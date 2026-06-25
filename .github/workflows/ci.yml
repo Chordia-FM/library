@@ -83,7 +83,7 @@ jobs:
       - name: Stage binary
         run: install -Dm755 target/x86_64-unknown-linux-musl/release/chordia-library chordia-library-linux-x86_64
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: chordia-library-linux-x86_64
           generate_release_notes: true
