@@ -121,7 +121,15 @@ pub async fn analyze(path: &Path, ffmpeg_path: &str) -> Result<Loudness, Analyze
         .args(["-hide_banner", "-nostats", "-i"])
         .arg(path)
         // First audio stream only (skip embedded cover-art video); measure true peak.
-        .args(["-map", "0:a:0", "-af", "ebur128=peak=true", "-f", "null", "-"])
+        .args([
+            "-map",
+            "0:a:0",
+            "-af",
+            "ebur128=peak=true",
+            "-f",
+            "null",
+            "-",
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())

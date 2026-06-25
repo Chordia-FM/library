@@ -91,7 +91,10 @@ fn release_matches_album(rel: &serde_json::Value, album_norm: &str) -> bool {
 fn recording_matches_album(rec: &serde_json::Value, album_norm: &str) -> bool {
     rec.get("releases")
         .and_then(|r| r.as_array())
-        .map(|rels| rels.iter().any(|rel| release_matches_album(rel, album_norm)))
+        .map(|rels| {
+            rels.iter()
+                .any(|rel| release_matches_album(rel, album_norm))
+        })
         .unwrap_or(false)
 }
 
@@ -132,7 +135,11 @@ fn release_position(rel: &serde_json::Value) -> (Option<i64>, Option<i64>) {
 /// preferring one whose release matches the file's album tag (this is what makes two encodings of
 /// the same track on the same album converge on one `recording_mbid`), then a title match, then the
 /// first. It pulls the track/disc position and album from the matching release. Pure for testing.
-fn parse_lookup(body: &serde_json::Value, want_title_norm: &str, want_album_norm: &str) -> Option<Identity> {
+fn parse_lookup(
+    body: &serde_json::Value,
+    want_title_norm: &str,
+    want_album_norm: &str,
+) -> Option<Identity> {
     if body.get("status").and_then(|s| s.as_str()) != Some("ok") {
         return None;
     }
@@ -154,9 +161,20 @@ fn parse_lookup(body: &serde_json::Value, want_title_norm: &str, want_album_norm
     // a title match when possible, then degrade gracefully.
     let rec = recordings
         .iter()
-        .find(|r| recording_matches_album(r, want_album_norm) && recording_matches_title(r, want_title_norm))
-        .or_else(|| recordings.iter().find(|r| recording_matches_album(r, want_album_norm)))
-        .or_else(|| recordings.iter().find(|r| recording_matches_title(r, want_title_norm)))
+        .find(|r| {
+            recording_matches_album(r, want_album_norm)
+                && recording_matches_title(r, want_title_norm)
+        })
+        .or_else(|| {
+            recordings
+                .iter()
+                .find(|r| recording_matches_album(r, want_album_norm))
+        })
+        .or_else(|| {
+            recordings
+                .iter()
+                .find(|r| recording_matches_title(r, want_title_norm))
+        })
         .or_else(|| recordings.first());
 
     let mut id = Identity {
@@ -373,7 +391,12 @@ mod tests {
 
         // Non-ok status or empty results → None.
         assert!(parse_lookup(&serde_json::json!({ "status": "error" }), "", "").is_none());
-        assert!(parse_lookup(&serde_json::json!({ "status": "ok", "results": [] }), "", "").is_none());
+        assert!(parse_lookup(
+            &serde_json::json!({ "status": "ok", "results": [] }),
+            "",
+            ""
+        )
+        .is_none());
     }
 
     #[test]

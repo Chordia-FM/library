@@ -174,8 +174,16 @@ impl RenderCtx {
     /// template references one of these and it resolves empty (e.g. an untagged track number), we
     /// don't yet have enough metadata to place the file, so organize skips it rather than emit a
     /// degraded name. Decorative vars (disc/year/genre/comment/filename) are not gated.
-    const REQUIRED_VARS: &'static [&'static str] =
-        &["track", "trackno", "track_no", "title", "album", "artist", "albumartist", "album_artist"];
+    const REQUIRED_VARS: &'static [&'static str] = &[
+        "track",
+        "trackno",
+        "track_no",
+        "title",
+        "album",
+        "artist",
+        "albumartist",
+        "album_artist",
+    ];
 
     /// The identity-defining variables a template references that are currently missing (empty). A
     /// non-empty result means "don't organize this file yet, we lack the tags it needs".

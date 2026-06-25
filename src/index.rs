@@ -46,10 +46,12 @@ async fn upsert_artist(
     .bind(mbid)
     .execute(db)
     .await?;
-    Ok(sqlx::query_scalar("SELECT id FROM artists WHERE name_normalized = ?")
-        .bind(name_norm)
-        .fetch_one(db)
-        .await?)
+    Ok(
+        sqlx::query_scalar("SELECT id FROM artists WHERE name_normalized = ?")
+            .bind(name_norm)
+            .fetch_one(db)
+            .await?,
+    )
 }
 
 /// Upsert an album, deduped by (normalized title, album-artist). Backfills album-level fields as
