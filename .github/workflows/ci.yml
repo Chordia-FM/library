@@ -10,24 +10,47 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# POLYREPO: this crate path-depends on ../contracts. contracts is a public sibling repo, so the
+# default GITHUB_TOKEN can clone it; every job that builds checks it out next to library/ (both under
+# the runner workspace) so `path = "../contracts"` resolves.
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          path: library
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/contracts
+          path: contracts
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --all --check
+        with:
+          workspaces: library
+      - run: cargo fmt --check
+        working-directory: library
       - run: cargo clippy --all-targets -- -D warnings
+        working-directory: library
       - run: cargo test --all
+        working-directory: library
 
   audit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          path: library
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/contracts
+          path: contracts
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: library/Cargo.toml
 
   # On a `v*` tag: publish the GHCR image with semver + `latest` tags (SELF_HOSTING pulls `:latest`).
   image:
@@ -38,14 +61,20 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - uses: actions/checkout@v7
+        with:
+          path: library
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/contracts
+          path: contracts
+      - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ghcr.io/chordia-fm/library
           # From tag v1.2.3 → :1.2.3, :1.2, and :latest.
@@ -53,9 +82,11 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
+          # Workspace root holds library/ + contracts/; the Dockerfile copies both siblings.
           context: .
+          file: library/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -69,21 +100,30 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+        with:
+          path: library
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/contracts
+          path: contracts
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: library
       # Static musl build so the "curl and run" install in SELF_HOSTING.md works on any glibc
       # version and on musl distros (Alpine). musl-tools supplies musl-gcc for bundled libsqlite3.
       - name: Install musl toolchain
         run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Build static release binary
-        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl
+        working-directory: library
       - name: Stage binary
-        run: install -Dm755 target/x86_64-unknown-linux-musl/release/chordia-library chordia-library-linux-x86_64
+        run: install -Dm755 library/target/x86_64-unknown-linux-musl/release/chordia-library chordia-library-linux-x86_64
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: chordia-library-linux-x86_64
           generate_release_notes: true
