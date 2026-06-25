@@ -1,0 +1,12 @@
+# Run the self-hosted library in a container. SQLite needs no external service.
+services:
+  library:
+    build:
+      context: ..
+      dockerfile: library/Dockerfile
+    ports:
+      - "8443:8443"
+    volumes:
+      - ./music:/music:ro          # point at your music; mounted read-only
+      - ./data:/data               # sqlite index + transcode cache + credentials + config
+    restart: unless-stopped

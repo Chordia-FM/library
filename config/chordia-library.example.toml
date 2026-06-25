@@ -1,0 +1,74 @@
+# Chordia self-hosted library configuration.
+# Copy to `chordia-library.toml` (or set CHORDIA_LIBRARY_CONFIG to point to it).
+#
+# Library folders and pairing credentials are not stored here. They are configured through
+# the browser setup flow (the URL printed on first start) and saved in data/pairing.json.
+
+# Port the server listens on. Open/forward this port so authorized clients and friends'
+# libraries can reach you directly.
+bind_port = 8443
+
+# The Central Hub this server pairs with.
+backend_url = "https://api.chordia.dev"   # dev: http://localhost:8080
+
+# Where the local SQLite index, scrobble queue, and pairing credentials are stored.
+data_dir = "./data"
+
+# Frontend URL - where the setup flow redirects your browser after visiting the setup link.
+frontend_url = "http://localhost:3000"   # production: https://chordia.dev
+
+# Optional: your server's public URL. Set this so the Hub can advertise it to peers.
+# hub_endpoint = "https://music.example.com:8443"
+
+# Log format: "pretty" for human-readable output, "json" for structured logging.
+log_format = "pretty"
+
+# Lower quality tiers (High/Normal/DataSaver) are transcoded on the fly with ffmpeg and cached on
+# disk. The Original tier is always bit-perfect passthrough and needs none of this. Spatial/Atmos
+# tracks are never transcoded. This whole section is optional; sensible defaults are shown.
+[transcode]
+# ffmpeg must be installed and on PATH (or give an absolute path here).
+ffmpeg_path = "ffmpeg"
+# Where to cache transcoded files. Defaults to "{data_dir}/transcode".
+# cache_dir = "./data/transcode"
+# Evict least-recently-served cached files once the cache exceeds this (bytes). Default 5 GiB.
+cache_max_bytes = 5368709120
+# Max simultaneous ffmpeg processes.
+max_concurrent = 2
+
+# Optional AcoustID acoustic fingerprinting. With an API key (free, from acoustid.org) and the
+# Chromaprint `fpcalc` binary installed, a background pass identifies each track so the same
+# recording matches across different encodings (the preferred own-copy match layer). Off by
+# default; own-copy matching still works via content hash and fuzzy metadata.
+# [acoustid]
+# api_key = "your-acoustid-key"
+# fpcalc_path = "fpcalc"
+
+# EBU R128 loudness analysis (ReplayGain). A background pass measures each track's integrated
+# loudness + true peak with ffmpeg (reusing [transcode] ffmpeg_path) and stores a ReplayGain 2.0
+# track gain. Clients apply it when "Normalize volume" is enabled, so tracks play at an even volume
+# without clipping. On by default; set enabled = false to skip it (e.g. on a CPU-constrained box).
+[loudness]
+enabled = true
+
+# Periodic library maintenance. The filesystem watcher handles live changes; this scheduler also
+# re-scans and prunes deleted files every interval_minutes, catching changes missed while the server
+# was down or if a watcher event was dropped. A full rescan re-hashes files, so keep this coarse.
+# Set interval_minutes = 0 to rely on the live watcher alone.
+[scan]
+interval_minutes = 360
+# When the same track exists in multiple encodings (e.g. you re-added an album in higher quality),
+# keep only the highest-quality copy in the catalog and move the lower-quality file(s) into a
+# recoverable `superseded/` folder under data_dir (never a hard delete). Matching is high-confidence
+# only (same album, disc, track, and title), so remixes and live versions are never merged. Set
+# false to keep every copy.
+dedupe_reuploads = true
+
+# Optional in-process HTTPS. Set both cert and key (PEM) to terminate TLS here and advertise the
+# leaf-certificate fingerprint to the Hub. Peers and native clients pin it, so a self-signed cert
+# is safe against MITM. Leave this section out to serve plain HTTP behind edge TLS (Cloudflare
+# Tunnel, Caddy, nginx), which is the recommended setup for browser clients (they can't pin
+# self-signed certs).
+# [tls]
+# cert = "/etc/chordia/cert.pem"
+# key  = "/etc/chordia/key.pem"

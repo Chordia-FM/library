@@ -1,0 +1,46 @@
+# Optional edge-TLS overlay: adds nginx + certbot in front of the library, for self-hosters running
+# on a public VPS with their own domain (instead of a Cloudflare Tunnel).
+#
+# Use it together with the base file:
+#   cp .env.example .env        # set LIBRARY_DOMAIN + CERTBOT_EMAIL (and MUSIC_DIR)
+#   bash init-letsencrypt.sh    # issues the cert, then:
+#   docker compose -f compose.prod.yaml -f compose.edge.yaml up -d
+#
+# nginx reaches the library over the compose network (library:8443), so the library's localhost
+# port publish in the base file is irrelevant here.
+
+name: chordia-library
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    depends_on:
+      - library
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      LIBRARY_DOMAIN: ${LIBRARY_DOMAIN:?set LIBRARY_DOMAIN in .env}
+      # Only substitute ${LIBRARY_DOMAIN} in the template; leave nginx's own $variables alone.
+      NGINX_ENVSUBST_FILTER: "^LIBRARY_DOMAIN$$"
+    volumes:
+      - ./nginx/templates:/etc/nginx/templates:ro
+      - certbot-certs:/etc/letsencrypt:ro
+      - certbot-webroot:/var/www/certbot:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+  certbot:
+    image: certbot/certbot:latest
+    entrypoint: /bin/sh -c 'trap exit TERM; while :; do certbot renew --webroot -w /var/www/certbot --quiet; sleep 12h & wait $${!}; done'
+    volumes:
+      - certbot-certs:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+
+volumes:
+  certbot-certs:
+  certbot-webroot:

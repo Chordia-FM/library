@@ -1,0 +1,4 @@
+# The Axum 0.8 / SQLx 0.8 stack requires rustc >= 1.82. `rustup update stable` if older.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

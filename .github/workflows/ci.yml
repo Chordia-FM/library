@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+  # On a `v*` tag: publish the GHCR image with semver + `latest` tags (SELF_HOSTING pulls `:latest`).
+  image:
+    needs: [test, audit]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/chordia-fm/library
+          # From tag v1.2.3 → :1.2.3, :1.2, and :latest.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  # On a `v*` tag: build the prebuilt Linux binary and attach it to the GitHub Release, fulfilling
+  # the `releases/latest/download/chordia-library-linux-x86_64` install path in SELF_HOSTING.md.
+  release:
+    needs: [test, audit]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      # Static musl build so the "curl and run" install in SELF_HOSTING.md works on any glibc
+      # version and on musl distros (Alpine). musl-tools supplies musl-gcc for bundled libsqlite3.
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: Build static release binary
+        run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Stage binary
+        run: install -Dm755 target/x86_64-unknown-linux-musl/release/chordia-library chordia-library-linux-x86_64
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: chordia-library-linux-x86_64
+          generate_release_notes: true
+          fail_on_unmatched_files: true

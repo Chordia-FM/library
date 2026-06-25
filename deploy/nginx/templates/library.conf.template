@@ -1,0 +1,48 @@
+# Rendered to /etc/nginx/conf.d/library.conf at container start; ${LIBRARY_DOMAIN} is substituted
+# from the environment (NGINX_ENVSUBST_FILTER restricts substitution to that one variable).
+
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name ${LIBRARY_DOMAIN};
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+    location / {
+        return 301 https://${LIBRARY_DOMAIN}$request_uri;
+    }
+}
+
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    http2       on;
+    server_name ${LIBRARY_DOMAIN};
+
+    ssl_certificate     /etc/letsencrypt/live/${LIBRARY_DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${LIBRARY_DOMAIN}/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    # Headroom for cover-art / batch metadata uploads.
+    client_max_body_size 256m;
+
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    location / {
+        proxy_pass              http://library:8443;
+        proxy_http_version      1.1;
+        proxy_set_header        Host              $host;
+        proxy_set_header        X-Real-IP         $remote_addr;
+        proxy_set_header        X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto $scheme;
+        # Stream audio straight through (Range/If-Range headers are forwarded by default).
+        proxy_buffering         off;
+        proxy_request_buffering off;
+        proxy_read_timeout      3600s;
+    }
+}

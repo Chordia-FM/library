@@ -1,0 +1,33 @@
+# Production library config. Copy to chordia-library.toml and edit `hub_endpoint`.
+# Full reference: ../config/chordia-library.example.toml
+
+bind_port = 8443
+
+# The Chordia Hub this library pairs with (don't change for the hosted Hub).
+backend_url  = "https://api.chordia.dev"
+frontend_url = "https://chordia.dev"
+
+# The PUBLIC https URL clients use to reach THIS library. Advertised to the Hub on each heartbeat.
+# Use your Cloudflare Tunnel URL, or your library subdomain if you run the edge overlay.
+hub_endpoint = "https://library.example.com"
+
+# Container data root (SQLite index, transcode cache, pairing credentials). Matches the volume mount.
+data_dir = "/data"
+log_format = "json"
+metadata_storage = "hub"
+
+[transcode]
+ffmpeg_path = "ffmpeg"        # bundled in the library image
+max_concurrent = 2
+# cache_dir defaults to /data/transcode; cache_max_bytes defaults to 5 GiB.
+
+# Terminate TLS at the edge (Cloudflare Tunnel or the nginx overlay) and serve plain HTTP here, which
+# is what browsers need. To instead have the library terminate HTTPS in-process and advertise its leaf
+# fingerprint for native-client pinning, set [tls] cert/key. See SELF_HOSTING.md.
+
+[loudness]
+enabled = true
+
+[scan]
+interval_minutes = 360
+dedupe_reuploads = true

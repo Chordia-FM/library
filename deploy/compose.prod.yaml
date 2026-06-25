@@ -1,0 +1,46 @@
+# Chordia library server: standalone production stack for self-hosters.
+#
+# This runs your library wherever your music lives (NAS, home server, VPS). It is NOT part of the
+# central Hub. It pairs to the Hub over the network and streams audio directly to clients.
+#
+# Quick start:
+#   cp .env.example .env                              # set MUSIC_DIR (and the edge vars if used)
+#   cp chordia-library.prod.example.toml chordia-library.toml   # edit hub_endpoint
+#   docker compose -f compose.prod.yaml up -d
+#   docker compose -f compose.prod.yaml logs library  # open the printed setup URL to pair
+#
+# Reachability (browsers need real-CA HTTPS, since they can't pin self-signed certs):
+#   • Cloudflare Tunnel (recommended, no inbound ports): run `cloudflared tunnel --url
+#     http://localhost:8443`, then set its https URL as `hub_endpoint` in the toml.
+#   • Public VPS with a domain: add the edge overlay (see compose.edge.yaml).
+# See README.md and the workspace SELF_HOSTING.md for details.
+
+name: chordia-library
+
+services:
+  library:
+    image: ghcr.io/chordia-fm/library:latest
+    # Building from source needs the full Chordia workspace (the ../contracts sibling), so it can't be
+    # done from a standalone clone of this repo, so use the published image above. (Dev builds use the
+    # repo-root compose.yaml, which sets context to the workspace root.)
+    restart: unless-stopped
+    ports:
+      # Bound to localhost: safe for Cloudflare Tunnel or a local reverse proxy on the same host.
+      # For direct port-forwarding from your router, change to "8443:8443" and firewall it.
+      - "127.0.0.1:8443:8443"
+    environment:
+      CHORDIA_LIBRARY_CONFIG: /data/chordia-library.toml
+    volumes:
+      - ${MUSIC_DIR:?set MUSIC_DIR in .env}:/music:ro
+      - library-data:/data
+      - ./chordia-library.toml:/data/chordia-library.toml:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  # Holds the SQLite index, transcode cache, and the pairing credentials. MUST persist across
+  # restarts or you'll have to re-pair with the Hub.
+  library-data:

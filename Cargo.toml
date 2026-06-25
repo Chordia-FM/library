@@ -1,0 +1,78 @@
+[package]
+name = "chordia-library"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Chordia self-hosted server that scans, indexes, streams, relays, and buffers scrobbles for a user's own music."
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/chordia-fm/library"
+
+[dependencies]
+# Local dev path dep; switch to the published crate once `contracts` ships.
+chordia-contracts = { path = "../contracts" }
+
+# Web / async
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+# Local datastore (SQLite - no external service to run)
+sqlx = { version = "0.9", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls-ring",
+    "sqlite",
+    "macros",
+    "migrate",
+    "uuid",
+] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+# Talk to the Hub (heartbeat, scrobble forward) + relay pulls from peer libraries
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "stream"] }
+
+# Observability / errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "2"
+anyhow = "1"
+
+# Metadata + fingerprinting
+lofty = "0.21"
+symphonia = { version = "0.5", features = ["all"] }
+sha2 = "0.10"
+hex = "0.4"
+
+# Filesystem watching
+notify = "6"
+
+# Random token generation
+rand = "0.8"
+
+# Capability-token validation (same crate + feature flags as backend)
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+ed25519-dalek = "2"
+base64 = "0.22"
+
+# Streaming
+tokio-util = { version = "0.7", features = ["io"] }
+bytes = "1"
+mime_guess = "2"
+async-stream = "0.3"
+futures-core = "0.3"
+
+# Transcoding (lower tiers) shells out to `ffmpeg` via tokio::process - no crate dep.
+
+# Native TLS termination + leaf-cert fingerprint advertisement (the directory pinning model).
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+rustls-pemfile = "2"
+
+[dev-dependencies]
+# Generate self-signed certs in tests (no external openssl needed).
+rcgen = "0.13"

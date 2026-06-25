@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local runtime data: sqlite index, transcode cache, paired credentials
+/data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Active config (keep the examples)
+chordia-library.toml
+
+# Env (deploy compose; keep the examples)
+.env
+.env.*
+!.env.example
+
+# Secrets
+*.pem
+*.key
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
