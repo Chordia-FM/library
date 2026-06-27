@@ -45,7 +45,8 @@ folders to index. Pairing credentials persist in the `library-data` volume, so k
 
 ## Notes
 
-- **Music** is mounted read-write at `/music` so Organize / Dedupe can run when you enable them
+- **Music** is mounted read-write at `/data/music` (the library sandboxes its folder browser to that
+  subtree) so Organize / Dedupe can run when you enable them
   (both opt-in, off by default, so nothing is touched until you do; append `:ro` in `compose.prod.yaml`
   to keep it untouched). Point `MUSIC_DIR` at a folder of music (any format `symphonia` decodes); the
   setup flow scans it.
