@@ -30,4 +30,6 @@ enabled = true
 
 [scan]
 interval_minutes = 360
-dedupe_reuploads = true
+# Off by default so the server never moves files in your library on its own. Turn on Dedupe per
+# library in the settings (needs the read-write music mount) if you want re-uploads collapsed.
+dedupe_reuploads = false

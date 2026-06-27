@@ -45,8 +45,10 @@ folders to index. Pairing credentials persist in the `library-data` volume, so k
 
 ## Notes
 
-- **Music** is mounted read-only at `/music`. Point `MUSIC_DIR` at a folder of music (any format
-  `symphonia` decodes); the setup flow scans it.
+- **Music** is mounted read-write at `/music` so Organize / Dedupe can run when you enable them
+  (both opt-in, off by default, so nothing is touched until you do; append `:ro` in `compose.prod.yaml`
+  to keep it untouched). Point `MUSIC_DIR` at a folder of music (any format `symphonia` decodes); the
+  setup flow scans it.
 - **ffmpeg** is bundled in the image (needed only for the lower quality tiers; the `Original` tier is
   bit-perfect passthrough).
 - **Persistence:** the `library-data` volume holds the SQLite index, transcode cache, and pairing

@@ -31,7 +31,11 @@ services:
     environment:
       CHORDIA_LIBRARY_CONFIG: /data/chordia-library.toml
     volumes:
-      - ${MUSIC_DIR:?set MUSIC_DIR in .env}:/music:ro
+      # Read-WRITE so the library can rename/move files when you enable Organize (folder templates)
+      # or Dedupe in the library settings. Both are opt-in and off by default, so with them off
+      # nothing on disk is modified. Append ":ro" (and set dedupe_reuploads = false in the toml) if
+      # you want the library to never touch your files.
+      - ${MUSIC_DIR:?set MUSIC_DIR in .env}:/music
       - library-data:/data
       - ./chordia-library.toml:/data/chordia-library.toml:ro
     logging:
