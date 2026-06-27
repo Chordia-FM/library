@@ -112,13 +112,19 @@ async fn main() -> anyhow::Result<()> {
         *state.setup_token.write().await = Some(token.clone());
 
         let port = config.bind_port;
-        // Match the scheme the server is actually serving on so the browser link works directly.
-        let scheme = if config.tls_paths().is_some() {
-            "https"
-        } else {
-            "http"
+        // Prefer the public endpoint (advertised to the Hub) so a remote/VPS library's setup link
+        // works from any browser; fall back to localhost for a same-machine setup.
+        let setup_url = match &config.hub_endpoint {
+            Some(ep) => format!("{}/setup/{token}", ep.trim_end_matches('/')),
+            None => {
+                let scheme = if config.tls_paths().is_some() {
+                    "https"
+                } else {
+                    "http"
+                };
+                format!("{scheme}://localhost:{port}/setup/{token}")
+            }
         };
-        let setup_url = format!("{scheme}://localhost:{port}/setup/{token}");
 
         // Box width is driven by the URL line (always the longest).
         // Interior = url_len + 4 (two spaces padding on each side).

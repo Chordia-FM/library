@@ -21,7 +21,14 @@ pub async fn setup_redirect(
     match expected {
         Some(ref t) if t == &token => {
             let port = state.config.bind_port;
-            let library_url = format!("http://localhost:{port}");
+            // Prefer the public endpoint (advertised to the Hub) so remote/VPS pairing works from
+            // any browser; fall back to localhost for a same-machine setup.
+            let library_url = state
+                .config
+                .hub_endpoint
+                .clone()
+                .map(|ep| ep.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| format!("http://localhost:{port}"));
             let frontend = &state.config.frontend_url;
             let target =
                 format!("{frontend}/library/setup?library_url={library_url}&token={token}");
