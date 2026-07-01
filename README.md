@@ -21,8 +21,9 @@ Collection") and share each independently. See the
 ## Architecture
 
 - **Stack:** Rust · Axum 0.8 · Tokio · SQLx · SQLite.
-- **Responsibilities:** pairing · scan + watch · metadata + fingerprint · catalog API ·
-  bit-perfect Range streaming · listener-controlled quality tiers · own-copy match · DJ relay ·
+- **Responsibilities:** pairing · scan + watch (with full re-index + progress) · metadata +
+  fingerprint · catalog API · bit-perfect Range streaming · listener-controlled quality tiers ·
+  own-copy match · edition + canonical-artist sync · opt-in acquisition · DJ relay ·
   offline scrobble buffer/forward · directory heartbeat.
 - **Talks to:** the Hub (HTTPS control), clients (HTTPS Range), and peer libraries (relay pulls).
 - **Security:** every request carries a Hub-signed capability token, validated **offline** against
@@ -47,6 +48,16 @@ curl localhost:8443/health    # -> ok
 
 TOML file (path via `CHORDIA_LIBRARY_CONFIG`, default `./chordia-library.toml`). See
 [`config/chordia-library.example.toml`](./config/chordia-library.example.toml).
+
+## Acquisition (opt-in)
+
+Off by default. When enabled, the library executes download jobs you trigger from the Manager: it
+searches your own Prowlarr for a missing release, scores the results against your quality profile
+(highest quality wins), hands the pick to your qBittorrent, then imports the finished files into the
+target library so they index and sync like anything else. Chordia ships no indexers or trackers; you
+supply your own, and you are responsible for the legality of what you acquire. Configure it under
+`[acquisition]` (see the example config); a remote or shared seedbox is supported via
+`remote_path`/`local_path`.
 
 ## Development
 

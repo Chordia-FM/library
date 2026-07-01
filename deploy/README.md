@@ -52,6 +52,10 @@ folders to index. Pairing credentials persist in the `library-data` volume, so k
   setup flow scans it.
 - **ffmpeg** is bundled in the image (needed only for the lower quality tiers; the `Original` tier is
   bit-perfect passthrough).
+- **Acquisition (optional):** `compose.prod.yaml` ships commented Prowlarr + qBittorrent sidecars.
+  Uncomment them (and the shared `acquisition-staging` volume) to let the library download and import
+  releases you queue from the Manager, then fill in the `[acquisition]` block in `chordia-library.toml`.
+  Off by default. Chordia ships no indexers or trackers, and you are responsible for what you acquire.
 - **Persistence:** the `library-data` volume holds the SQLite index, transcode cache, and pairing
   credentials. Back it up or you'll re-pair and re-scan.
 - **Updating:** `docker compose -f compose.prod.yaml pull && docker compose -f compose.prod.yaml up -d`.
