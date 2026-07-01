@@ -11,6 +11,7 @@
 
 #![allow(dead_code)]
 
+mod acquisition;
 mod api;
 mod auth;
 mod catalog;
@@ -71,7 +72,7 @@ async fn main() -> anyhow::Result<()> {
         let id = lib_id.clone();
         let scan_path = path.clone();
         tokio::spawn(async move {
-            scanner::initial_scan(&db, &id, &scan_path).await;
+            scanner::initial_scan(&db, &id, &scan_path, false).await;
             // Drop entries for files deleted while the server was down (cheap stat-only pass).
             scanner::prune_missing(&db, &id).await;
         });
@@ -180,6 +181,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Re-upload dedupe (keep highest-quality copy; on unless [scan] dedupe_reuploads = false).
     dedupe::start_dedupe(state.clone());
+
+    // Torrent-based acquisition: pull download jobs from the Hub + report health (no-op unless
+    // [acquisition] enabled with Prowlarr + qBittorrent configured).
+    acquisition::start_job_loop(state.clone());
+    acquisition::start_report_loop(state.clone());
+    acquisition::start_resume(state.clone());
 
     // Bind and serve.
     let app = http::router(state);

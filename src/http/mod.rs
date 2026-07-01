@@ -32,6 +32,10 @@ pub struct AppState {
     /// SHA-256 of the in-process TLS leaf cert advertised to the Hub, or empty when plain-HTTP or
     /// edge-terminated. Computed once at startup, then shared by the heartbeat and pairing-claim flows.
     pub tls_fingerprint: String,
+    /// Download job_ids currently being processed by a run/resume flow, so a re-queue + re-claim (or a
+    /// startup resume racing a fresh claim) never runs a second monitor that could tear down the first's
+    /// torrent. See `acquisition::claim_job`.
+    pub inflight_jobs: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
 }
 
 impl AppState {
@@ -73,6 +77,7 @@ impl AppState {
             setup_token: Arc::new(RwLock::new(None)),
             transcoder,
             tls_fingerprint,
+            inflight_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
         })
     }
 }

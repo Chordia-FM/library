@@ -8,6 +8,9 @@
 
 use std::path::Path;
 
+use chordia_contracts::acquisition::{
+    AcquisitionReport, ClaimedJob, JobCandidates, JobClaimRequest, JobStatusUpdate,
+};
 use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, CatalogSyncResponse};
 use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse};
 use chordia_contracts::scrobble::ScrobbleBatch;
@@ -162,6 +165,114 @@ impl HubClient {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();
             anyhow::bail!("catalog prune failed {status}: {body}");
+        }
+        Ok(())
+    }
+
+    /// Claim up to `max` queued download jobs for this server (`POST /v1/manager/jobs/claim`).
+    pub async fn claim_jobs(
+        &self,
+        server_api_key: &str,
+        server_id: Uuid,
+        max: u32,
+    ) -> anyhow::Result<Vec<ClaimedJob>> {
+        let url = format!("{}/v1/manager/jobs/claim", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(&JobClaimRequest { server_id, max })
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("claim jobs failed {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Report a download job's status transition (`POST /v1/manager/jobs/{id}/status`).
+    pub async fn report_job_status(
+        &self,
+        server_api_key: &str,
+        job_id: Uuid,
+        update: &JobStatusUpdate,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/v1/manager/jobs/{job_id}/status", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(update)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("report job status failed {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Whether the Hub still wants this job (`GET /v1/manager/jobs/{id}/active`). `false` when the
+    /// user cancelled it (or it was otherwise terminated). The caller then removes the torrent + its
+    /// files. A network/transport error propagates so the caller can treat it as "still active" and
+    /// avoid tearing down a healthy download on a transient blip.
+    pub async fn job_active(&self, server_api_key: &str, job_id: Uuid) -> anyhow::Result<bool> {
+        let url = format!("{}/v1/manager/jobs/{job_id}/active", self.base_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .send()
+            .await?;
+        if resp.status() == reqwest::StatusCode::GONE {
+            return Ok(false);
+        }
+        if !resp.status().is_success() {
+            anyhow::bail!("job active check failed {}", resp.status());
+        }
+        Ok(true)
+    }
+
+    /// Report scored candidates for an interactive job (`POST /v1/manager/jobs/{id}/candidates`).
+    pub async fn report_candidates(
+        &self,
+        server_api_key: &str,
+        job_id: Uuid,
+        candidates: &JobCandidates,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/v1/manager/jobs/{job_id}/candidates", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(candidates)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("report candidates failed {}", resp.status());
+        }
+        Ok(())
+    }
+
+    /// Report this library's acquisition health (`POST /v1/manager/libraries/{id}/acquisition/report`).
+    pub async fn report_acquisition(
+        &self,
+        server_api_key: &str,
+        library_id: Uuid,
+        report: &AcquisitionReport,
+    ) -> anyhow::Result<()> {
+        let url = format!(
+            "{}/v1/manager/libraries/{library_id}/acquisition/report",
+            self.base_url
+        );
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(report)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("report acquisition failed {}", resp.status());
         }
         Ok(())
     }

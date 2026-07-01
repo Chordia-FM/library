@@ -54,6 +54,139 @@ pub struct Config {
     /// separately under `[transcode] max_concurrent`.
     #[serde(default)]
     pub max_stream_kbps: Option<u32>,
+    /// Optional torrent-based acquisition (Lidarr-style). See [`AcquisitionConfig`]. Off unless
+    /// `enabled = true` and a Prowlarr + qBittorrent are configured.
+    #[serde(default)]
+    pub acquisition: AcquisitionConfig,
+}
+
+/// Torrent-based acquisition. The library executes download jobs pulled from the Hub (and the
+/// interactive direct-search endpoint): it searches a user-supplied **Prowlarr** for releases,
+/// scores them against the job's quality profile, hands the chosen one to a user-supplied
+/// **qBittorrent**, then imports the finished files into the target library's music folder so the
+/// scanner picks them up. Chordia ships NO indexers or trackers; the operator configures their own.
+/// Disabled unless `enabled = true` and the Prowlarr/qBittorrent URLs are set.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AcquisitionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub prowlarr_url: Option<String>,
+    #[serde(default)]
+    pub prowlarr_api_key: Option<String>,
+    #[serde(default)]
+    pub qbit_url: Option<String>,
+    #[serde(default)]
+    pub qbit_user: Option<String>,
+    #[serde(default)]
+    pub qbit_pass: Option<String>,
+    /// Where qBittorrent saves downloads. MUST share a filesystem/volume with the music root so the
+    /// import is an atomic move. Defaults to `{data_dir}/acquisition`.
+    #[serde(default)]
+    pub staging_dir: Option<PathBuf>,
+    /// Subfolder under the target library's music root that finished downloads are moved into (the
+    /// scanner then indexes + organizes them). Default `_incoming`.
+    #[serde(default = "default_import_subdir")]
+    pub import_subdir: String,
+    /// How often the job loop polls the Hub for queued jobs (seconds).
+    #[serde(default = "default_acq_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// Keep seeding finished torrents (the imported files are hardlinked/copied so the torrent keeps
+    /// its own copy). When false, the torrent's files are MOVED into the library and the torrent is
+    /// removed from qBittorrent once imported. Default true.
+    #[serde(default = "default_keep_seeding")]
+    pub keep_seeding: bool,
+    /// Remote / shared-seedbox mode: qBittorrent runs elsewhere (e.g. a seedbox) and this library
+    /// reads finished files from a LOCAL MOUNT of its download directory. Set BOTH `remote_path` (the
+    /// path qBittorrent reports, e.g. `/downloads`) and `local_path` (where that's mounted here, e.g.
+    /// `/mnt/seedbox` or `D:\seedbox`). In this mode files are COPIED (never moved) and the torrent is
+    /// left seeding on the seedbox. `remote_path` is also the save path handed to qBittorrent.
+    #[serde(default)]
+    pub remote_path: Option<String>,
+    #[serde(default)]
+    pub local_path: Option<PathBuf>,
+    /// qBittorrent category for THIS library's grabs, so a shared seedbox can tell libraries apart and
+    /// each can monitor/import only its own torrents. Default `chordia`.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// How often (days) the Hub re-searches a followed-artist release that wasn't found on the
+    /// trackers yet (reuses the existing job, never a duplicate). Reported to the Hub on the health
+    /// heartbeat. Default 7.
+    #[serde(default = "default_research_interval_days")]
+    pub research_interval_days: u32,
+}
+
+impl Default for AcquisitionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prowlarr_url: None,
+            prowlarr_api_key: None,
+            qbit_url: None,
+            qbit_user: None,
+            qbit_pass: None,
+            staging_dir: None,
+            import_subdir: default_import_subdir(),
+            poll_interval_secs: default_acq_poll_secs(),
+            keep_seeding: default_keep_seeding(),
+            remote_path: None,
+            local_path: None,
+            category: None,
+            research_interval_days: default_research_interval_days(),
+        }
+    }
+}
+
+fn default_keep_seeding() -> bool {
+    true
+}
+
+fn default_research_interval_days() -> u32 {
+    7
+}
+
+impl AcquisitionConfig {
+    /// True when acquisition is enabled AND the minimum external infra is configured.
+    pub fn is_configured(&self) -> bool {
+        self.enabled
+            && self.prowlarr_url.is_some()
+            && self.prowlarr_api_key.is_some()
+            && self.qbit_url.is_some()
+    }
+
+    /// Remote / shared-seedbox mode (both `remote_path` and `local_path` set): qBittorrent runs
+    /// elsewhere and finished files are read from a local mount. Drives copy-not-move + path mapping.
+    pub fn is_remote(&self) -> bool {
+        self.remote_path.is_some() && self.local_path.is_some()
+    }
+
+    /// The qBittorrent category to file this library's grabs under (default `chordia`).
+    pub fn category(&self) -> &str {
+        self.category
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("chordia")
+    }
+
+    /// Map a qBittorrent-reported content path to one readable by THIS library. In remote mode the
+    /// `remote_path` prefix is rewritten to `local_path` (separators normalised, so a Linux seedbox
+    /// path like `/downloads/Album` maps onto a Windows mount); otherwise the path is unchanged.
+    pub fn local_content_path(&self, content_path: &str) -> String {
+        match (&self.remote_path, &self.local_path) {
+            (Some(remote), Some(local)) => {
+                let rel = content_path
+                    .strip_prefix(remote.as_str())
+                    .unwrap_or(content_path)
+                    .trim_start_matches(['/', '\\']);
+                let mut p = local.clone();
+                for c in rel.split(['/', '\\']).filter(|s| !s.is_empty()) {
+                    p.push(c);
+                }
+                p.to_string_lossy().into_owned()
+            }
+            _ => content_path.to_string(),
+        }
+    }
 }
 
 /// AcoustID acoustic fingerprinting. When `api_key` is set (and the `fpcalc`/Chromaprint binary is
@@ -194,6 +327,14 @@ impl Config {
             .unwrap_or_else(|| self.data_dir.join("transcode"))
     }
 
+    /// Resolved acquisition staging directory: explicit config value, else `{data_dir}/acquisition`.
+    pub fn acquisition_staging_dir(&self) -> PathBuf {
+        self.acquisition
+            .staging_dir
+            .clone()
+            .unwrap_or_else(|| self.data_dir.join("acquisition"))
+    }
+
     /// `(cert, key)` paths only when both are configured - i.e. in-process TLS is enabled.
     pub fn tls_paths(&self) -> Option<(PathBuf, PathBuf)> {
         match (&self.tls.cert, &self.tls.key) {
@@ -232,4 +373,64 @@ fn default_cache_max_bytes() -> u64 {
 }
 fn default_max_concurrent() -> usize {
     2
+}
+fn default_import_subdir() -> String {
+    "_incoming".to_string()
+}
+fn default_acq_poll_secs() -> u64 {
+    20
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn acq(remote: Option<&str>, local: Option<&str>) -> AcquisitionConfig {
+        AcquisitionConfig {
+            remote_path: remote.map(String::from),
+            local_path: local.map(PathBuf::from),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn local_mode_passes_content_path_through() {
+        let c = acq(None, None);
+        assert!(!c.is_remote());
+        assert_eq!(c.local_content_path("/anything/here"), "/anything/here");
+    }
+
+    #[test]
+    fn remote_mode_remaps_the_seedbox_prefix_to_the_local_mount() {
+        let c = acq(Some("/downloads"), Some("/mnt/seedbox"));
+        assert!(c.is_remote());
+        let mapped = c.local_content_path("/downloads/Some Album (2020)/cd1");
+        let expected = PathBuf::from("/mnt/seedbox")
+            .join("Some Album (2020)")
+            .join("cd1")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(mapped, expected);
+    }
+
+    #[test]
+    fn remote_mode_needs_both_paths() {
+        // Only one of the pair set → not remote mode (treated as local, path unchanged).
+        assert!(!acq(Some("/downloads"), None).is_remote());
+        assert!(!acq(None, Some("/mnt/seedbox")).is_remote());
+        assert_eq!(
+            acq(Some("/downloads"), None).local_content_path("/downloads/x"),
+            "/downloads/x"
+        );
+    }
+
+    #[test]
+    fn category_defaults_to_chordia_but_is_overridable() {
+        assert_eq!(acq(None, None).category(), "chordia");
+        let mut c = acq(None, None);
+        c.category = Some("lib-frankfurt".into());
+        assert_eq!(c.category(), "lib-frankfurt");
+        c.category = Some(String::new()); // empty → default
+        assert_eq!(c.category(), "chordia");
+    }
 }

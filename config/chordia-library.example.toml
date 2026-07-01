@@ -64,6 +64,44 @@ interval_minutes = 360
 # false to keep every copy.
 dedupe_reuploads = true
 
+# Optional torrent-based acquisition (Lidarr-style). When enabled, the library executes download
+# jobs you trigger from the Manager: it searches YOUR Prowlarr for releases, scores them against
+# your quality profile (always preferring the highest-quality source), hands the pick to YOUR
+# qBittorrent, then imports the finished files into the target library so they're indexed and synced.
+# Chordia ships no indexers or trackers. You supply your own Prowlarr + qBittorrent (see the
+# compose sidecars in deploy/compose.prod.yaml). You are responsible for the legality of what you
+# acquire in your jurisdiction. Off unless enabled = true AND the Prowlarr/qBittorrent URLs are set.
+# [acquisition]
+# enabled = true
+# prowlarr_url = "http://prowlarr:9696"
+# prowlarr_api_key = "your-prowlarr-api-key"     # Prowlarr → Settings → General → API Key
+# qbit_url = "http://qbittorrent:8080"
+# qbit_user = "admin"
+# qbit_pass = "your-qbittorrent-password"
+# Where qBittorrent saves in-progress downloads. Keep this OUTSIDE your music root (so partial
+# downloads aren't indexed); finished files are moved into "{music root}/_incoming". For atomic
+# (instant) imports, put it on the same filesystem/volume as your music. Default {data_dir}/acquisition.
+# staging_dir = "/downloads"
+# import_subdir = "_incoming"        # subfolder of the music root finished downloads land in
+# poll_interval_secs = 20            # how often to check the Hub for new download jobs
+# keep_seeding = true                # true: hardlink/copy imports so the torrent keeps seeding.
+#                                    # false: move files into the library and remove the torrent once
+#                                    # imported (no seeding). Default true.
+#
+# Remote / shared-seedbox mode: run qBittorrent elsewhere (a seedbox) and read finished files from a
+# LOCAL MOUNT of its download directory. Set BOTH remote_path (the path qBittorrent reports, e.g.
+# "/downloads") and local_path (where that directory is mounted on this machine). In this mode files
+# are copied, never moved, and the torrent keeps seeding on the seedbox. On Windows, `chordia mount`
+# sets up the rclone mount for you.
+# remote_path = "/downloads"
+# local_path = "/mnt/seedbox"
+# category = "chordia"               # qBittorrent category for THIS library's grabs, so libraries
+#                                    # sharing one seedbox can tell their torrents apart. Default chordia.
+#
+# research_interval_days = 7         # how often to re-search a followed-artist release that wasn't on
+#                                    # the trackers yet (reuses its job, never a duplicate). Reported
+#                                    # to the Hub on the health heartbeat. Default 7.
+
 # Optional in-process HTTPS. Set both cert and key (PEM) to terminate TLS here and advertise the
 # leaf-certificate fingerprint to the Hub. Peers and native clients pin it, so a self-signed cert
 # is safe against MITM. Leave this section out to serve plain HTTP behind edge TLS (Cloudflare
