@@ -3,8 +3,9 @@
 //! `initial_scan` walks every configured library folder and upserts tracks into SQLite.
 //! `start_watcher` registers a `notify` watcher for incremental re-index on fs events.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, LazyLock, Mutex};
 use std::time::Duration;
 
 use notify::{Event, EventKind, RecursiveMode, Watcher};
@@ -13,6 +14,61 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tracing::{error, info, warn};
 
 use crate::index;
+
+/// Live progress of the most recent scan per library, for the management UI. In-memory only (a
+/// library restart aborts any scan anyway), keyed by `library_id`. Lets the UI show a progress bar
+/// that survives navigation. The state lives here, not in a component, which matters because a
+/// forced full re-index re-hashes every file and can run for many minutes.
+#[derive(Clone, Default)]
+pub struct ScanProgress {
+    /// Whether a scan is currently in flight.
+    pub running: bool,
+    /// Total audio files found under the root this pass.
+    pub total: u32,
+    /// Files examined so far (indexed or skipped).
+    pub done: u32,
+    /// Whether this pass is a forced full re-index (re-processes unchanged files).
+    pub force: bool,
+}
+
+static SCAN_PROGRESS: LazyLock<Mutex<HashMap<String, ScanProgress>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Snapshot the current scan progress for a library, or `None` if it has never been scanned.
+pub fn scan_progress(library_id: &str) -> Option<ScanProgress> {
+    SCAN_PROGRESS.lock().ok()?.get(library_id).cloned()
+}
+
+fn progress_begin(library_id: &str, total: u32, force: bool) {
+    if let Ok(mut m) = SCAN_PROGRESS.lock() {
+        m.insert(
+            library_id.to_string(),
+            ScanProgress {
+                running: true,
+                total,
+                done: 0,
+                force,
+            },
+        );
+    }
+}
+
+fn progress_set_done(library_id: &str, done: u32) {
+    if let Ok(mut m) = SCAN_PROGRESS.lock() {
+        if let Some(p) = m.get_mut(library_id) {
+            p.done = done;
+        }
+    }
+}
+
+fn progress_finish(library_id: &str) {
+    if let Ok(mut m) = SCAN_PROGRESS.lock() {
+        if let Some(p) = m.get_mut(library_id) {
+            p.running = false;
+            p.done = p.total;
+        }
+    }
+}
 
 /// Extensions we consider audio files.
 const AUDIO_EXTS: &[&str] = &[
@@ -27,9 +83,11 @@ fn is_audio(path: &Path) -> bool {
 }
 
 /// Walk `root` and upsert every audio file into the SQLite index under `library_id`,
-/// skipping any file under an excluded sub-directory.
-pub async fn initial_scan(db: &SqlitePool, library_id: &str, root: &Path) {
-    info!(library_id, path = ?root, "starting initial scan");
+/// skipping any file under an excluded sub-directory. When `force` is set, every file is re-probed
+/// and re-indexed even if unchanged. This is needed to re-derive index-time decisions (e.g. edition folding)
+/// on a library indexed before that logic existed; the normal path skips unchanged files for speed.
+pub async fn initial_scan(db: &SqlitePool, library_id: &str, root: &Path, force: bool) {
+    info!(library_id, path = ?root, force, "starting initial scan");
     let mut count = 0u32;
     let mut errors = 0u32;
     let mut skipped = 0u32;
@@ -37,14 +95,19 @@ pub async fn initial_scan(db: &SqlitePool, library_id: &str, root: &Path) {
     let mut unchanged = 0u32;
     let excluded = load_exclusions(db, library_id).await;
     let paths = collect_audio_files(root);
+    progress_begin(library_id, paths.len() as u32, force);
+    let mut examined = 0u32;
     for path in paths {
+        examined += 1;
+        progress_set_done(library_id, examined);
         if is_excluded(&path, &excluded) {
             skipped += 1;
             continue;
         }
         // Skip the full re-probe and SHA-256 when mtime and size match what we already indexed. The
         // fs watcher handles live edits between scans, so this only skips genuinely unchanged files.
-        if path_unchanged(db, library_id, &path).await {
+        // A forced rescan bypasses the skip to re-run indexing for every file.
+        if !force && path_unchanged(db, library_id, &path).await {
             unchanged += 1;
             continue;
         }
@@ -56,6 +119,7 @@ pub async fn initial_scan(db: &SqlitePool, library_id: &str, root: &Path) {
             }
         }
     }
+    progress_finish(library_id);
     info!(
         library_id,
         count, errors, skipped, unchanged, "initial scan complete"
@@ -188,7 +252,7 @@ pub fn start_scheduler(
             tokio::time::sleep(interval).await;
             for (id, root) in &libraries {
                 prune_missing(&db, id).await;
-                initial_scan(&db, id, root).await;
+                initial_scan(&db, id, root, false).await;
             }
         }
     })

@@ -33,6 +33,7 @@ pub fn router() -> Router<AppState> {
             "/mgmt/libraries/{id}/rescan",
             axum::routing::post(rescan_library),
         )
+        .route("/mgmt/libraries/{id}/scan-status", get(scan_status))
         .route("/mgmt/browse", get(browse_dirs))
 }
 
@@ -73,7 +74,7 @@ struct LibraryInfo {
     hub_library_id: Option<String>,
     /// Whether files are laid out on disk from the templates below.
     organize: bool,
-    /// Album or default template (e.g. `{albumartist}/{album}/{track} - {title}`).
+    /// Album or default template (e.g. `{albumartist}/{album}/{edition}/{disc}/{track} - {title}`).
     organize_template: Option<String>,
     /// Template for tracks with no album (singles). Falls back to the album template when empty.
     organize_template_single: Option<String>,
@@ -179,7 +180,7 @@ async fn add_library(
     let db = state.db.clone();
     let lib_id = library_id.clone();
     tokio::spawn(async move {
-        scanner::initial_scan(&db, &lib_id, &path).await;
+        scanner::initial_scan(&db, &lib_id, &path, false).await;
     });
 
     scanner::start_watcher(
@@ -369,7 +370,7 @@ async fn set_excluded_dirs(
     let lib = id.clone();
     let root_pb = std::path::PathBuf::from(&root);
     tokio::spawn(async move {
-        scanner::initial_scan(&db, &lib, &root_pb).await;
+        scanner::initial_scan(&db, &lib, &root_pb, false).await;
     });
 
     Ok(StatusCode::NO_CONTENT)
@@ -381,7 +382,7 @@ async fn set_excluded_dirs(
 struct SetOrganizeRequest {
     /// Whether to lay files out from the templates.
     organize: bool,
-    /// Album or default template (e.g. `{albumartist}/{album}/{track} - {title}`). Required to enable.
+    /// Album or default template (e.g. `{albumartist}/{album}/{edition}/{disc}/{track} - {title}`). Required to enable.
     #[serde(default)]
     template: Option<String>,
     /// Optional template for tracks with no album.
@@ -467,13 +468,24 @@ async fn set_organize(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Query for [`rescan_library`]. `force=true` re-probes and re-indexes every file (even unchanged
+/// ones), so index-time decisions like edition folding are re-derived on an already-indexed library;
+/// the default skips unchanged files for speed.
+#[derive(Deserialize)]
+struct RescanQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 /// `POST /v1/mgmt/libraries/{id}/rescan` re-reads every file under the library root in the
 /// background, picking up metadata edits and added or removed files. If organise is on, files are
-/// placed by the templates as they're re-indexed.
+/// placed by the templates as they're re-indexed. Pass `?force=true` for a full re-index that also
+/// re-processes unchanged files.
 async fn rescan_library(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(q): Query<RescanQuery>,
 ) -> AppResult<StatusCode> {
     require_mgmt_auth(&headers, &state).await?;
 
@@ -486,9 +498,10 @@ async fn rescan_library(
     let st = state.clone();
     let lib = id.clone();
     let root_pb = std::path::PathBuf::from(&root);
+    let force = q.force;
     tokio::spawn(async move {
         // Pick up new/changed files, then drop entries for files deleted from disk.
-        scanner::initial_scan(&st.db, &lib, &root_pb).await;
+        scanner::initial_scan(&st.db, &lib, &root_pb, force).await;
         scanner::prune_missing(&st.db, &lib).await;
         // Push the refreshed catalog (including the deletions) to the Hub right away, rather than
         // waiting for the periodic sync, so removed tracks leave browsing promptly.
@@ -498,6 +511,32 @@ async fn rescan_library(
     });
 
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Live progress of the current/last scan, for the management UI's progress bar. State lives in the
+/// scanner (not the client), so it survives navigating away and back while a long full re-index runs.
+#[derive(Serialize)]
+struct ScanStatusResponse {
+    running: bool,
+    total: u32,
+    done: u32,
+    force: bool,
+}
+
+/// `GET /v1/mgmt/libraries/{id}/scan-status` reports the current scan progress (zeros if never run).
+async fn scan_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> AppResult<Json<ScanStatusResponse>> {
+    require_mgmt_auth(&headers, &state).await?;
+    let p = scanner::scan_progress(&id).unwrap_or_default();
+    Ok(Json(ScanStatusResponse {
+        running: p.running,
+        total: p.total,
+        done: p.done,
+        force: p.force,
+    }))
 }
 
 // Directory browser.
