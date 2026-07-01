@@ -1,0 +1,90 @@
+# Chordia acquisition dev stack (Prowlarr only).
+#
+#   docker compose -f compose.acquisition.yaml up -d
+#
+# This is a SIDE stack you bring up next to `.\chordia dev`. Prowlarr is the indexer aggregator the
+# library searches for releases. **qBittorrent is NOT here**: for a native Windows dev library the
+# torrent client must run on Windows too (so the library can import the finished files from the same
+# filesystem, at the exact path qBittorrent reports). See "qBittorrent (native)" below.
+#
+# Chordia ships NO indexers or trackers. You add your own in Prowlarr. You are responsible for the
+# legality of what you acquire in your jurisdiction.
+#
+# ── Prowlarr setup ────────────────────────────────────────────────────────────────────────────────
+#   1. up -d, then open http://127.0.0.1:9696 and finish first-run setup.
+#   2. Add at least one indexer (Add Indexer).
+#   3. Settings → General → copy the API Key (for the toml below).
+#
+# ── FlareSolverr (indexer proxy for Cloudflare-protected trackers) ───────────────────────────────────
+# Many public indexers sit behind Cloudflare / DDoS-Guard; Prowlarr can't solve those challenges on
+# its own, so searches silently return nothing. FlareSolverr (bundled below) runs a headless browser
+# that solves them. Wire it up in Prowlarr ONCE:
+#   1. Settings → Indexers → Indexer Proxies → + → FlareSolverr.
+#   2. Name: flaresolverr · Tags: add a tag (e.g. "flaresolverr") ·
+#      Host: http://flaresolverr:8191   (the service name Prowlarr reaches on the compose network).
+#   3. Save (Test should pass).
+#   4. On each Cloudflare-protected indexer (Settings → Indexers → the indexer), add the SAME tag.
+#      Prowlarr then routes only those indexers' requests through FlareSolverr.
+#
+# ── qBittorrent (native, on Windows) ────────────────────────────────────────────────────────────────
+#   1. Install qBittorrent (https://www.qbittorrent.org/download) and launch it.
+#   2. Tools → Options → Web UI:
+#        • tick "Web User Interface (Remote control)"
+#        • set Port = 8088   (NOT 8080; your dev Hub owns 8080)
+#        • tick "Bypass authentication for clients on localhost"  ← the library connects from
+#          localhost, so no username/password is needed.
+#   3. Pick a save folder OUTSIDE your music root for in-progress downloads (e.g. D:\chordia-staging).
+#      The library hands qBittorrent this same path, then moves finished files into {music}\_incoming.
+#
+# ── Point the library at both (library\chordia-library.toml) ──────────────────────────────────────────
+#   [acquisition]
+#   enabled          = true
+#   prowlarr_url     = "http://localhost:9696"
+#   prowlarr_api_key = "<key from Prowlarr>"
+#   qbit_url         = "http://localhost:8088"
+#   qbit_user        = "admin"          # ignored when localhost auth is bypassed
+#   qbit_pass        = "admin"          # ignored when localhost auth is bypassed
+#   staging_dir      = "D:/chordia-staging"   # ABSOLUTE path; must match qBittorrent's save folder
+#
+# Then restart the library (`.\chordia library`). It reports acquisition health to the Hub on a
+# ~2-min loop; once it sees your indexers the Manager's Download buttons light up.
+
+name: chordia-acquisition
+
+services:
+  prowlarr:
+    image: lscr.io/linuxserver/prowlarr:latest
+    restart: unless-stopped
+    environment:
+      PUID: "${PUID:-1000}"
+      PGID: "${PGID:-1000}"
+      TZ: ${TZ:-Etc/UTC}
+    ports:
+      - "127.0.0.1:${PROWLARR_PORT:-9696}:9696"
+    volumes:
+      - prowlarr-config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Indexer proxy: solves Cloudflare/DDoS-Guard challenges for Prowlarr. Prowlarr reaches it by
+  # service name (http://flaresolverr:8191) on the shared compose network; the published port is just
+  # for poking it directly while debugging.
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: info
+      TZ: ${TZ:-Etc/UTC}
+    ports:
+      - "127.0.0.1:${FLARESOLVERR_PORT:-8191}:8191"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  prowlarr-config:

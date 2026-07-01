@@ -18,8 +18,8 @@ services:
     depends_on:
       - library
     ports:
-      - "80:80"
-      - "443:443"
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
     environment:
       LIBRARY_DOMAIN: ${LIBRARY_DOMAIN:?set LIBRARY_DOMAIN in .env}
       # Only substitute ${LIBRARY_DOMAIN} in the template; leave nginx's own $variables alone.

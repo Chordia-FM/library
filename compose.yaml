@@ -1,12 +1,13 @@
 # Run the self-hosted library in a container. SQLite needs no external service.
+# Overrides (LIBRARY_PORT, MUSIC_DIR, DATA_DIR) are read from `.env`; copy `.env.example`.
 services:
   library:
     build:
       context: ..
       dockerfile: library/Dockerfile
     ports:
-      - "8443:8443"
+      - "${LIBRARY_PORT:-8443}:8443"
     volumes:
-      - ./music:/music:ro          # point at your music; mounted read-only
-      - ./data:/data               # sqlite index + transcode cache + credentials + config
+      - ${DATA_DIR:-./data}:/data                # sqlite index + transcode cache + credentials + config
+      - ${MUSIC_DIR:-./music}:/data/music        # your music (read-write: Organize/Dedupe/imports write here)
     restart: unless-stopped
