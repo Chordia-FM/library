@@ -258,6 +258,83 @@ pub fn normalize(s: &str) -> String {
         .join(" ")
 }
 
+/// Qualifiers that mark the SAME album with extra/changed tracks, folded into the base album (the
+/// edition is kept on the track), so e.g. "X" and "X (Deluxe)" share one album.
+const EDITION_KEYWORDS: &[&str] = &[
+    "deluxe",
+    "expanded",
+    "special",
+    "anniversary",
+    "collector",
+    "complete",
+    "definitive",
+    "ultimate",
+    "platinum",
+    "bonus",
+];
+/// Qualifiers that mark a genuinely DIFFERENT work: never folded (kept as a distinct album). This
+/// includes remasters/reissues: they're an ALTERNATE master of the same tracks, not bonus content, so
+/// folding them would make dedupe collide them with the originals (keeping only one master) or list
+/// every track twice. Keeping them separate preserves the original AND every remaster as its own album.
+const VERSION_KEYWORDS: &[&str] = &[
+    "live",
+    "acoustic",
+    "instrumental",
+    "remix",
+    "demo",
+    "karaoke",
+    "mono",
+    "stereo",
+    "commentary",
+    "cappella",
+    "acapella",
+    "unplugged",
+    "orchestral",
+    "session",
+    "remaster",
+    "reissue",
+];
+
+/// Split an album title into `(base_title, edition)`. A trailing `(…)`/`[…]` edition qualifier
+/// ("Deluxe", "Special Edition", …) is pulled off so those tracks fold into the base album; "version"
+/// qualifiers (Live, Acoustic, Remaster, …) and ordinary parentheses (years, "Pt. 2", "feat. …") are
+/// left intact so genuinely-different works (including remasters/reissues) stay separate.
+pub fn parse_edition(title: &str) -> (String, Option<String>) {
+    let trimmed = title.trim();
+    let Some((base, inner)) = trailing_bracket(trimmed) else {
+        return (trimmed.to_string(), None);
+    };
+    let low = inner.to_lowercase();
+    if VERSION_KEYWORDS.iter().any(|k| low.contains(k)) {
+        return (trimmed.to_string(), None);
+    }
+    let is_edition = EDITION_KEYWORDS.iter().any(|k| low.contains(k))
+        || low.ends_with("edition")
+        || low.ends_with("version");
+    let base = base.trim();
+    if is_edition && !base.is_empty() {
+        (base.to_string(), Some(inner.trim().to_string()))
+    } else {
+        (trimmed.to_string(), None)
+    }
+}
+
+/// Extract a trailing `(…)` or `[…]` group as `(before, inner)`; `None` if the string doesn't end in
+/// a closing bracket.
+fn trailing_bracket(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_end();
+    let (open, close) = match s.chars().last()? {
+        ')' => ('(', ')'),
+        ']' => ('[', ']'),
+        _ => return None,
+    };
+    let open_idx = s.rfind(open)?;
+    Some((
+        &s[..open_idx],
+        &s[open_idx + open.len_utf8()..s.len() - close.len_utf8()],
+    ))
+}
+
 fn is_lossless(codec: &str) -> bool {
     matches!(
         codec,

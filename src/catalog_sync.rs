@@ -8,7 +8,9 @@
 use std::collections::HashSet;
 use std::time::Duration;
 
-use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, SyncTrack};
+use chordia_contracts::catalog::{
+    AlbumArtistResolution, CatalogPruneRequest, CatalogSyncRequest, SyncTrack,
+};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -39,6 +41,7 @@ struct SyncRow {
     release_mbid: Option<String>,
     isrc: Option<String>,
     cover_hash: Option<String>,
+    edition: Option<String>,
 }
 
 fn row_to_track(r: SyncRow) -> SyncTrack {
@@ -60,6 +63,7 @@ fn row_to_track(r: SyncRow) -> SyncTrack {
         release_mbid: r.release_mbid,
         isrc: r.isrc,
         cover_hash: r.cover_hash,
+        edition: r.edition,
     }
 }
 
@@ -103,7 +107,7 @@ async fn sync_library(
                 al.title AS album, al.title_normalized AS album_norm, aa.name AS album_artist, \
                 t.track_no, t.disc_no, al.year AS year, al.genre AS genre, t.duration_ms, \
                 t.content_hash, t.recording_mbid, al.release_mbid AS release_mbid, t.isrc, \
-                t.cover_hash \
+                t.cover_hash, t.edition \
          FROM library_tracks lt JOIN tracks t ON t.id = lt.track_id \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
@@ -121,6 +125,7 @@ async fn sync_library(
     let tracks: Vec<SyncTrack> = rows.into_iter().map(row_to_track).collect();
 
     let mut missing: HashSet<String> = HashSet::new();
+    let mut resolutions: Vec<AlbumArtistResolution> = Vec::new();
     for chunk in tracks.chunks(BATCH) {
         let resp = hub
             .sync_catalog(
@@ -132,7 +137,12 @@ async fn sync_library(
             )
             .await?;
         missing.extend(resp.missing_covers);
+        resolutions.extend(resp.canonical_album_artists);
     }
+
+    // Adopt the Hub's canonical album-artist for each album, and relocate the files of any album whose
+    // folder name changed (consolidating e.g. "Machine Gun Kelly"/"MGK"/"Wiz Khalifa" → "mgk").
+    apply_canonical_album_artists(state, local_id, &resolutions).await;
 
     // Upload only the artwork the Hub asked for.
     for hash in missing {
@@ -166,6 +176,66 @@ async fn sync_library(
 
     info!(library = %local_id, tracks = tracks.len(), "catalog synced to hub");
     Ok(())
+}
+
+/// Store the Hub's canonical album-artist on each matching album, and relocate the files of any album
+/// whose folder name changed. Matches the library's album by its normalized title + the album-artist
+/// name we sent (so it pairs to exactly the row the Hub resolved). Best-effort: a failed match/move is
+/// logged, never fatal to the sync.
+async fn apply_canonical_album_artists(
+    state: &AppState,
+    local_id: &str,
+    resolutions: &[AlbumArtistResolution],
+) {
+    if resolutions.is_empty() {
+        return;
+    }
+    let mut changed: Vec<String> = Vec::new();
+    for r in resolutions {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT al.id, al.canonical_album_artist FROM albums al \
+             JOIN artists ar ON ar.id = al.artist_id \
+             WHERE al.title_normalized = ?1 AND ar.name = ?2 LIMIT 1",
+        )
+        .bind(&r.album_normalized)
+        .bind(&r.album_artist)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten();
+        let Some((album_id, current)) = row else {
+            continue;
+        };
+        if current.as_deref() == Some(r.canonical_artist.as_str()) {
+            continue; // already up to date
+        }
+        if sqlx::query("UPDATE albums SET canonical_album_artist = ?1 WHERE id = ?2")
+            .bind(&r.canonical_artist)
+            .bind(&album_id)
+            .execute(&state.db)
+            .await
+            .is_ok()
+        {
+            changed.push(album_id);
+        }
+    }
+    if changed.is_empty() {
+        return;
+    }
+    // Only relocate when on-disk organization is enabled; otherwise the names are stored and files move
+    // whenever organize is turned on (reorganize_library) or the album is next touched.
+    let Some((root, settings)) = crate::organize::library_settings(&state.db, local_id).await
+    else {
+        return;
+    };
+    for album_id in &changed {
+        if let Err(e) =
+            crate::organize::reorganize_album(&state.db, local_id, &root, &settings, album_id).await
+        {
+            warn!(album_id = %album_id, error = %e, "relocate after album-artist change failed");
+        }
+    }
+    info!(library = %local_id, albums = changed.len(), "relocated albums to canonical artist folder");
 }
 
 /// Spawn the background sync loop.

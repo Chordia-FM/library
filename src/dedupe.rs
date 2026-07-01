@@ -52,6 +52,9 @@ struct CopyRow {
     sample_rate_hz: i64,
     bit_depth: i64,
     channels: i64,
+    /// Edition qualifier (NULL = standard). When a group spans editions, the surviving copy is reset
+    /// to standard so a shared track doesn't keep a stray "Deluxe" tag after dedupe.
+    edition: Option<String>,
 }
 
 /// Comparable quality score: lossless beats lossy; then resolution (rate×depth×channels); then the
@@ -108,7 +111,7 @@ async fn dedupe_pass(state: &AppState) -> anyhow::Result<u32> {
         "SELECT lt.library_id, COALESCE(al.title_normalized, '') AS album_norm, \
                 COALESCE(t.disc_no, 0) AS disc_no, COALESCE(t.track_no, 0) AS track_no, \
                 t.title_norm, t.recording_mbid, t.acoustid, t.content_hash, \
-                fp.path, f.lossless, f.sample_rate_hz, f.bit_depth, f.channels \
+                fp.path, f.lossless, f.sample_rate_hz, f.bit_depth, f.channels, t.edition \
          FROM library_tracks lt \
          JOIN tracks t ON t.id = lt.track_id \
          JOIN files f ON f.content_hash = t.content_hash \
@@ -129,6 +132,8 @@ async fn dedupe_pass(state: &AppState) -> anyhow::Result<u32> {
         paths: Vec<String>,
     }
     let mut groups: HashMap<String, HashMap<String, Entry>> = HashMap::new();
+    // Whether each group includes a standard-edition (NULL) copy, so the survivor can be reset.
+    let mut group_has_standard: HashMap<String, bool> = HashMap::new();
 
     for r in rows {
         // Identity key, most-reliable first: MusicBrainz recording id (stable across encodings),
@@ -157,6 +162,9 @@ async fn dedupe_pass(state: &AppState) -> anyhow::Result<u32> {
             r.channels,
             size,
         );
+        if r.edition.is_none() {
+            group_has_standard.insert(key.clone(), true);
+        }
         let by_hash = groups.entry(key).or_default();
         let entry = by_hash.entry(r.content_hash).or_insert(Entry {
             rank,
@@ -181,6 +189,14 @@ async fn dedupe_pass(state: &AppState) -> anyhow::Result<u32> {
             .max_by_key(|(_, e)| e.rank)
             .map(|(h, _)| h.clone())
             .expect("non-empty");
+        // The kept copy is a SHARED track if the group spanned a standard edition, so clear its edition
+        // so it isn't mislabeled "Deluxe" just because the higher-quality file came from that edition.
+        if group_has_standard.get(&key).copied().unwrap_or(false) {
+            let _ = sqlx::query("UPDATE tracks SET edition = NULL WHERE content_hash = ?")
+                .bind(&keep)
+                .execute(&state.db)
+                .await;
+        }
         for (hash, entry) in &by_hash {
             if *hash == keep {
                 continue;

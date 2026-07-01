@@ -31,9 +31,18 @@ struct TrackMeta {
     title: String,
     artist: String,
     album_artist: Option<String>,
+    /// The Hub's canonical primary artist for this album (folds "Machine Gun Kelly"/"MGK" → "mgk" and
+    /// corrects collabs). Preferred over `album_artist` for the folder when set.
+    canonical_album_artist: Option<String>,
     album: Option<String>,
     track_no: Option<i64>,
     disc_no: Option<i64>,
+    /// Distinct disc numbers on this track's album, so `{disc}` only folders genuinely multi-disc
+    /// releases (a single-disc album collapses the disc segment).
+    disc_count: Option<i64>,
+    /// The track's edition qualifier (deluxe/special/…), folded off the album title at index time.
+    /// Drives `{edition}`/`{type}`; NULL = standard edition.
+    edition: Option<String>,
     year: Option<i64>,
     genre: Option<String>,
 }
@@ -116,26 +125,52 @@ impl RenderCtx {
     /// Resolve a single `{var}` to its value, or empty string when absent/unknown.
     fn resolve_var(&self, name: &str) -> String {
         let m = &self.meta;
+        // Prefer the Hub's CANONICAL album-artist (folds aliases + corrects collabs) when known, else
+        // the album-artist tag, else the track artist.
         let album_artist = m
-            .album_artist
+            .canonical_album_artist
             .as_deref()
+            .or(m.album_artist.as_deref())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .unwrap_or(m.artist.as_str());
         match name.trim().to_ascii_lowercase().as_str() {
             // Use the *primary* artist so a multi-artist track still files under the main artist's
-            // folder (e.g. "Drake feat. Rihanna" → "Drake"), matching the Hub's primary.
+            // folder (e.g. "Drake feat. Rihanna" → "Drake"), matching the Hub's primary. The canonical
+            // name is already a single artist, so primary_artist is a no-op on it.
             "albumartist" | "album_artist" => primary_artist(album_artist),
             "artist" => primary_artist(&m.artist),
-            "album" => m.album.clone().unwrap_or_default(),
+            // `{album}` is the BASE album (deluxe/special fold in); `{edition}`/`{type}` is the
+            // edition qualifier, empty for the standard edition, so `…/{album}/{edition}/…`
+            // collapses to `…/{album}/…` for normal tracks and groups deluxe extras in a subfolder.
+            "album" => m
+                .album
+                .as_deref()
+                .map(|a| crate::metadata::parse_edition(a).0)
+                .unwrap_or_default(),
+            // Prefer the track's stored edition (set at index time, where the album title was already
+            // folded to its base), falling back to parsing the album title for any track indexed
+            // before edition folding shipped (its title may still carry the qualifier).
+            "edition" | "type" => m
+                .edition
+                .clone()
+                .or_else(|| {
+                    m.album
+                        .as_deref()
+                        .and_then(|a| crate::metadata::parse_edition(a).1)
+                })
+                .unwrap_or_default(),
             "title" => m.title.clone(),
             "filename" => self.filename.clone(),
             "track" | "trackno" | "track_no" => {
                 m.track_no.map(|n| format!("{n:02}")).unwrap_or_default()
             }
-            "disc" | "discno" | "disc_no" | "side" => {
-                m.disc_no.map(|n| n.to_string()).unwrap_or_default()
-            }
+            // Only folder genuinely multi-disc releases; a single-disc album resolves empty so the
+            // `…/{disc}/…` segment collapses. Rendered as "Disc N" so it reads as a folder.
+            "disc" | "discno" | "disc_no" | "disk" | "side" => match (m.disc_no, m.disc_count) {
+                (Some(n), Some(c)) if c > 1 => format!("Disc {n}"),
+                _ => String::new(),
+            },
             "year" => m.year.map(|y| y.to_string()).unwrap_or_default(),
             "genre" => m.genre.clone().unwrap_or_default(),
             _ => String::new(),
@@ -485,7 +520,11 @@ pub async fn organize_file(
 
     let Some(meta) = sqlx::query_as::<_, TrackMeta>(
         "SELECT t.title, COALESCE(ar.name, '') AS artist, aa.name AS album_artist, \
-                al.title AS album, t.track_no, t.disc_no, al.year AS year, al.genre AS genre \
+                al.canonical_album_artist AS canonical_album_artist, \
+                al.title AS album, t.track_no, t.disc_no, \
+                (SELECT COUNT(DISTINCT t2.disc_no) FROM tracks t2 WHERE t2.album_id = t.album_id) \
+                    AS disc_count, \
+                t.edition AS edition, al.year AS year, al.genre AS genre \
          FROM tracks t \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
@@ -599,6 +638,33 @@ pub async fn reorganize_library(
     info!(library_id, moved, errors, "reorganize complete");
 }
 
+/// Re-lay every file belonging to ONE album — used after the Hub reports a changed canonical
+/// album-artist, so the album's folder follows the new name and the old one is vacated
+/// (`organize_file`'s `move_and_update` → `prune_empty_dirs` removes the emptied dir).
+pub async fn reorganize_album(
+    db: &SqlitePool,
+    library_id: &str,
+    root: &Path,
+    settings: &OrgSettings,
+    album_id: &str,
+) -> anyhow::Result<()> {
+    let paths: Vec<String> = sqlx::query_scalar(
+        "SELECT fp.path FROM file_paths fp \
+         JOIN tracks t ON t.content_hash = fp.content_hash \
+         WHERE fp.library_id = ? AND t.album_id = ?",
+    )
+    .bind(library_id)
+    .bind(album_id)
+    .fetch_all(db)
+    .await?;
+    for p in paths {
+        if let Err(e) = organize_file(db, library_id, root, settings, Path::new(&p)).await {
+            warn!(path = %p, error = %e, "reorganize_album: organize failed");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,9 +675,12 @@ mod tests {
                 title: "Song".into(),
                 artist: "The Artist".into(),
                 album_artist: Some("Album Artist".into()),
+                canonical_album_artist: None,
                 album: Some("The Album".into()),
                 track_no: Some(3),
                 disc_no: Some(1),
+                disc_count: Some(1),
+                edition: None,
                 year: Some(2020),
                 genre: Some("Rock".into()),
             },
@@ -622,6 +691,57 @@ mod tests {
     #[test]
     fn renders_album_track() {
         let segs = ctx().render("{albumartist}/{album}/{track} - {title}");
+        assert_eq!(segs, vec!["Album Artist", "The Album", "03 - Song"]);
+    }
+
+    #[test]
+    fn default_template_collapses_edition_and_disc_for_a_standard_single_disc_album() {
+        // The shipped default. A normal single-disc, standard-edition track skips both the {edition}
+        // and {disc} folders.
+        let segs = ctx().render("{albumartist}/{album}/{edition}/{disc}/{track} - {title}");
+        assert_eq!(segs, vec!["Album Artist", "The Album", "03 - Song"]);
+    }
+
+    #[test]
+    fn edition_track_gets_its_own_folder() {
+        let mut c = ctx();
+        c.meta.album = Some("The Album (Deluxe Edition)".into());
+        let segs = c.render("{albumartist}/{album}/{edition}/{disc}/{track} - {title}");
+        // {album} folds to the base; the deluxe tracks land under a "Deluxe Edition" subfolder.
+        assert_eq!(
+            segs,
+            vec!["Album Artist", "The Album", "Deluxe Edition", "03 - Song"]
+        );
+    }
+
+    #[test]
+    fn folded_edition_reads_the_track_column_not_the_base_title() {
+        // After folding, the album title is the base and the edition lives on the track. {edition}
+        // must come from there, or a folded deluxe track would lose its subfolder.
+        let mut c = ctx();
+        c.meta.album = Some("The Album".into());
+        c.meta.edition = Some("Deluxe".into());
+        let segs = c.render("{albumartist}/{album}/{edition}/{track} - {title}");
+        assert_eq!(
+            segs,
+            vec!["Album Artist", "The Album", "Deluxe", "03 - Song"]
+        );
+    }
+
+    #[test]
+    fn disc_folders_only_a_multi_disc_album() {
+        let mut c = ctx();
+        c.meta.disc_no = Some(2);
+        c.meta.disc_count = Some(2);
+        let segs = c.render("{albumartist}/{album}/{disc}/{track} - {title}");
+        assert_eq!(
+            segs,
+            vec!["Album Artist", "The Album", "Disc 2", "03 - Song"]
+        );
+        // Single-disc (count 1) collapses the disc segment entirely.
+        c.meta.disc_no = Some(1);
+        c.meta.disc_count = Some(1);
+        let segs = c.render("{albumartist}/{album}/{disc}/{track} - {title}");
         assert_eq!(segs, vec!["Album Artist", "The Album", "03 - Song"]);
     }
 

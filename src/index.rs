@@ -165,20 +165,35 @@ pub async fn upsert_track(
     // Track's primary artist (the raw credit tag, which the Hub splits into individual credits).
     let artist_id = upsert_artist(db, &t.artist, &t.artist_norm, t.mb_artist_id.as_deref()).await?;
     // Album (if any), attributed to the album-artist tag when present, else the track's artist.
+    // A deluxe/special/expanded edition folds into its BASE album (the edition is kept on the track),
+    // so "X" and "X (Deluxe)" share one album row and the deluxe extras sit alongside the originals.
+    let mut track_edition: Option<String> = None;
     let album_id: Option<String> =
         if let Some(album_title) = t.album.as_deref().filter(|s| !s.trim().is_empty()) {
-            let album_norm = t
-                .album_norm
-                .clone()
-                .unwrap_or_else(|| crate::metadata::normalize(album_title));
-            let album_artist_id = match t.album_artist.as_deref().filter(|s| !s.trim().is_empty()) {
-                Some(aa) => upsert_artist(db, aa, &crate::metadata::normalize(aa), None).await?,
-                None => artist_id.clone(),
-            };
+            let (base_title, edition) = crate::metadata::parse_edition(album_title);
+            track_edition = edition;
+            let album_norm = crate::metadata::normalize(&base_title);
+            // Own the album by its PRIMARY artist (first credit), matching how the Hub attributes it,
+            // so a collab like "Blog Era Boyz" credited "mgk & Wiz Khalifa" files under mgk, not whoever
+            // a given file's ALBUMARTIST tag happens to name. We take the album-artist tag when present,
+            // else the track credit, and reduce either to its first artist via `primary_artist`.
+            let album_artist_raw = t
+                .album_artist
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(t.artist.as_str());
+            let album_artist = chordia_contracts::artists::primary_artist(album_artist_raw);
+            let album_artist_id = upsert_artist(
+                db,
+                &album_artist,
+                &crate::metadata::normalize(&album_artist),
+                None,
+            )
+            .await?;
             Some(
                 upsert_album(
                     db,
-                    album_title,
+                    &base_title,
                     &album_norm,
                     &album_artist_id,
                     t.year.map(|y| y as i64),
@@ -213,7 +228,7 @@ pub async fn upsert_track(
             "UPDATE tracks SET title=?,artist_id=?,album_id=?,\
              track_no=COALESCE(track_no, ?),disc_no=COALESCE(disc_no, ?),composer=?,\
              comment=?,isrc=?,bpm=?,lyrics=?,recording_mbid=COALESCE(recording_mbid, ?),\
-             cover_hash=?,title_norm=?,duration_ms=? WHERE id=?",
+             cover_hash=?,title_norm=?,duration_ms=?,edition=? WHERE id=?",
         )
         .bind(&t.title)
         .bind(&artist_id)
@@ -229,6 +244,7 @@ pub async fn upsert_track(
         .bind(cover_hash)
         .bind(&t.title_norm)
         .bind(t.duration_ms as i64)
+        .bind(track_edition.as_deref())
         .bind(&id)
         .execute(db)
         .await?;
@@ -238,8 +254,8 @@ pub async fn upsert_track(
         sqlx::query(
             "INSERT INTO tracks \
              (id,content_hash,title,artist_id,album_id,track_no,disc_no,composer,comment,isrc,\
-              bpm,lyrics,recording_mbid,cover_hash,title_norm,duration_ms) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              bpm,lyrics,recording_mbid,cover_hash,title_norm,duration_ms,edition) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&id)
         .bind(&t.content_hash)
@@ -257,6 +273,7 @@ pub async fn upsert_track(
         .bind(cover_hash)
         .bind(&t.title_norm)
         .bind(t.duration_ms as i64)
+        .bind(track_edition.as_deref())
         .execute(db)
         .await?;
         id
