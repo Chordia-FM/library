@@ -409,6 +409,9 @@ async fn move_and_update(
     current_str: &str,
 ) -> anyhow::Result<PathBuf> {
     if let Some(p) = target.parent() {
+        // Existing ancestors may match the target case-insensitively (Windows) with stale casing —
+        // align them first so the move lands under the canonical spelling.
+        align_dir_casing(db, library_id, root, p).await;
         tokio::fs::create_dir_all(p).await?;
     }
     move_file(current, target).await?;
@@ -455,6 +458,62 @@ async fn prune_empty_dirs(start: Option<&Path>, root: &Path) {
         match tokio::fs::remove_dir(&d).await {
             Ok(()) => dir = d.parent().map(Path::to_path_buf),
             Err(_) => break, // not empty (or error), so stop climbing
+        }
+    }
+}
+
+/// Align the on-disk casing of `desired`'s components (under `root`) with the desired names,
+/// repointing `file_paths` for everything under a renamed directory.
+///
+/// Windows resolves paths case-insensitively, so `create_dir_all` and `rename` silently reuse a
+/// stale-cased folder (e.g. `MGK\` after the canonical artist became `mgk`) and the casing never
+/// heals on its own. Renames here are case-only (same parent), so on a case-sensitive filesystem
+/// the mismatch branch simply never triggers (a component either matches exactly or is absent).
+async fn align_dir_casing(db: &SqlitePool, library_id: &str, root: &Path, desired: &Path) {
+    let Ok(rel) = desired.strip_prefix(root) else {
+        return;
+    };
+    let mut actual = root.to_path_buf();
+    for comp in rel.components() {
+        let want = comp.as_os_str().to_string_lossy().to_string();
+        // What this component is actually called on disk (metadata() can't tell — it resolves
+        // case-insensitively on Windows — so list the parent).
+        let mut found: Option<String> = None;
+        if let Ok(mut rd) = tokio::fs::read_dir(&actual).await {
+            while let Ok(Some(ent)) = rd.next_entry().await {
+                let name = ent.file_name().to_string_lossy().to_string();
+                if name.to_lowercase() == want.to_lowercase() {
+                    found = Some(name);
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(name) if name != want => {
+                let from = actual.join(&name);
+                let to = actual.join(&want);
+                if tokio::fs::rename(&from, &to).await.is_ok() {
+                    let old_prefix = from.to_string_lossy().to_string();
+                    let new_prefix = to.to_string_lossy().to_string();
+                    let _ = sqlx::query(
+                        "UPDATE file_paths SET path = ?1 || substr(path, length(?2) + 1) \
+                         WHERE library_id = ?3 AND substr(path, 1, length(?2)) = ?2",
+                    )
+                    .bind(&new_prefix)
+                    .bind(&old_prefix)
+                    .bind(library_id)
+                    .execute(db)
+                    .await;
+                    info!(from = %old_prefix, to = %new_prefix, "organize: aligned folder casing");
+                    actual = to;
+                } else {
+                    // Locked or in use; keep walking the real casing and retry on a later pass.
+                    actual = from;
+                }
+            }
+            Some(name) => actual.push(name),
+            // Doesn't exist yet: whatever creates it (create_dir_all/move) uses the desired casing.
+            None => return,
         }
     }
 }
@@ -569,6 +628,11 @@ pub async fn organize_file(
 
     let ideal = build_target(root, &template, &ctx, &ext);
     if norm(&ideal) == norm(current) {
+        // Right location, possibly wrong casing (a canonical name can differ only by case, e.g.
+        // "MGK" → "mgk"): heal the on-disk casing instead of leaving the stale folder forever.
+        if ideal.as_os_str() != current.as_os_str() {
+            align_dir_casing(db, library_id, root, &ideal).await;
+        }
         return Ok(None); // already in place
     }
 
@@ -692,6 +756,48 @@ mod tests {
     fn renders_album_track() {
         let segs = ctx().render("{albumartist}/{album}/{track} - {title}");
         assert_eq!(segs, vec!["Album Artist", "The Album", "03 - Song"]);
+    }
+
+    #[tokio::test]
+    async fn align_dir_casing_renames_dirs_and_repoints_paths() {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE file_paths (path TEXT PRIMARY KEY, library_id TEXT NOT NULL, \
+             content_hash TEXT NOT NULL)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let root = std::env::temp_dir().join(format!("chordia-org-case-{}", std::process::id()));
+        let _ = tokio::fs::remove_dir_all(&root).await;
+        let old_dir = root.join("MGK").join("Lace Up");
+        tokio::fs::create_dir_all(&old_dir).await.unwrap();
+        let file = old_dir.join("01 - Song.mp3");
+        tokio::fs::write(&file, b"x").await.unwrap();
+        sqlx::query("INSERT INTO file_paths (path, library_id, content_hash) VALUES (?, 'lib', 'h')")
+            .bind(file.to_string_lossy().to_string())
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let desired = root.join("mgk").join("Lace Up").join("01 - Song.mp3");
+        align_dir_casing(&db, "lib", &root, &desired).await;
+
+        // The artist folder adopted the canonical casing and the indexed path follows it.
+        let names: Vec<String> = std::fs::read_dir(&root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["mgk".to_string()]);
+        assert!(tokio::fs::try_exists(&desired).await.unwrap());
+        let stored: String =
+            sqlx::query_scalar("SELECT path FROM file_paths WHERE library_id = 'lib'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(stored, desired.to_string_lossy().to_string());
+        let _ = tokio::fs::remove_dir_all(&root).await;
     }
 
     #[test]
