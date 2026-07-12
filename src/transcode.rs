@@ -205,7 +205,8 @@ impl Transcoder {
 
     /// Evict least-recently-served cache files until the total is under `max_bytes`.
     async fn enforce_budget(&self) {
-        let mut entries: Vec<(PathBuf, u64, Option<Instant>)> = Vec::new();
+        type Entry = (PathBuf, u64, Option<Instant>, Option<std::time::SystemTime>);
+        let mut entries: Vec<Entry> = Vec::new();
         let mut total: u64 = 0;
         let Ok(mut rd) = tokio::fs::read_dir(&self.cache_dir).await else {
             return;
@@ -229,17 +230,23 @@ impl Transcoder {
             }
             let len = meta.len();
             total += len;
-            // Rank by last-served time; files not served this run (`None`) sort oldest.
+            // Rank by last-served time; files not served this run (`None`) fall back to mtime.
             let rank = access.get(&path).copied();
-            entries.push((path, len, rank));
+            entries.push((path, len, rank, meta.modified().ok()));
         }
 
         if total <= self.max_bytes {
             return;
         }
-        // Oldest first: `None` (unseen) precedes any `Some(instant)`, then earliest instant.
-        entries.sort_by_key(|e| e.2);
-        for (path, len, _) in entries {
+        // Oldest first. Entries not served this run precede served ones and rank among
+        // themselves by mtime, so eviction stays LRU-ish across restarts instead of arbitrary.
+        entries.sort_by(|a, b| match (a.2, b.2) {
+            (None, None) => a.3.cmp(&b.3),
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(x), Some(y)) => x.cmp(&y),
+        });
+        for (path, len, _, _) in entries {
             if total <= self.max_bytes {
                 break;
             }
