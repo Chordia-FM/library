@@ -3,8 +3,8 @@
 //! `probe(path)` reads tags with `lofty` and probes the codec/container with `symphonia`, then
 //! computes the SHA-256 content hash. The result maps directly to the SQLite `tracks` row.
 //!
-//! AcoustID (chromaprint) fingerprinting is deferred to M6. In the interim we use content_hash
-//! and normalized metadata as the primary match signals.
+//! AcoustID (chromaprint) fingerprinting lives in [`crate::fingerprint`] as a background pass;
+//! content_hash and normalized metadata computed here remain the synchronous match signals.
 
 use std::io::Read;
 use std::path::Path;
