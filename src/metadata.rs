@@ -319,6 +319,41 @@ pub fn parse_edition(title: &str) -> (String, Option<String>) {
     }
 }
 
+/// Split an album title into `(base_title, version)` where version is `Some("instrumental")` /
+/// `Some("live")` when the TRAILING bracket marks one — "X (Instrumental)", "X [Live at Wembley
+/// 1986]". Aligned with the Hub's `classify_version`: only instrumental/live count as versions
+/// here; everything else (remaster, acoustic, years, "feat. …") returns `(title, None)`. Matching
+/// is token-based, not substring, so "X (Delivered)" or "X (Alive)" never match. Backs the
+/// `{version}` organize template variable; album identity (title_normalized) is untouched.
+pub fn parse_version(title: &str) -> (String, Option<&'static str>) {
+    let trimmed = title.trim();
+    let Some((base, inner)) = trailing_bracket(trimmed) else {
+        return (trimmed.to_string(), None);
+    };
+    let base = base.trim();
+    if base.is_empty() {
+        return (trimmed.to_string(), None);
+    }
+    let low = inner.to_lowercase();
+    let mut tokens = low
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty());
+    let version = if tokens
+        .clone()
+        .any(|t| t == "instrumental" || t == "instrumentals")
+    {
+        Some("instrumental")
+    } else if tokens.any(|t| t == "live") {
+        Some("live")
+    } else {
+        None
+    };
+    match version {
+        Some(v) => (base.to_string(), Some(v)),
+        None => (trimmed.to_string(), None),
+    }
+}
+
 /// Extract a trailing `(…)` or `[…]` group as `(before, inner)`; `None` if the string doesn't end in
 /// a closing bracket.
 fn trailing_bracket(s: &str) -> Option<(&str, &str)> {

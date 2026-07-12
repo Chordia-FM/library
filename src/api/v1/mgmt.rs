@@ -74,7 +74,7 @@ struct LibraryInfo {
     hub_library_id: Option<String>,
     /// Whether files are laid out on disk from the templates below.
     organize: bool,
-    /// Album or default template (e.g. `{albumartist}/{album}/{edition}/{disc}/{track} - {title}`).
+    /// Album or default template (e.g. `{albumartist}/{album}/{version}/{edition}/{disc}/{track} - {title}`).
     organize_template: Option<String>,
     /// Template for tracks with no album (singles). Falls back to the album template when empty.
     organize_template_single: Option<String>,
@@ -382,7 +382,7 @@ async fn set_excluded_dirs(
 struct SetOrganizeRequest {
     /// Whether to lay files out from the templates.
     organize: bool,
-    /// Album or default template (e.g. `{albumartist}/{album}/{edition}/{disc}/{track} - {title}`). Required to enable.
+    /// Album or default template (e.g. `{albumartist}/{album}/{version}/{edition}/{disc}/{track} - {title}`). Required to enable.
     #[serde(default)]
     template: Option<String>,
     /// Optional template for tracks with no album.

@@ -121,9 +121,37 @@ struct RenderCtx {
     filename: String,
 }
 
+/// Whether `template` references `{version}` (same brace parsing as `substitute`, so spacing and
+/// case don't matter). Gates version-stripping in `{album}`: only a template that files versions
+/// into their own `{version}` segment may fold "X (Live)" down to "X" — for every other template
+/// the full title IS the folder, and stripping it would merge a version album's tracks into the
+/// studio album's folder.
+fn template_references_version(template: &str) -> bool {
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c != '{' {
+            continue;
+        }
+        let mut var = String::new();
+        let mut closed = false;
+        for c2 in chars.by_ref() {
+            if c2 == '}' {
+                closed = true;
+                break;
+            }
+            var.push(c2);
+        }
+        if closed && var.trim().eq_ignore_ascii_case("version") {
+            return true;
+        }
+    }
+    false
+}
+
 impl RenderCtx {
     /// Resolve a single `{var}` to its value, or empty string when absent/unknown.
-    fn resolve_var(&self, name: &str) -> String {
+    /// `version_aware` = the template references `{version}` (see [`template_references_version`]).
+    fn resolve_var(&self, name: &str, version_aware: bool) -> String {
         let m = &self.meta;
         // Prefer the Hub's CANONICAL album-artist (folds aliases + corrects collabs) when known, else
         // the album-artist tag, else the track artist.
@@ -143,10 +171,30 @@ impl RenderCtx {
             // `{album}` is the BASE album (deluxe/special fold in); `{edition}`/`{type}` is the
             // edition qualifier, empty for the standard edition, so `…/{album}/{edition}/…`
             // collapses to `…/{album}/…` for normal tracks and groups deluxe extras in a subfolder.
+            // The version suffix ("X (Live)") folds off ONLY when the template has a `{version}`
+            // segment to receive it.
             "album" => m
                 .album
                 .as_deref()
-                .map(|a| crate::metadata::parse_edition(a).0)
+                .map(|a| {
+                    let base = if version_aware {
+                        crate::metadata::parse_version(a).0
+                    } else {
+                        a.to_string()
+                    };
+                    crate::metadata::parse_edition(&base).0
+                })
+                .unwrap_or_default(),
+            // `{version}` mirrors `{edition}`: empty for the studio release (segment collapses),
+            // "Instrumental"/"Live" for a version album, nesting it under the base album folder.
+            "version" => m
+                .album
+                .as_deref()
+                .and_then(|a| crate::metadata::parse_version(a).1)
+                .map(|v| match v {
+                    "instrumental" => "Instrumental".to_string(),
+                    _ => "Live".to_string(),
+                })
                 .unwrap_or_default(),
             // Prefer the track's stored edition (set at index time, where the album title was already
             // folded to its base), falling back to parsing the album title for any track indexed
@@ -178,7 +226,7 @@ impl RenderCtx {
     }
 
     /// Substitute every `{var}` in one template segment. Unterminated `{` is kept literally.
-    fn substitute(&self, segment: &str) -> String {
+    fn substitute(&self, segment: &str, version_aware: bool) -> String {
         let mut out = String::with_capacity(segment.len());
         let mut chars = segment.chars().peekable();
         while let Some(c) = chars.next() {
@@ -196,7 +244,7 @@ impl RenderCtx {
                 var.push(c2);
             }
             if closed {
-                out.push_str(&self.resolve_var(&var));
+                out.push_str(&self.resolve_var(&var, version_aware));
             } else {
                 out.push('{');
                 out.push_str(&var);
@@ -223,6 +271,7 @@ impl RenderCtx {
     /// The identity-defining variables a template references that are currently missing (empty). A
     /// non-empty result means "don't organize this file yet, we lack the tags it needs".
     fn missing_required_vars(&self, template: &str) -> Vec<String> {
+        let version_aware = template_references_version(template);
         let mut missing = Vec::new();
         let mut chars = template.chars().peekable();
         while let Some(c) = chars.next() {
@@ -241,7 +290,7 @@ impl RenderCtx {
             let name = var.trim().to_ascii_lowercase();
             if closed
                 && Self::REQUIRED_VARS.contains(&name.as_str())
-                && self.resolve_var(&name).trim().is_empty()
+                && self.resolve_var(&name, version_aware).trim().is_empty()
                 && !missing.contains(&name)
             {
                 missing.push(name);
@@ -254,6 +303,7 @@ impl RenderCtx {
     /// extension). Empty folder segments collapse; the final segment (filename) always falls back
     /// to the title, then `"Unknown"`.
     fn render(&self, template: &str) -> Vec<String> {
+        let version_aware = template_references_version(template);
         let raw: Vec<&str> = template
             .split('/')
             .filter(|s| !s.trim().is_empty())
@@ -261,7 +311,7 @@ impl RenderCtx {
         let last = raw.len().saturating_sub(1);
         let mut out: Vec<String> = Vec::new();
         for (i, seg) in raw.iter().enumerate() {
-            let cleaned = tidy(&self.substitute(seg));
+            let cleaned = tidy(&self.substitute(seg, version_aware));
             if i == last {
                 let name = if cleaned.is_empty() {
                     tidy(&self.meta.title)
@@ -758,6 +808,81 @@ mod tests {
         assert_eq!(segs, vec!["Album Artist", "The Album", "03 - Song"]);
     }
 
+    #[test]
+    fn parse_version_recognizes_trailing_markers_only() {
+        use crate::metadata::parse_version;
+        assert_eq!(
+            parse_version("X (Instrumental)"),
+            ("X".into(), Some("instrumental"))
+        );
+        assert_eq!(
+            parse_version("X (Instrumentals)"),
+            ("X".into(), Some("instrumental"))
+        );
+        assert_eq!(parse_version("X [Live]"), ("X".into(), Some("live")));
+        assert_eq!(
+            parse_version("X (Live at Wembley 1986)"),
+            ("X".into(), Some("live"))
+        );
+        // Token matching: no substring false positives; edition/plain brackets pass through whole.
+        assert_eq!(
+            parse_version("X (Delivered)"),
+            ("X (Delivered)".into(), None)
+        );
+        assert_eq!(parse_version("X (Alive)"), ("X (Alive)".into(), None));
+        assert_eq!(
+            parse_version("X (Deluxe Edition)"),
+            ("X (Deluxe Edition)".into(), None)
+        );
+        assert_eq!(parse_version("X"), ("X".into(), None));
+        // Un-bracketed live titles stay unmatched (conservative), as does a bare bracket title.
+        assert_eq!(
+            parse_version("X Live at Wembley"),
+            ("X Live at Wembley".into(), None)
+        );
+        assert_eq!(parse_version("(Live)"), ("(Live)".into(), None));
+    }
+
+    fn live_ctx() -> RenderCtx {
+        let mut c = ctx();
+        c.meta.album = Some("The Album (Live)".into());
+        c
+    }
+
+    #[test]
+    fn version_template_nests_the_version_under_the_base_album() {
+        let segs =
+            live_ctx().render("{albumartist}/{album}/{version}/{edition}/{disc}/{track} - {title}");
+        assert_eq!(segs, vec!["Album Artist", "The Album", "Live", "03 - Song"]);
+    }
+
+    #[test]
+    fn version_template_collapses_for_a_studio_album() {
+        // The shipped default with a normal studio album: {version} collapses away.
+        let segs =
+            ctx().render("{albumartist}/{album}/{version}/{edition}/{disc}/{track} - {title}");
+        assert_eq!(segs, vec!["Album Artist", "The Album", "03 - Song"]);
+    }
+
+    #[test]
+    fn version_album_without_version_var_keeps_its_full_title_folder() {
+        // The collision guard: a template that has no {version} segment must keep "The Album
+        // (Live)" as its own folder — folding it would merge live tracks into the studio album.
+        let segs = live_ctx().render("{albumartist}/{album}/{edition}/{disc}/{track} - {title}");
+        assert_eq!(segs, vec!["Album Artist", "The Album (Live)", "03 - Song"]);
+    }
+
+    #[test]
+    fn instrumental_version_renders_capitalized() {
+        let mut c = ctx();
+        c.meta.album = Some("The Album (Instrumentals)".into());
+        let segs = c.render("{albumartist}/{album}/{version}/{track} - {title}");
+        assert_eq!(
+            segs,
+            vec!["Album Artist", "The Album", "Instrumental", "03 - Song"]
+        );
+    }
+
     #[tokio::test]
     async fn align_dir_casing_renames_dirs_and_repoints_paths() {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -775,11 +900,13 @@ mod tests {
         tokio::fs::create_dir_all(&old_dir).await.unwrap();
         let file = old_dir.join("01 - Song.mp3");
         tokio::fs::write(&file, b"x").await.unwrap();
-        sqlx::query("INSERT INTO file_paths (path, library_id, content_hash) VALUES (?, 'lib', 'h')")
-            .bind(file.to_string_lossy().to_string())
-            .execute(&db)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO file_paths (path, library_id, content_hash) VALUES (?, 'lib', 'h')",
+        )
+        .bind(file.to_string_lossy().to_string())
+        .execute(&db)
+        .await
+        .unwrap();
 
         let desired = root.join("mgk").join("Lace Up").join("01 - Song.mp3");
         align_dir_casing(&db, "lib", &root, &desired).await;
