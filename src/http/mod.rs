@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
-use sqlx::sqlite::SqliteConnectOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
@@ -46,9 +46,15 @@ impl AppState {
         // Disk cache for transcoded (lower-tier) audio.
         let transcode_cache_dir = config.transcode_cache_dir();
         std::fs::create_dir_all(&transcode_cache_dir)?;
+        // Scans, workers, and HTTP readers share this database: WAL lets readers proceed during
+        // writes, the busy timeout rides out short writer contention instead of erroring, and
+        // NORMAL sync is the standard durable-enough pairing with WAL.
         let opts = SqliteConnectOptions::new()
             .filename(config.data_dir.join("library.sqlite"))
-            .create_if_missing(true);
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .busy_timeout(std::time::Duration::from_secs(5));
         let db = SqlitePool::connect_with(opts).await?;
         sqlx::migrate!("./migrations").run(&db).await?;
 
