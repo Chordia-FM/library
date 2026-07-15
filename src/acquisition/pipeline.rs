@@ -29,8 +29,10 @@ enum MonitorOutcome {
     /// Cancelled / terminated on the Hub. The torrent was torn down; stop without failing.
     Cancelled,
     /// Dead swarm, stall, or mismatched content: the torrent was removed, and the caller should try
-    /// the next-best candidate (and fail the job only once none are left).
-    Abandoned,
+    /// the next-best candidate (and fail the job only once none are left). Carries the specific reason
+    /// when the rejection was about CONTENT (e.g. a single-track job whose release doesn't contain the
+    /// requested track), so the final failure can tell the truth instead of blaming seeders.
+    Abandoned(Option<String>),
 }
 
 /// Run one claimed job end to end, reporting status back to the Hub. Failures are reported, not
@@ -95,6 +97,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
             &music_root,
             &hash,
             &[], // resumed downloads carry no expected tracklist; verification ran on the first pass
+            &[], // and no track filter — a resume imports whatever the first pass grabbed
         )
         .await
     }
@@ -105,7 +108,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
         // The resumed swarm went dead/stalled. The monitor already removed the torrent + cleared
         // bookkeeping; there's no candidate list to fall back on across a restart, so report it failed
         // and let the user retry (which re-searches fresh).
-        Ok(MonitorOutcome::Abandoned) => {
+        Ok(MonitorOutcome::Abandoned(_)) => {
             let _ = hub
                 .report_job_status(
                     &creds.server_api_key,
@@ -228,6 +231,9 @@ async fn run_inner(
     // other libraries' concurrent adds.
     let tag = job.job_id.to_string();
     let total = candidates.len();
+    // Reasons candidates were rejected on CONTENT (not seeders), so a final failure can name the real
+    // cause (e.g. "the release doesn't contain the requested track") instead of a phantom swarm problem.
+    let mut content_reasons: Vec<String> = Vec::new();
     for (i, chosen) in candidates.into_iter().enumerate() {
         // Grab.
         let mut grab = status("grabbing");
@@ -268,13 +274,17 @@ async fn run_inner(
             &music_root,
             &hash,
             &job.expected_titles,
+            &job.wanted_titles,
         )
         .await?
         {
             MonitorOutcome::Imported | MonitorOutcome::Cancelled => return Ok(()),
-            MonitorOutcome::Abandoned => {
+            MonitorOutcome::Abandoned(reason) => {
                 // The monitor already removed the torrent + cleared bookkeeping; fall through to the
-                // next-best candidate (if any).
+                // next-best candidate (if any). Keep any CONTENT reason to explain a final failure.
+                if let Some(r) = reason {
+                    content_reasons.push(r);
+                }
                 tracing::info!(
                     job = %job.job_id,
                     "candidate {}/{} abandoned, trying next",
@@ -285,13 +295,18 @@ async fn run_inner(
         }
     }
 
-    // Every candidate we tried was a dead swarm / stalled / unusable.
-    hub.report_job_status(
-        api_key,
-        job.job_id,
-        &failed("no usable source: every candidate stalled or had no live seeders"),
-    )
-    .await?;
+    // Every candidate was rejected. If the rejections were about CONTENT (e.g. a single-track job whose
+    // releases don't actually contain the requested track), say so plainly instead of blaming seeders —
+    // otherwise the user chases a phantom swarm problem for a track that simply isn't in any rip found.
+    let msg = match content_reasons.last() {
+        Some(reason) if !job.wanted_titles.is_empty() => format!(
+            "none of the {total} release(s) found contain the requested track — {reason}. It may not be in any rip your indexers can reach."
+        ),
+        Some(reason) => format!("no usable source: {reason}"),
+        None => "no usable source: every candidate stalled or had no live seeders".to_string(),
+    };
+    hub.report_job_status(api_key, job.job_id, &failed(&msg))
+        .await?;
     Ok(())
 }
 
@@ -309,6 +324,9 @@ async fn monitor_to_completion(
     music_root: &Path,
     hash: &str,
     expected_titles: &[String],
+    // For a single-track download: the exact title(s) to import; the release must contain them and only
+    // the matching file(s) are imported. Empty = import the whole download (album/discography).
+    wanted_titles: &[String],
 ) -> anyhow::Result<MonitorOutcome> {
     // Two independent decisions: (1) `keep_source` — copy vs move at import. Remote/shared-seedbox mode
     // ALWAYS copies (the files live behind a mount and must never be moved out from under the swarm).
@@ -368,13 +386,14 @@ async fn monitor_to_completion(
                 .config
                 .acquisition
                 .local_content_path(&info.content_path);
-            if let Some(reason) = verify_content(&content, expected_titles) {
-                // Mislabelled (right title, wrong audio): drop it and let the caller try the next-best
-                // candidate. Only if none remain does the job end up failed.
+            if let Some(reason) = verify_content(&content, expected_titles, wanted_titles) {
+                // Mislabelled album, OR (track job) the release lacks the wanted track: drop it and let
+                // the caller try the next-best candidate. Only if none remain does the job fail — so
+                // downloading one bonus track never dumps a whole, possibly-wrong album into the library.
                 let _ = client.remove_torrent(hash, true).await;
                 let _ = super::clear_job(&state.db, job_id).await;
                 tracing::warn!(job = %job_id, "{reason}; abandoning, will try next candidate");
-                return Ok(MonitorOutcome::Abandoned);
+                return Ok(MonitorOutcome::Abandoned(Some(reason)));
             }
             import(
                 &state.db,
@@ -383,6 +402,7 @@ async fn monitor_to_completion(
                 &state.config.acquisition.import_subdir,
                 &content,
                 keep_source,
+                wanted_titles,
             )
             .await?;
             // Push the new tracks to the Hub BEFORE reporting completed, so the catalog reflects them
@@ -427,7 +447,7 @@ async fn monitor_to_completion(
                 "download {}; abandoning, will try next candidate",
                 if dead_swarm { "found no live seeders" } else { "stalled" }
             );
-            return Ok(MonitorOutcome::Abandoned);
+            return Ok(MonitorOutcome::Abandoned(None));
         }
         if info.progress - last_reported >= 0.02 {
             last_reported = info.progress;
@@ -512,17 +532,47 @@ async fn search_relevant(
     job: &ClaimedJob,
 ) -> anyhow::Result<Vec<Release>> {
     let album = job.album_title.as_deref();
+    // When a specific edition was requested, bias the primary query toward it (e.g. append "Deluxe")
+    // so Prowlarr surfaces that edition first. "Standard"/empty carries no signal, so skip it.
+    let edition = job
+        .edition_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("standard"));
+    // A specific edition was requested → every candidate must actually BE that edition. This is what
+    // stops a fallback query from grabbing the (higher-seeded) standard release instead of the Deluxe:
+    // if no true edition match is found, we return nothing and the job reports no_results.
+    let keep_edition = |rels: &mut Vec<Release>| {
+        if let Some(ed) = edition {
+            rels.retain(|r| edition_match(&r.title, ed));
+        }
+    };
     for artist_opt in artist_name_candidates(job) {
         let artist = artist_opt.as_deref();
-        let query = query_str(artist, album, job.display_title.as_deref());
+        let base = query_str(artist, album, job.display_title.as_deref());
+        let query = match edition {
+            Some(ed) => format!("{base} {ed}"),
+            None => base.clone(),
+        };
         let mut releases = client.search(&query).await?;
         releases.retain(|r| is_relevant(&r.title, artist, album));
+        keep_edition(&mut releases);
+        // Edition query found nothing → retry the plain artist+album query (the edition may be labelled
+        // differently on the tracker), but still require the edition token so we never fall back to the
+        // standard release.
+        if releases.is_empty() && edition.is_some() {
+            let mut more = client.search(&base).await?;
+            more.retain(|r| is_relevant(&r.title, artist, album));
+            keep_edition(&mut more);
+            releases = more;
+        }
         if releases.is_empty() {
             if let Some(core) = core_fallback(album) {
                 let backup = query_str(artist, Some(&core), job.display_title.as_deref());
-                if backup != query {
+                if backup != base {
                     let mut more = client.search(&backup).await?;
                     more.retain(|r| is_relevant(&r.title, artist, Some(&core)));
+                    keep_edition(&mut more);
                     releases = more;
                 }
             }
@@ -593,13 +643,21 @@ async fn import(
     import_subdir: &str,
     content_path: &str,
     keep_source: bool,
+    // When non-empty (a track job), import ONLY the files matching a wanted title; otherwise import all.
+    wanted_titles: &[String],
 ) -> anyhow::Result<()> {
     let dest = music_root.join(import_subdir);
     std::fs::create_dir_all(&dest)?;
     let mut placed = 0usize;
-    place_audio(Path::new(content_path), &dest, keep_source, &mut placed)?;
+    place_audio(
+        Path::new(content_path),
+        &dest,
+        keep_source,
+        &mut placed,
+        wanted_titles,
+    )?;
     if placed == 0 {
-        anyhow::bail!("no audio files found in the completed download");
+        anyhow::bail!("no matching audio files found in the completed download");
     }
     scanner::initial_scan(db, local_lib_id, &dest, false).await;
     Ok(())
@@ -610,18 +668,60 @@ fn place_audio(
     dest_dir: &Path,
     keep_source: bool,
     placed: &mut usize,
+    wanted_titles: &[String],
 ) -> anyhow::Result<()> {
     if src.is_file() {
-        if is_audio(src) {
+        // For a track job, keep only the files whose name matches a wanted title.
+        let keep =
+            is_audio(src) && (wanted_titles.is_empty() || file_is_wanted(src, wanted_titles));
+        if keep {
             place_one(src, dest_dir, keep_source)?;
             *placed += 1;
         }
     } else if src.is_dir() {
         for entry in std::fs::read_dir(src)? {
-            place_audio(&entry?.path(), dest_dir, keep_source, placed)?;
+            place_audio(&entry?.path(), dest_dir, keep_source, placed, wanted_titles)?;
         }
     }
     Ok(())
+}
+
+/// Whether an audio file's name matches one of the wanted track titles.
+fn file_is_wanted(src: &Path, wanted_titles: &[String]) -> bool {
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    wanted_titles.iter().any(|w| title_matches(stem, w))
+}
+
+/// The file-name stems (extension stripped) of every audio file under `root`, for title matching.
+fn audio_file_stems(root: &Path) -> Vec<String> {
+    fn walk(p: &Path, out: &mut Vec<String>) {
+        if p.is_file() {
+            if is_audio(p) {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.push(stem.to_string());
+                }
+            }
+        } else if let Ok(rd) = std::fs::read_dir(p) {
+            for entry in rd.flatten() {
+                walk(&entry.path(), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
+
+/// Whether an audio file's name plausibly IS the given track title: most of the title's word tokens
+/// appear in the file name (robust to a leading track number, a "feat." tail, and the extension).
+fn title_matches(file_stem: &str, title: &str) -> bool {
+    let hay: HashSet<String> = tokenize(file_stem).into_iter().collect();
+    let toks = tokenize(title);
+    if toks.is_empty() {
+        return false;
+    }
+    let hit = toks.iter().filter(|t| hay.contains(*t)).count();
+    hit as f32 / toks.len() as f32 >= 0.75
 }
 
 fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<()> {
@@ -651,7 +751,22 @@ fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<(
 /// audio files than the album's track count, i.e. a single / EP / partial / mislabelled grab. Generous (a
 /// third of expected) so a standard edition of a multi-edition release, or a deluxe, never trips it.
 /// Returns `Some(reason)` to fail, else `None`; skips when the cached tracklist is too small to judge.
-fn verify_content(content_path: &str, expected_titles: &[String]) -> Option<String> {
+fn verify_content(
+    content_path: &str,
+    expected_titles: &[String],
+    wanted_titles: &[String],
+) -> Option<String> {
+    // Track job: require every wanted title to be present as a file (reject a release lacking it, so a
+    // single-track download can't import a whole wrong album). Import then keeps only those files.
+    if !wanted_titles.is_empty() {
+        let stems = audio_file_stems(Path::new(content_path));
+        for want in wanted_titles {
+            if !stems.iter().any(|s| title_matches(s, want)) {
+                return Some(format!("the wanted track “{want}” isn't in this release"));
+            }
+        }
+        return None;
+    }
     let expected = expected_titles.len();
     if expected < 5 {
         return None; // single / EP / uncached: nothing reliable to check against
@@ -960,6 +1075,22 @@ fn tokenize(s: &str) -> Vec<String> {
         .filter(|w| w.len() > 1)
         .map(String::from)
         .collect()
+}
+
+/// Whether a candidate title plausibly IS the requested edition. Matches on the edition's distinctive
+/// word (the longest alphabetic token, ignoring generic "edition"/"version"), as a substring so
+/// "Remaster" matches "Remastered". Used to reject the standard release when a specific edition (e.g.
+/// "Deluxe") was requested.
+fn edition_match(title: &str, edition: &str) -> bool {
+    let key = tokenize(edition)
+        .into_iter()
+        .filter(|t| !matches!(t.as_str(), "edition" | "version" | "the"))
+        // Prefer a real word (has letters) over a bare year number, then the longest such token.
+        .max_by_key(|t| (t.chars().any(|c| c.is_alphabetic()), t.len()));
+    match key {
+        Some(k) => title.to_lowercase().contains(&k),
+        None => true,
+    }
 }
 
 /// Volume numerals recognised for sequel disambiguation: Roman I–XX, the spelled-out cardinals

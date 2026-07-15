@@ -6,8 +6,10 @@ use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::get;
 use axum::{Json, Router};
+use chordia_contracts::auth::CapabilityAction;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{require_action, CapToken};
 use crate::error::{AppError, AppResult};
 use crate::http::AppState;
 use crate::index;
@@ -35,6 +37,29 @@ pub fn router() -> Router<AppState> {
         )
         .route("/mgmt/libraries/{id}/scan-status", get(scan_status))
         .route("/mgmt/browse", get(browse_dirs))
+        .route("/mgmt/recover", axum::routing::post(recover_management))
+}
+
+#[derive(Serialize)]
+struct RecoverResponse {
+    management_token: String,
+}
+
+/// `POST /v1/mgmt/recover` — exchange a Hub-minted `RecoverManagement` capability (owner-only, verified
+/// offline against the Hub JWKS by the [`CapToken`] extractor, `aud` pinned to this server) for this
+/// server's management token. Lets an owner signed in on any device recover folder-management access
+/// without re-running the one-time pairing flow. The Hub never sees the management token.
+async fn recover_management(
+    State(state): State<AppState>,
+    token: CapToken,
+) -> AppResult<Json<RecoverResponse>> {
+    require_action(&token, CapabilityAction::RecoverManagement)?;
+    let lock = state.credentials.read().await;
+    let management_token = lock
+        .as_ref()
+        .map(|c| c.management_token.clone())
+        .ok_or(AppError::Unauthorized)?;
+    Ok(Json(RecoverResponse { management_token }))
 }
 
 pub(crate) async fn require_mgmt_auth(headers: &HeaderMap, state: &AppState) -> AppResult<()> {

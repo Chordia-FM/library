@@ -114,6 +114,34 @@ impl AcquisitionClient {
 
     // ── Prowlarr ─────────────────────────────────────────────────────────────
 
+    /// GET a Prowlarr endpoint with the API key. Surfaces the REAL failure cause — reqwest's own
+    /// message is just the opaque `error sending request for url (…)`; the timeout / connect / TLS
+    /// reason lives in its error `source()` chain — and retries a transient connection blip twice
+    /// (Prowlarr fans each search out across every indexer, so a momentary hiccup is common). A
+    /// genuine timeout fails fast: re-running a 60s search that's actually slow just wastes minutes.
+    async fn prowlarr_get(&self, url: &str) -> anyhow::Result<reqwest::Response> {
+        let mut last = String::new();
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 * attempt as u64)).await;
+            }
+            match self
+                .http
+                .get(url)
+                .header("X-Api-Key", &self.prowlarr_key)
+                .send()
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(e) if e.is_timeout() => {
+                    anyhow::bail!("prowlarr request timed out (60s): {}", err_chain(&e))
+                }
+                Err(e) => last = err_chain(&e),
+            }
+        }
+        anyhow::bail!("prowlarr request failed after 3 tries: {last}")
+    }
+
     /// Search Prowlarr's audio categories for `query`.
     pub async fn search(&self, query: &str) -> anyhow::Result<Vec<Release>> {
         let url = format!(
@@ -121,12 +149,7 @@ impl AcquisitionClient {
             self.prowlarr_url.trim_end_matches('/'),
             urlencode(query)
         );
-        let resp = self
-            .http
-            .get(&url)
-            .header("X-Api-Key", &self.prowlarr_key)
-            .send()
-            .await?;
+        let resp = self.prowlarr_get(&url).await?;
         if !resp.status().is_success() {
             anyhow::bail!("prowlarr search failed {}", resp.status());
         }
@@ -137,12 +160,7 @@ impl AcquisitionClient {
     /// Number of indexers Prowlarr has configured (for the health report).
     pub async fn indexer_count(&self) -> anyhow::Result<u32> {
         let url = format!("{}/api/v1/indexer", self.prowlarr_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .get(&url)
-            .header("X-Api-Key", &self.prowlarr_key)
-            .send()
-            .await?;
+        let resp = self.prowlarr_get(&url).await?;
         if !resp.status().is_success() {
             anyhow::bail!("prowlarr indexer list failed {}", resp.status());
         }
@@ -486,6 +504,20 @@ impl AcquisitionClient {
             .filter_map(|t| t["hash"].as_str().map(|s| s.to_lowercase()))
             .collect())
     }
+}
+
+/// Render an error plus its full `source()` chain. A reqwest transport failure's top-level `Display`
+/// is only `error sending request for url (…)`; the actual cause (`operation timed out`, `tcp connect
+/// error: …`, a TLS error) is a nested source, so we walk and join the chain for a usable message.
+fn err_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        s.push_str(": ");
+        s.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    s
 }
 
 fn release_from_json(r: &Value) -> Option<Release> {
