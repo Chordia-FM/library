@@ -228,7 +228,7 @@ pub async fn upsert_track(
             "UPDATE tracks SET title=?,artist_id=?,album_id=?,\
              track_no=COALESCE(track_no, ?),disc_no=COALESCE(disc_no, ?),composer=?,\
              comment=?,isrc=?,bpm=?,lyrics=?,recording_mbid=COALESCE(recording_mbid, ?),\
-             cover_hash=?,title_norm=?,duration_ms=?,edition=? WHERE id=?",
+             cover_hash=?,title_norm=?,duration_ms=?,edition=?,advisory=? WHERE id=?",
         )
         .bind(&t.title)
         .bind(&artist_id)
@@ -245,6 +245,7 @@ pub async fn upsert_track(
         .bind(&t.title_norm)
         .bind(t.duration_ms as i64)
         .bind(track_edition.as_deref())
+        .bind(t.advisory.as_deref())
         .bind(&id)
         .execute(db)
         .await?;
@@ -254,8 +255,8 @@ pub async fn upsert_track(
         sqlx::query(
             "INSERT INTO tracks \
              (id,content_hash,title,artist_id,album_id,track_no,disc_no,composer,comment,isrc,\
-              bpm,lyrics,recording_mbid,cover_hash,title_norm,duration_ms,edition) \
-             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+              bpm,lyrics,recording_mbid,cover_hash,title_norm,duration_ms,edition,advisory) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         )
         .bind(&id)
         .bind(&t.content_hash)
@@ -274,6 +275,7 @@ pub async fn upsert_track(
         .bind(&t.title_norm)
         .bind(t.duration_ms as i64)
         .bind(track_edition.as_deref())
+        .bind(t.advisory.as_deref())
         .execute(db)
         .await?;
         id

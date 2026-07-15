@@ -51,6 +51,8 @@ pub struct ProbedTrack {
     pub bpm: Option<u32>,
     /// Whether the album is a compilation ("various artists").
     pub compilation: bool,
+    /// Content advisory from the iTunes/ID3 rating tag: `"explicit"` / `"clean"`, `None` if unrated.
+    pub advisory: Option<String>,
     /// Unsynchronized lyrics, if embedded.
     pub lyrics: Option<String>,
     /// MusicBrainz IDs embedded in the tags (Picard-tagged libraries). Save a network lookup.
@@ -122,6 +124,16 @@ pub fn probe(path: &Path) -> anyhow::Result<ProbedTrack> {
     let compilation = str_tag(&ItemKey::FlagCompilation)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
+    // iTunes/ID3 advisory rating: "1" = explicit, "2" = clean, "0"/absent = unrated. lofty maps
+    // the ID3v2 `ITUNESADVISORY` frame and MP4 `rtng` atom to `ParentalAdvisory`, but has no
+    // Vorbis-comment mapping, so fall back to the raw `ITUNESADVISORY` key for FLAC/OGG.
+    let advisory = str_tag(&ItemKey::ParentalAdvisory)
+        .or_else(|| str_tag(&ItemKey::Unknown("ITUNESADVISORY".to_string())))
+        .and_then(|v| match v.trim() {
+            "1" => Some("explicit".to_string()),
+            "2" => Some("clean".to_string()),
+            _ => None,
+        });
     let recording_mbid = str_tag(&ItemKey::MusicBrainzRecordingId);
     let release_mbid = str_tag(&ItemKey::MusicBrainzReleaseId);
     let mb_artist_id = str_tag(&ItemKey::MusicBrainzArtistId);
@@ -200,6 +212,7 @@ pub fn probe(path: &Path) -> anyhow::Result<ProbedTrack> {
         label,
         bpm,
         compilation,
+        advisory,
         lyrics,
         recording_mbid,
         release_mbid,

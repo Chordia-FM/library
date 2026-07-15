@@ -42,6 +42,7 @@ struct SyncRow {
     isrc: Option<String>,
     cover_hash: Option<String>,
     edition: Option<String>,
+    advisory: Option<String>,
 }
 
 fn row_to_track(r: SyncRow) -> SyncTrack {
@@ -64,6 +65,7 @@ fn row_to_track(r: SyncRow) -> SyncTrack {
         isrc: r.isrc,
         cover_hash: r.cover_hash,
         edition: r.edition,
+        advisory: r.advisory,
     }
 }
 
@@ -107,7 +109,7 @@ async fn sync_library(
                 al.title AS album, al.title_normalized AS album_norm, aa.name AS album_artist, \
                 t.track_no, t.disc_no, al.year AS year, al.genre AS genre, t.duration_ms, \
                 t.content_hash, t.recording_mbid, al.release_mbid AS release_mbid, t.isrc, \
-                t.cover_hash, t.edition \
+                t.cover_hash, t.edition, t.advisory \
          FROM library_tracks lt JOIN tracks t ON t.id = lt.track_id \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
