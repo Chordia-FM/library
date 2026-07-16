@@ -50,7 +50,7 @@ pub async fn run_job(state: &AppState, job: ClaimedJob) {
         let mut removed = true;
         if let Ok(Some(hash)) = super::prior_hash(&state.db, job.job_id).await {
             removed = match AcquisitionClient::from_config(&state.config.acquisition) {
-                Some(client) => client.remove_torrent(&hash, true).await.is_ok(),
+                Some(client) => client.remove_on_teardown(&hash).await.is_ok(),
                 None => false,
             };
         }
@@ -79,7 +79,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
             .await
             .unwrap_or(true)
         {
-            if client.remove_torrent(&hash, true).await.is_ok() {
+            if client.remove_on_teardown(&hash).await.is_ok() {
                 let _ = super::clear_job(&state.db, job_id).await;
             }
             return Ok(MonitorOutcome::Cancelled);
@@ -121,7 +121,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
             tracing::warn!(job = %job_id, error = %e, "download resume failed");
             // Symmetric with run_job: tear down the torrent, keep the bookkeeping if removal fails.
             let removed = match AcquisitionClient::from_config(&state.config.acquisition) {
-                Some(client) => client.remove_torrent(&hash, true).await.is_ok(),
+                Some(client) => client.remove_on_teardown(&hash).await.is_ok(),
                 None => false,
             };
             let _ = hub
@@ -248,7 +248,7 @@ async fn run_inner(
         // candidate in this loop, can leave an old torrent for this job. Remove it + its files before
         // grabbing fresh, so attempts don't pile up orphaned downloads.
         if let Ok(Some(old_hash)) = super::prior_hash(&state.db, job.job_id).await {
-            let _ = client.remove_torrent(&old_hash, true).await;
+            let _ = client.remove_on_teardown(&old_hash).await;
         }
 
         if local_staging {
@@ -348,7 +348,7 @@ async fn monitor_to_completion(
         // still active) rather than killing a healthy download. Only drop the resume bookkeeping once
         // removal succeeds; otherwise keep the row so a later resume re-attempts the teardown.
         if !hub.job_active(api_key, job_id).await.unwrap_or(true) {
-            if client.remove_torrent(hash, true).await.is_ok() {
+            if client.remove_on_teardown(hash).await.is_ok() {
                 let _ = super::clear_job(&state.db, job_id).await;
                 tracing::info!(job = %job_id, "download cancelled: removed torrent + files");
             } else {
@@ -386,11 +386,21 @@ async fn monitor_to_completion(
                 .config
                 .acquisition
                 .local_content_path(&info.content_path);
+            // A just-completed torrent is renamed into place on the seedbox, but a network mount
+            // (sshfs/rclone) has no push notification and caches directory listings, so the files can
+            // be briefly invisible here. Wait for the import source to appear before reading it, so
+            // mount-propagation lag doesn't fail (and tear down) a perfectly good download.
+            for _ in 0..15u32 {
+                if Path::new(&content).exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
             if let Some(reason) = verify_content(&content, expected_titles, wanted_titles) {
                 // Mislabelled album, OR (track job) the release lacks the wanted track: drop it and let
                 // the caller try the next-best candidate. Only if none remain does the job fail — so
                 // downloading one bonus track never dumps a whole, possibly-wrong album into the library.
-                let _ = client.remove_torrent(hash, true).await;
+                let _ = client.remove_on_teardown(hash).await;
                 let _ = super::clear_job(&state.db, job_id).await;
                 tracing::warn!(job = %job_id, "{reason}; abandoning, will try next candidate");
                 return Ok(MonitorOutcome::Abandoned(Some(reason)));
@@ -438,7 +448,7 @@ async fn monitor_to_completion(
         // candidate. Otherwise, the slower flatline watchdog for a download that started then stalled.
         let dead_swarm = best_progress <= 0.0001 && last_alive.elapsed() > NO_PEERS_TIMEOUT;
         if dead_swarm || last_advance.elapsed() > STALL_TIMEOUT {
-            let _ = client.remove_torrent(hash, true).await;
+            let _ = client.remove_on_teardown(hash).await;
             let _ = super::clear_job(&state.db, job_id).await;
             tracing::info!(
                 job = %job_id,

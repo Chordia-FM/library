@@ -80,6 +80,9 @@ pub struct AcquisitionClient {
     qbit_url: String,
     qbit_user: Option<String>,
     qbit_pass: Option<String>,
+    /// Remote/shared-seedbox mode: finished files live on a mount this library only COPIES from and
+    /// never owns, so a teardown must never delete them (see `remove_on_teardown`).
+    remote: bool,
     /// The WebUI session cookie as a full `name=value` pair. The cookie NAME varies by qBittorrent
     /// version (`SID` on old builds, `QBT_SID_<port>` on 5.x+), so we store and replay it verbatim.
     session: Mutex<Option<String>>,
@@ -108,6 +111,7 @@ impl AcquisitionClient {
             qbit_url: cfg.qbit_url.clone()?,
             qbit_user: cfg.qbit_user.clone(),
             qbit_pass: cfg.qbit_pass.clone(),
+            remote: cfg.is_remote(),
             session: Mutex::new(None),
         })
     }
@@ -493,6 +497,13 @@ impl AcquisitionClient {
             anyhow::bail!("qBittorrent delete failed {}", resp.status());
         }
         Ok(())
+    }
+
+    /// Remove a torrent during TEARDOWN (failure, cancel, abandon, or pre-grab cleanup), deleting its
+    /// files too — EXCEPT in remote/shared-seedbox mode, where the files live on a mount this library
+    /// only copies from and never owns, so a teardown must never wipe the seedbox's data.
+    pub async fn remove_on_teardown(&self, hash: &str) -> anyhow::Result<()> {
+        self.remove_torrent(hash, !self.remote).await
     }
 
     /// Every torrent infohash currently in qBittorrent (lowercased), for detecting a just-added one.
