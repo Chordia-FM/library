@@ -481,6 +481,24 @@ impl AcquisitionClient {
         }))
     }
 
+    /// The torrent's contained file names (relative paths), available as soon as its METADATA has
+    /// resolved — long before any content downloads. Empty until then (magnets need a peer to hand
+    /// over metadata). Powers the early wrong-release check: a mislabelled torrent is caught from
+    /// its file list in seconds instead of after a full download.
+    pub async fn torrent_files(&self, hash: &str) -> anyhow::Result<Vec<String>> {
+        let resp = self
+            .qbit_get("/api/v2/torrents/files", &[("hash", hash)])
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("qBittorrent files failed {}", resp.status());
+        }
+        let arr: Vec<Value> = resp.json().await?;
+        Ok(arr
+            .iter()
+            .filter_map(|f| f["name"].as_str().map(String::from))
+            .collect())
+    }
+
     /// Remove a torrent from qBittorrent. `delete_files` also deletes its on-disk data, so pass false
     /// when we've already moved the files into the library.
     pub async fn remove_torrent(&self, hash: &str, delete_files: bool) -> anyhow::Result<()> {

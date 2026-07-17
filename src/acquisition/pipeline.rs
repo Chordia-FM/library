@@ -375,8 +375,30 @@ async fn monitor_to_completion(
     let mut best_progress = -1.0f32;
     let mut last_advance = Instant::now();
     let mut last_alive = Instant::now();
+    // Set once the torrent's metadata (file list) has been checked against the album's tracklist.
+    let mut manifest_checked = false;
     loop {
         tokio::time::sleep(Duration::from_secs(10)).await;
+        // Early wrong-release check: the moment the torrent's metadata resolves, its FILE LIST gets
+        // the same content check the post-download import does. A mislabelled torrent (right-looking
+        // name, wrong audio inside) is abandoned within seconds of the grab — before it spends the
+        // whole download — and the run loop falls through to the next-best candidate.
+        if !manifest_checked {
+            if let Ok(names) = client.torrent_files(hash).await {
+                if !names.is_empty() {
+                    manifest_checked = true;
+                    if let Some(reason) = verify_manifest(&names, expected_titles, wanted_titles) {
+                        let _ = client.remove_on_teardown(hash).await;
+                        let _ = super::clear_job(&state.db, job_id).await;
+                        tracing::warn!(
+                            job = %job_id,
+                            "{reason}; abandoning at metadata check, will try next candidate"
+                        );
+                        return Ok(MonitorOutcome::Abandoned(Some(reason)));
+                    }
+                }
+            }
+        }
         // Stop + clean up if the user cancelled (or the Hub otherwise terminated the job): remove the
         // torrent AND its on-disk data. A transient Hub error keeps us monitoring (treats the job as
         // still active) rather than killing a healthy download. Only drop the resume bookkeeping once
@@ -866,6 +888,45 @@ fn verify_content(
     (got < floor).then(|| {
         format!(
             "downloaded only {got} tracks but the album has ~{expected}; likely the wrong release or an incomplete download"
+        )
+    })
+}
+
+/// The same wrong-release check as `verify_content`, but against a torrent's FILE LIST (the
+/// relative paths from its metadata) — so a mislabelled grab is caught seconds after the grab,
+/// before the download spends bandwidth. Same tolerances: count-based for albums (robust to
+/// tags/script/edition), title-based for single-track jobs.
+fn verify_manifest(
+    names: &[String],
+    expected_titles: &[String],
+    wanted_titles: &[String],
+) -> Option<String> {
+    let audio: Vec<&Path> = names
+        .iter()
+        .map(Path::new)
+        .filter(|p| is_audio(p))
+        .collect();
+    if !wanted_titles.is_empty() {
+        let stems: Vec<String> = audio
+            .iter()
+            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .collect();
+        for want in wanted_titles {
+            if !stems.iter().any(|s| title_matches(s, want)) {
+                return Some(format!("the wanted track “{want}” isn't in this release"));
+            }
+        }
+        return None;
+    }
+    let expected = expected_titles.len();
+    if expected < 5 {
+        return None; // single / EP / uncached: nothing reliable to check against
+    }
+    let got = audio.len();
+    let floor = (expected / 4).clamp(2, 5);
+    (got < floor).then(|| {
+        format!(
+            "the release contains only {got} audio files but the album has ~{expected} tracks; likely the wrong release"
         )
     })
 }
