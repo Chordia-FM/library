@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
 use crate::error::AppResult;
@@ -29,8 +29,9 @@ pub async fn file_freshness(path: &Path) -> (Option<i64>, Option<i64>) {
 }
 
 /// Upsert an artist, deduped by normalized name; backfills the MusicBrainz id. Returns its id.
+/// Takes a connection (not the pool) so it can run inside `upsert_track`'s per-file transaction.
 async fn upsert_artist(
-    db: &SqlitePool,
+    db: &mut SqliteConnection,
     name: &str,
     name_norm: &str,
     mbid: Option<&str>,
@@ -44,7 +45,7 @@ async fn upsert_artist(
     .bind(name)
     .bind(name_norm)
     .bind(mbid)
-    .execute(db)
+    .execute(&mut *db)
     .await?;
     Ok(
         sqlx::query_scalar("SELECT id FROM artists WHERE name_normalized = ?")
@@ -58,7 +59,7 @@ async fn upsert_artist(
 /// they become known (without clobbering values already set). Returns its id.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_album(
-    db: &SqlitePool,
+    db: &mut SqliteConnection,
     title: &str,
     title_norm: &str,
     artist_id: &str,
@@ -99,7 +100,7 @@ async fn upsert_album(
     .bind(compilation as i64)
     .bind(release_mbid)
     .bind(cover_hash)
-    .execute(db)
+    .execute(&mut *db)
     .await?;
     Ok(
         sqlx::query_scalar("SELECT id FROM albums WHERE title_normalized = ? AND artist_id = ?")
@@ -127,6 +128,11 @@ pub async fn upsert_track(
 ) -> AppResult<String> {
     let path_str = path.to_string_lossy();
 
+    // One transaction per file: indexing a file is 6-8 statements, and autocommitting each one
+    // paid a write lock + WAL append apiece and let a crash publish a partially-indexed file.
+    // A single commit keeps the file atomic and makes bulk scans markedly cheaper.
+    let mut tx = db.begin().await?;
+
     // Step 1: files
     sqlx::query(
         "INSERT INTO files (content_hash, codec, sample_rate_hz, bit_depth, channels, \
@@ -145,7 +151,7 @@ pub async fn upsert_track(
     .bind(t.lossless as i64)
     .bind(t.spatial as i64)
     .bind(t.duration_ms as i64)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
 
     // Step 1b: cover_art (deduped embedded artwork)
@@ -154,7 +160,7 @@ pub async fn upsert_track(
             .bind(&cover.hash)
             .bind(&cover.mime)
             .bind(&cover.data)
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
         Some(cover.hash.as_str())
     } else {
@@ -163,7 +169,13 @@ pub async fn upsert_track(
 
     // Step 2: artists + albums (canonical entities)
     // Track's primary artist (the raw credit tag, which the Hub splits into individual credits).
-    let artist_id = upsert_artist(db, &t.artist, &t.artist_norm, t.mb_artist_id.as_deref()).await?;
+    let artist_id = upsert_artist(
+        &mut tx,
+        &t.artist,
+        &t.artist_norm,
+        t.mb_artist_id.as_deref(),
+    )
+    .await?;
     // Album (if any), attributed to the album-artist tag when present, else the track's artist.
     // A deluxe/special/expanded edition folds into its BASE album (the edition is kept on the track),
     // so "X" and "X (Deluxe)" share one album row and the deluxe extras sit alongside the originals.
@@ -184,7 +196,7 @@ pub async fn upsert_track(
                 .unwrap_or(t.artist.as_str());
             let album_artist = chordia_contracts::artists::primary_artist(album_artist_raw);
             let album_artist_id = upsert_artist(
-                db,
+                &mut tx,
                 &album_artist,
                 &crate::metadata::normalize(&album_artist),
                 None,
@@ -192,7 +204,7 @@ pub async fn upsert_track(
             .await?;
             Some(
                 upsert_album(
-                    db,
+                    &mut tx,
                     &base_title,
                     &album_norm,
                     &album_artist_id,
@@ -215,7 +227,7 @@ pub async fn upsert_track(
     let existing_id: Option<String> =
         sqlx::query_scalar("SELECT id FROM tracks WHERE content_hash = ?")
             .bind(&t.content_hash)
-            .fetch_optional(db)
+            .fetch_optional(&mut *tx)
             .await?;
 
     let track_id = if let Some(id) = existing_id {
@@ -247,7 +259,7 @@ pub async fn upsert_track(
         .bind(track_edition.as_deref())
         .bind(t.advisory.as_deref())
         .bind(&id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
         id
     } else {
@@ -276,7 +288,7 @@ pub async fn upsert_track(
         .bind(t.duration_ms as i64)
         .bind(track_edition.as_deref())
         .bind(t.advisory.as_deref())
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
         id
     };
@@ -298,16 +310,17 @@ pub async fn upsert_track(
     .bind(&*path_str)
     .bind(mtime_ns)
     .bind(size_bytes)
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
 
     // Step 4: library_tracks
     sqlx::query("INSERT OR IGNORE INTO library_tracks (library_id, track_id) VALUES (?,?)")
         .bind(library_id)
         .bind(&track_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
 
+    tx.commit().await?;
     Ok(track_id)
 }
 
