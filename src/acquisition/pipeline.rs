@@ -149,12 +149,20 @@ async fn run_inner(
 
     // Resolve the ORDERED list of releases to try. A dead/stalled swarm falls through to the next-best
     // automatically (the user's "try the next one"), so we keep the whole ranked list, not just the top.
-    // `chosen_guid` is a USER PICK only on an INTERACTIVE job (per the contract). An auto-grab also
-    // records the guid it grabbed, for display — so pinning on the guid alone left any auto job that
-    // had grabbed once permanently stuck: Retry (unlike Download, it doesn't clear the guid) would
-    // re-search for a guid Prowlarr may no longer return and fail forever with "chosen release is no
-    // longer available". Honour the pick only when the user actually made one.
-    let picked = job.chosen_guid.as_deref().filter(|_| job.interactive);
+    //
+    // Which `chosen_guid`s are real USER PICKS? An auto-grab also records the guid it grabbed (for
+    // display), so pinning on the guid alone left auto jobs permanently stuck re-searching a guid
+    // Prowlarr no longer returns. But NON-interactive jobs can also legitimately end up in
+    // `awaiting_selection` (an unsure auto search hands over candidates) — and gating on
+    // `interactive` alone DISCARDED the user's pick on those, re-searching and re-asking forever.
+    // The stored source is the reliable tell: only the Hub's select-candidate path copies
+    // `chosen_download_url`/`chosen_magnet_url` onto the job; status-report recordings never do.
+    let pick_has_source =
+        job.chosen_download_url.is_some() || job.chosen_magnet_url.is_some();
+    let picked = job
+        .chosen_guid
+        .as_deref()
+        .filter(|_| job.interactive || pick_has_source);
     let candidates: Vec<Release> = if let Some(guid) = picked {
         hub.report_job_status(api_key, job.job_id, &status("searching"))
             .await?;
@@ -163,7 +171,7 @@ async fn run_inner(
         // re-finding the guid via a live search — which only works while Prowlarr still returns
         // that release. Their explicit pick is the only one we try either way: if it's dead, fail
         // rather than silently grab something they didn't choose.
-        if job.chosen_download_url.is_some() || job.chosen_magnet_url.is_some() {
+        if pick_has_source {
             vec![Release {
                 guid: guid.to_string(),
                 title: job
