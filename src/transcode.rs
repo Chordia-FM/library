@@ -87,6 +87,11 @@ pub struct Transcoder {
     /// transcodes of the same (hash, profile) never write the same temp file (which would corrupt
     /// the published cache entry).
     tmp_seq: std::sync::atomic::AtomicU64,
+    /// Single-flight locks keyed by `(hash, profile)` (the etag string). The global semaphore only
+    /// bounds TOTAL concurrency — without this, N concurrent cold requests for the SAME track+tier
+    /// each grab a permit and run N identical ffmpegs. Entries are pruned once the last waiter
+    /// leaves.
+    inflight: Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Transcoder {
@@ -98,6 +103,7 @@ impl Transcoder {
             sem: Semaphore::new(cfg.max_concurrent.max(1)),
             last_access: Mutex::new(HashMap::new()),
             tmp_seq: std::sync::atomic::AtomicU64::new(0),
+            inflight: Mutex::new(HashMap::new()),
         }
     }
 
@@ -131,76 +137,114 @@ impl Transcoder {
             }));
         }
 
-        // One ffmpeg per (cache miss) slot. Re-check after acquiring: another request for the same
-        // (hash, profile) may have finished it while we waited.
-        let _permit = self
-            .sem
-            .acquire()
-            .await
-            .map_err(|e| AppError::Internal(e.into()))?;
-        if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+        // Single-flight per (hash, profile): concurrent cold requests for the SAME file serialize
+        // on this keyed lock, so exactly one runs ffmpeg and the rest find the published file on
+        // their re-check below. The global semaphore then only bounds total ffmpeg concurrency
+        // across DIFFERENT files.
+        let flight = {
+            let mut map = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.entry(etag.clone())
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        let result: AppResult<Option<Transcoded>> = 'flight: {
+            let _flight = flight.lock().await;
+            // The flight we waited behind may have published the file.
+            if tokio::fs::try_exists(&out).await.unwrap_or(false) {
+                self.touch(&out);
+                break 'flight Ok(Some(Transcoded {
+                    path: out,
+                    content_codec: t.content_codec,
+                    etag: etag.clone(),
+                }));
+            }
+
+            let _permit = match self.sem.acquire().await {
+                Ok(p) => p,
+                Err(e) => break 'flight Err(AppError::Internal(e.into())),
+            };
+
+            // Transcode to a temp file, then atomically rename so a crash/cancel never leaves a
+            // truncated file that would later be served as if complete.
+            let nonce = self
+                .tmp_seq
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = self
+                .cache_dir
+                .join(format!("{file_name}.{}.{nonce}.tmp", std::process::id()));
+
+            let mut cmd = tokio::process::Command::new(&self.ffmpeg);
+            cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
+                .arg(source)
+                // Drop any video/cover stream; map only audio; re-encode to the tier.
+                .args([
+                    "-vn",
+                    "-map_metadata",
+                    "0",
+                    "-c:a",
+                    t.encoder,
+                    "-b:a",
+                    t.bitrate,
+                ]);
+            if t.format == "mp4" {
+                // Put the moov atom at the front so byte-range seeking works on the cached file.
+                cmd.args(["-movflags", "+faststart"]);
+            }
+            // Set the muxer explicitly - the temp filename has no usable extension.
+            cmd.args(["-f", t.format]).arg(&tmp);
+
+            let status = match cmd.status().await {
+                Ok(s) => s,
+                Err(e) => {
+                    break 'flight Err(AppError::Internal(anyhow::anyhow!(
+                        "spawning ffmpeg ({}): {e}",
+                        self.ffmpeg
+                    )))
+                }
+            };
+
+            if !status.success() {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                break 'flight Err(AppError::BadGateway(format!(
+                    "transcode to {} failed (ffmpeg exit {:?})",
+                    t.slug,
+                    status.code()
+                )));
+            }
+
+            if let Err(e) = tokio::fs::rename(&tmp, &out).await {
+                break 'flight Err(AppError::Internal(anyhow::anyhow!(
+                    "publishing transcode: {e}"
+                )));
+            }
             self.touch(&out);
-            return Ok(Some(Transcoded {
+            info!(content_hash, profile = t.slug, "transcoded");
+
+            self.enforce_budget().await;
+            Ok(Some(Transcoded {
                 path: out,
                 content_codec: t.content_codec,
-                etag,
-            }));
+                etag: etag.clone(),
+            }))
+        };
+
+        // Drop the in-flight entry once no other request is waiting on it (map + our clone = 2).
+        {
+            let mut map = self
+                .inflight
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if map
+                .get(&etag)
+                .is_some_and(|a| std::sync::Arc::strong_count(a) <= 2)
+            {
+                map.remove(&etag);
+            }
         }
-
-        // Transcode to a temp file, then atomically rename so a crash/cancel never leaves a
-        // truncated file that would later be served as if complete.
-        let nonce = self
-            .tmp_seq
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let tmp = self
-            .cache_dir
-            .join(format!("{file_name}.{}.{nonce}.tmp", std::process::id()));
-
-        let mut cmd = tokio::process::Command::new(&self.ffmpeg);
-        cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
-            .arg(source)
-            // Drop any video/cover stream; map only audio; re-encode to the tier.
-            .args([
-                "-vn",
-                "-map_metadata",
-                "0",
-                "-c:a",
-                t.encoder,
-                "-b:a",
-                t.bitrate,
-            ]);
-        if t.format == "mp4" {
-            // Put the moov atom at the front so byte-range seeking works on the cached file.
-            cmd.args(["-movflags", "+faststart"]);
-        }
-        // Set the muxer explicitly - the temp filename has no usable extension.
-        cmd.args(["-f", t.format]).arg(&tmp);
-
-        let status = cmd.status().await.map_err(|e| {
-            AppError::Internal(anyhow::anyhow!("spawning ffmpeg ({}): {e}", self.ffmpeg))
-        })?;
-
-        if !status.success() {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(AppError::BadGateway(format!(
-                "transcode to {} failed (ffmpeg exit {:?})",
-                t.slug,
-                status.code()
-            )));
-        }
-
-        tokio::fs::rename(&tmp, &out)
-            .await
-            .map_err(|e| AppError::Internal(anyhow::anyhow!("publishing transcode: {e}")))?;
-        self.touch(&out);
-        info!(content_hash, profile = t.slug, "transcoded");
-
-        self.enforce_budget().await;
-        Ok(Some(Transcoded {
-            path: out,
-            content_codec: t.content_codec,
-            etag,
-        }))
+        result
     }
 
     /// Evict least-recently-served cache files until the total is under `max_bytes`.
