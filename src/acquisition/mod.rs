@@ -9,6 +9,7 @@
 
 pub mod pipeline;
 pub mod quality;
+pub mod upgrade;
 
 use std::collections::HashSet;
 use std::path::PathBuf;

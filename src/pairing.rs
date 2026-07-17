@@ -233,6 +233,26 @@ impl HubClient {
     }
 
     /// Report scored candidates for an interactive job (`POST /v1/manager/jobs/{id}/candidates`).
+    /// Post the quality-upgrade sweep's proposals; returns how many the Hub queued.
+    pub async fn propose_upgrades(
+        &self,
+        server_api_key: &str,
+        proposals: &chordia_contracts::acquisition::UpgradeProposals,
+    ) -> anyhow::Result<u32> {
+        let url = format!("{}/v1/manager/upgrades", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(proposals)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("upgrade proposal failed: {}", resp.status());
+        }
+        Ok(resp.json().await?)
+    }
+
     pub async fn report_candidates(
         &self,
         server_api_key: &str,

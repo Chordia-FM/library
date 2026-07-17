@@ -114,6 +114,22 @@ pub struct AcquisitionConfig {
     /// heartbeat. Default 7.
     #[serde(default = "default_research_interval_days")]
     pub research_interval_days: u32,
+    /// Quality-upgrade sweep: periodically propose re-acquiring the worst all-lossy albums in
+    /// better (lossless) quality. On by default whenever acquisition itself is configured.
+    #[serde(default = "default_upgrade_enabled")]
+    pub upgrade_enabled: bool,
+    /// Albums proposed per sweep (worst-first). Keeps each pass a small burst of tracker searches
+    /// instead of a collection-wide hammering. Default 10.
+    #[serde(default = "default_upgrade_cap")]
+    pub upgrade_cap: u32,
+    /// Days between sweeps. Default 7.
+    #[serde(default = "default_upgrade_interval_days")]
+    pub upgrade_interval_days: u32,
+    /// Days before a previously-proposed album may be proposed again. This is what ROTATES the
+    /// sweep through the collection (never the same worst-10 every week) and what eventually
+    /// re-checks old attempts once new sources may exist. Default 90.
+    #[serde(default = "default_upgrade_retry_days")]
+    pub upgrade_retry_days: u32,
 }
 
 impl Default for AcquisitionConfig {
@@ -133,6 +149,10 @@ impl Default for AcquisitionConfig {
             local_path: None,
             category: None,
             research_interval_days: default_research_interval_days(),
+            upgrade_enabled: default_upgrade_enabled(),
+            upgrade_cap: default_upgrade_cap(),
+            upgrade_interval_days: default_upgrade_interval_days(),
+            upgrade_retry_days: default_upgrade_retry_days(),
         }
     }
 }
@@ -143,6 +163,22 @@ fn default_keep_seeding() -> bool {
 
 fn default_research_interval_days() -> u32 {
     7
+}
+
+fn default_upgrade_enabled() -> bool {
+    true
+}
+
+fn default_upgrade_cap() -> u32 {
+    10
+}
+
+fn default_upgrade_interval_days() -> u32 {
+    7
+}
+
+fn default_upgrade_retry_days() -> u32 {
+    90
 }
 
 impl AcquisitionConfig {

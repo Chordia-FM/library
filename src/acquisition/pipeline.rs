@@ -195,7 +195,12 @@ async fn run_inner(
         // Prowlarr returns fuzzy results; `search_relevant` keeps everything PLAUSIBLY about the
         // requested artist+album (e.g. drops a "Hot Rize" for a Mac Miller request) and retries on the
         // core album title when the full one finds nothing.
-        let releases = search_relevant(&client, job).await?;
+        let mut releases = search_relevant(&client, job).await?;
+        // An upgrade job may only grab a STRICTLY better release than the owned copy (v1: lossless
+        // — sweeps propose all-lossy albums). A sidegrade would churn disk for nothing.
+        if job.upgrade {
+            releases.retain(|r| quality::is_lossless(&r.title));
+        }
         if releases.is_empty() {
             hub.report_job_status(api_key, job.job_id, &status("no_results"))
                 .await?;
@@ -214,6 +219,13 @@ async fn run_inner(
         if !job.interactive && !confident.is_empty() {
             confident.truncate(MAX_CANDIDATE_ATTEMPTS);
             confident
+        } else if job.upgrade {
+            // Upgrades are unattended: when no CONFIDENT lossless match exists, report no_results
+            // quietly instead of asking the user to pick — the sweep will look again after the
+            // retry cooldown, and a manual check can always ask on demand via a normal download.
+            hub.report_job_status(api_key, job.job_id, &status("no_results"))
+                .await?;
+            return Ok(());
         } else {
             // Not sure (ambiguous title, only a different volume, odd naming) or the user opted to
             // choose: hand the candidates over to pick from, closest match first. Never risk the wrong

@@ -187,6 +187,8 @@ async fn main() -> anyhow::Result<()> {
     acquisition::start_job_loop(state.clone());
     acquisition::start_report_loop(state.clone());
     acquisition::start_resume(state.clone());
+    // Weekly worst-first quality-upgrade sweep (rotates via upgrade_attempts stamps).
+    acquisition::upgrade::start_upgrade_scan(state.clone());
 
     // Bind and serve.
     let app = http::router(state);

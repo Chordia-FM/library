@@ -12,6 +12,12 @@ const DEFAULT: &[&str] = &[
     "flac_24", "flac", "alac", "wav", "mp3_320", "mp3_v0", "aac_256", "mp3",
 ];
 
+/// Whether a release title reads as a LOSSLESS encoding — the strictly-better gate for quality
+/// upgrades (v1 upgrades are lossy → lossless; sweeps only propose all-lossy albums).
+pub fn is_lossless(title: &str) -> bool {
+    matches!(detect_format(title), "flac_24" | "flac" | "alac" | "wav")
+}
+
 /// Detect a coarse format key from a release title.
 ///
 /// Hi-res specs (24-bit, ≥96 kHz) imply a LOSSLESS source even when the title never says "FLAC". No
