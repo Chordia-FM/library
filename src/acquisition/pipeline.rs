@@ -156,12 +156,32 @@ async fn run_inner(
     // longer available". Honour the pick only when the user actually made one.
     let picked = job.chosen_guid.as_deref().filter(|_| job.interactive);
     let candidates: Vec<Release> = if let Some(guid) = picked {
-        // The user already picked a candidate for this interactive job: re-find it (trying the same
-        // full + core-title queries the candidate list was built from). Their explicit pick is the only
-        // one we try. If it's dead, fail rather than silently grab something they didn't choose.
         hub.report_job_status(api_key, job.job_id, &status("searching"))
             .await?;
-        vec![find_chosen(&client, job, guid).await?]
+        // Prefer the SOURCE stored at selection time: it grabs directly with no freshness window.
+        // Only a legacy pick (made before candidate sources were persisted) falls back to
+        // re-finding the guid via a live search — which only works while Prowlarr still returns
+        // that release. Their explicit pick is the only one we try either way: if it's dead, fail
+        // rather than silently grab something they didn't choose.
+        if job.chosen_download_url.is_some() || job.chosen_magnet_url.is_some() {
+            vec![Release {
+                guid: guid.to_string(),
+                title: job
+                    .chosen_title
+                    .clone()
+                    .or_else(|| job.display_title.clone())
+                    .unwrap_or_default(),
+                download_url: job.chosen_download_url.clone(),
+                magnet_url: job.chosen_magnet_url.clone(),
+                info_hash: job.chosen_info_hash.clone(),
+                size: job.chosen_size_bytes.unwrap_or(0),
+                seeders: job.chosen_seeders.unwrap_or(0),
+                leechers: 0,
+                indexer: job.chosen_indexer.clone(),
+            }]
+        } else {
+            vec![find_chosen(&client, job, guid).await?]
+        }
     } else {
         hub.report_job_status(api_key, job.job_id, &status("searching"))
             .await?;
@@ -647,6 +667,12 @@ fn to_candidate(r: &Release) -> CandidateInput {
         size_bytes: Some(r.size),
         seeders: Some(r.seeders),
         leechers: Some(r.leechers),
+        // Persist the actual source with the candidate: a later user pick then grabs directly
+        // instead of re-resolving the guid via a live Prowlarr search (whose results age out —
+        // that's what made picks "expire" and re-ask).
+        download_url: r.download_url.clone(),
+        magnet_url: r.magnet_url.clone(),
+        info_hash: r.info_hash.clone(),
     }
 }
 

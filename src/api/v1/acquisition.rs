@@ -53,6 +53,11 @@ async fn search(
                 size_bytes: Some(r.size),
                 seeders: Some(r.seeders),
                 leechers: Some(r.leechers),
+                // This response goes to the BROWSER: never leak indexer/Prowlarr URLs (they can
+                // embed API keys). Sources are only persisted on the server-authed Hub path.
+                download_url: None,
+                magnet_url: None,
+                info_hash: None,
             })
             .collect(),
     ))
