@@ -157,8 +157,7 @@ async fn run_inner(
     // `interactive` alone DISCARDED the user's pick on those, re-searching and re-asking forever.
     // The stored source is the reliable tell: only the Hub's select-candidate path copies
     // `chosen_download_url`/`chosen_magnet_url` onto the job; status-report recordings never do.
-    let pick_has_source =
-        job.chosen_download_url.is_some() || job.chosen_magnet_url.is_some();
+    let pick_has_source = job.chosen_download_url.is_some() || job.chosen_magnet_url.is_some();
     let picked = job
         .chosen_guid
         .as_deref()
