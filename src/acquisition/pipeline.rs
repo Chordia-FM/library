@@ -756,17 +756,46 @@ fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<(
         // Hardlink so the torrent keeps its copy (free, same volume) and can seed; fall back to a copy
         // across filesystems. Never move, or seeding breaks.
         if std::fs::hard_link(src, &dest).is_err() {
-            std::fs::copy(src, &dest)
-                .with_context(|| format!("copying {} -> {}", src.display(), dest.display()))?;
+            copy_into_place(src, dest_dir, &dest)?;
         }
     } else {
         // Atomic rename when on the same volume; copy+remove across filesystems (e.g. a seedbox mount).
         if std::fs::rename(src, &dest).is_err() {
-            std::fs::copy(src, &dest)
-                .with_context(|| format!("copying {} -> {}", src.display(), dest.display()))?;
+            copy_into_place(src, dest_dir, &dest)?;
             let _ = std::fs::remove_file(src);
         }
     }
+    Ok(())
+}
+
+/// Copy `src` into the library via a `.part` sidecar, then rename it into place.
+///
+/// Copying STRAIGHT to `dest` is not atomic, and `dest` sits inside the music root the fs watcher
+/// watches recursively. Off a remote mount (seedbox) a track takes minutes to pull, so the file grows
+/// on disk the whole time: the watcher fires on it repeatedly, the scanner hashes a PARTIAL file, and
+/// since tracks are keyed by `content_hash` every partial read minted a brand-new track row — one
+/// album arrived as dozens of duplicates. (Local imports hardlink or rename, which are atomic, so this
+/// only ever bit the remote path.)
+///
+/// `.part` is not in `AUDIO_EXTS`, so the scanner ignores the sidecar completely; the rename is atomic
+/// within the same directory, so the watcher only ever observes the finished file.
+fn copy_into_place(src: &Path, dest_dir: &Path, dest: &Path) -> anyhow::Result<()> {
+    let mut part_name = dest
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid file name"))?
+        .to_os_string();
+    part_name.push(".part");
+    let part = dest_dir.join(part_name);
+    if let Err(e) = std::fs::copy(src, &part) {
+        let _ = std::fs::remove_file(&part); // don't leave a half-copied sidecar behind
+        return Err(anyhow::Error::new(e).context(format!(
+            "copying {} -> {}",
+            src.display(),
+            part.display()
+        )));
+    }
+    std::fs::rename(&part, dest)
+        .with_context(|| format!("finalising {} -> {}", part.display(), dest.display()))?;
     Ok(())
 }
 
