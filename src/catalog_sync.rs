@@ -5,13 +5,15 @@
 //! from external providers, and serves browsing. Cover bytes are only uploaded when the Hub reports
 //! it is missing them, so steady-state syncs are cheap.
 
-use std::collections::HashSet;
-use std::time::Duration;
+use std::collections::{HashMap, HashSet};
+use std::hash::Hasher;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use chordia_contracts::catalog::{
     AlbumArtistResolution, CatalogPruneRequest, CatalogSyncRequest, SyncTrack,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::config::MetadataStorage;
@@ -21,6 +23,17 @@ use crate::pairing::HubClient;
 /// Tracks per sync request, kept so the JSON body stays well under the Hub's body limit.
 const BATCH: usize = 500;
 const SYNC_INTERVAL_SECS: u64 = 180;
+
+/// Re-push everything at least this often even when the payload is unchanged. The sync RESPONSE
+/// (missing covers, canonical album-artist resolutions) is how the Hub reconciles with this
+/// library, so skipped pushes must not starve that forever — and a periodic full push also heals
+/// Hub-side drift (e.g. a restored backup) the hash can't see.
+const FORCE_SYNC_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+/// Last successfully-pushed payload hash + when, per local library id. In-memory on purpose: a
+/// fresh process always starts with one full sync, which doubles as the startup safety net.
+static SYNC_STATE: LazyLock<Mutex<HashMap<String, (u64, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(sqlx::FromRow)]
 struct SyncRow {
@@ -114,7 +127,8 @@ async fn sync_library(
          LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
          LEFT JOIN artists aa ON aa.id = al.artist_id \
-         WHERE lt.library_id = ? AND t.artist_id IS NOT NULL",
+         WHERE lt.library_id = ? AND t.artist_id IS NOT NULL \
+         ORDER BY t.id",
     )
     .bind(local_id)
     .fetch_all(&state.db)
@@ -125,6 +139,24 @@ async fn sync_library(
     let track_refs: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
 
     let tracks: Vec<SyncTrack> = rows.into_iter().map(row_to_track).collect();
+
+    // Skip the push entirely when nothing changed since the last successful cycle (the ORDER BY
+    // above makes the serialized payload — and so this hash — deterministic). This is what keeps a
+    // steady-state library from re-uploading its whole catalog every 3 minutes; the forced
+    // interval below bounds how long Hub-side reconciliation can be deferred.
+    let payload_hash = {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        h.write(&serde_json::to_vec(&tracks).unwrap_or_default());
+        h.finish()
+    };
+    if let Ok(st) = SYNC_STATE.lock() {
+        if let Some((prev, at)) = st.get(local_id) {
+            if *prev == payload_hash && at.elapsed() < FORCE_SYNC_INTERVAL {
+                debug!(library = %local_id, "catalog unchanged; skipping sync push");
+                return Ok(());
+            }
+        }
+    }
 
     let mut missing: HashSet<String> = HashSet::new();
     let mut resolutions: Vec<AlbumArtistResolution> = Vec::new();
@@ -163,7 +195,7 @@ async fn sync_library(
 
     // Reconcile deletions: tell the Hub the full current ref set so it drops memberships for files
     // removed on this side, so deleted tracks leave browsing.
-    if let Err(e) = hub
+    let prune_ok = match hub
         .prune_catalog(
             api_key,
             &CatalogPruneRequest {
@@ -173,7 +205,19 @@ async fn sync_library(
         )
         .await
     {
-        warn!(error = %e, "catalog prune failed");
+        Ok(_) => true,
+        Err(e) => {
+            warn!(error = %e, "catalog prune failed");
+            false
+        }
+    };
+
+    // Record the hash only when the WHOLE cycle (including prune) landed, so a partial failure is
+    // retried on the next 3-minute tick instead of being skipped for up to an hour.
+    if prune_ok {
+        if let Ok(mut st) = SYNC_STATE.lock() {
+            st.insert(local_id.to_string(), (payload_hash, Instant::now()));
+        }
     }
 
     info!(library = %local_id, tracks = tracks.len(), "catalog synced to hub");
