@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use chordia_contracts::acquisition::{CandidateInput, ClaimedJob, JobCandidates};
 use sqlx::SqlitePool;
 use uuid::Uuid;
@@ -738,17 +739,25 @@ fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<(
     let name = src
         .file_name()
         .ok_or_else(|| anyhow::anyhow!("invalid file name"))?;
+    // The fs watcher indexes each file the moment it lands here and `organize` moves it into place,
+    // then prunes the emptied import dir (organize.rs `prune_empty_dirs`) — so the destination can
+    // vanish BETWEEN files. Re-assert it per file rather than once per import, or every track after
+    // the first fails with a bare ENOENT and takes the whole album's job down with it.
+    std::fs::create_dir_all(dest_dir)
+        .with_context(|| format!("creating import dir {}", dest_dir.display()))?;
     let dest = dest_dir.join(name);
     if keep_source {
         // Hardlink so the torrent keeps its copy (free, same volume) and can seed; fall back to a copy
         // across filesystems. Never move, or seeding breaks.
         if std::fs::hard_link(src, &dest).is_err() {
-            std::fs::copy(src, &dest)?;
+            std::fs::copy(src, &dest)
+                .with_context(|| format!("copying {} -> {}", src.display(), dest.display()))?;
         }
     } else {
         // Atomic rename when on the same volume; copy+remove across filesystems (e.g. a seedbox mount).
         if std::fs::rename(src, &dest).is_err() {
-            std::fs::copy(src, &dest)?;
+            std::fs::copy(src, &dest)
+                .with_context(|| format!("copying {} -> {}", src.display(), dest.display()))?;
             let _ = std::fs::remove_file(src);
         }
     }
