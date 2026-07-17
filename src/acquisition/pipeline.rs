@@ -149,7 +149,13 @@ async fn run_inner(
 
     // Resolve the ORDERED list of releases to try. A dead/stalled swarm falls through to the next-best
     // automatically (the user's "try the next one"), so we keep the whole ranked list, not just the top.
-    let candidates: Vec<Release> = if let Some(guid) = &job.chosen_guid {
+    // `chosen_guid` is a USER PICK only on an INTERACTIVE job (per the contract). An auto-grab also
+    // records the guid it grabbed, for display — so pinning on the guid alone left any auto job that
+    // had grabbed once permanently stuck: Retry (unlike Download, it doesn't clear the guid) would
+    // re-search for a guid Prowlarr may no longer return and fail forever with "chosen release is no
+    // longer available". Honour the pick only when the user actually made one.
+    let picked = job.chosen_guid.as_deref().filter(|_| job.interactive);
+    let candidates: Vec<Release> = if let Some(guid) = picked {
         // The user already picked a candidate for this interactive job: re-find it (trying the same
         // full + core-title queries the candidate list was built from). Their explicit pick is the only
         // one we try. If it's dead, fail rather than silently grab something they didn't choose.
