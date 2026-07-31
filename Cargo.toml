@@ -15,7 +15,7 @@ chordia-contracts = { path = "../contracts" }
 axum = { version = "0.8", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 tower = "0.5"
-tower-http = { version = "0.7", features = ["trace", "cors", "fs"] }
+tower-http = { version = "0.7", features = ["trace", "cors", "fs", "set-header"] }
 
 # Serialization / config
 serde = { version = "1", features = ["derive"] }

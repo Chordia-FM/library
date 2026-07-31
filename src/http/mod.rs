@@ -4,12 +4,14 @@ pub mod middleware;
 
 use std::sync::Arc;
 
+use axum::http::header;
 use axum::routing::get;
 use axum::Router;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqliteSynchronous};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
 use tower_http::cors::{AllowHeaders, Any, CorsLayer};
+use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth::JwksCache;
@@ -105,8 +107,28 @@ pub fn router(state: AppState) -> Router {
                 .allow_headers(AllowHeaders::mirror_request())
                 .expose_headers(Any),
         )
+        // Baseline response headers, mirroring what the Hub sets on itself. This server hands out
+        // audio and JSON, never an app document, so a full CSP isn't meaningful here — but a
+        // response that a browser could be talked into sniffing as HTML, or framing, still is.
+        // `overriding` rather than `appending`: a duplicate HSTS header is treated as invalid, and a
+        // reverse proxy in front may add its own.
+        .layer(sec(header::X_CONTENT_TYPE_OPTIONS, "nosniff"))
+        .layer(sec(header::X_FRAME_OPTIONS, "DENY"))
+        .layer(sec(header::REFERRER_POLICY, "no-referrer"))
+        .layer(sec(
+            header::STRICT_TRANSPORT_SECURITY,
+            "max-age=31536000; includeSubDomains",
+        ))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// One static response header, overriding whatever the handler produced.
+fn sec(
+    name: header::HeaderName,
+    value: &'static str,
+) -> SetResponseHeaderLayer<axum::http::HeaderValue> {
+    SetResponseHeaderLayer::overriding(name, axum::http::HeaderValue::from_static(value))
 }
 
 async fn health() -> &'static str {
