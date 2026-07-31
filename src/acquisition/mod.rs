@@ -404,12 +404,20 @@ impl AcquisitionClient {
             if loc.starts_with("magnet:") {
                 return Ok(TorrentSource::Magnet(loc));
             }
-            let resp = self
-                .http
-                .get(&loc)
-                .header("X-Api-Key", &self.prowlarr_key)
-                .send()
-                .await?;
+            // Only re-attach the Prowlarr API key if the redirect stayed on Prowlarr. The location
+            // comes from the indexer response, so an indexer (or anyone who can answer as one) could
+            // point it at a host of their choosing and be handed the key — which is full control of
+            // the user's Prowlarr, including its other indexer credentials.
+            let same_origin = reqwest::Url::parse(&loc).ok().is_some_and(|target| {
+                reqwest::Url::parse(&self.prowlarr_url)
+                    .ok()
+                    .is_some_and(|base| target.origin() == base.origin())
+            });
+            let mut req = self.http.get(&loc);
+            if same_origin {
+                req = req.header("X-Api-Key", &self.prowlarr_key);
+            }
+            let resp = req.send().await?;
             if !resp.status().is_success() {
                 anyhow::bail!("indexer download failed {}", resp.status());
             }
