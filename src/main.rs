@@ -66,6 +66,25 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("loading libraries from DB")?;
 
+    // Streaming and catalog reads are scoped to the capability token's `library_id`, matched against
+    // `libraries.hub_library_id`. A row with a NULL `hub_library_id` therefore matches no token and
+    // is silently unstreamable — and `mgmt::create_library` writes NULL, so the state is reachable
+    // rather than theoretical. It used to be exempted; that exemption was a token-scoping hole and
+    // is gone. Say so loudly at boot instead of letting it present as "the track just won't play".
+    let unlinked: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM libraries WHERE hub_library_id IS NULL")
+            .fetch_all(&state.db)
+            .await
+            .context("checking for unlinked libraries")?;
+    for (id, name) in &unlinked {
+        tracing::error!(
+            library_id = %id,
+            name = %name,
+            "library is not linked to a Hub library (hub_library_id IS NULL): it will not stream. \
+             Re-run the pairing/setup flow for it, or delete it."
+        );
+    }
+
     for (lib_id, path_str) in existing_libs {
         let path = std::path::PathBuf::from(&path_str);
         let db = state.db.clone();
