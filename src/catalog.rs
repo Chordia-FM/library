@@ -126,6 +126,24 @@ pub async fn list_libraries(db: &SqlitePool) -> AppResult<Vec<LibraryRow>> {
     .await?)
 }
 
+/// Libraries linked to one Hub-side library UUID — i.e. the ones a capability token scoped to that
+/// UUID is allowed to see. Used by the public catalog routes so a token for library A cannot
+/// enumerate library B.
+pub async fn list_libraries_for_hub(
+    db: &SqlitePool,
+    hub_library_id: &str,
+) -> AppResult<Vec<LibraryRow>> {
+    Ok(sqlx::query_as::<_, LibraryRow>(
+        "SELECT l.id, l.name, l.path, COUNT(lt.track_id) AS track_count \
+         FROM libraries l LEFT JOIN library_tracks lt ON lt.library_id = l.id \
+         WHERE l.hub_library_id = ? \
+         GROUP BY l.id ORDER BY l.name",
+    )
+    .bind(hub_library_id)
+    .fetch_all(db)
+    .await?)
+}
+
 pub async fn list_tracks(
     db: &SqlitePool,
     library_id: &str,

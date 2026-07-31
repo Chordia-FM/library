@@ -169,6 +169,10 @@ mod tests {
     fn event() -> ListeningEvent {
         ListeningEvent {
             event_id: Uuid::now_v7(),
+            // Added to the contract after this fixture was written, which broke the bin's test
+            // target — `cargo check` never builds it, so the breakage was invisible to the usual gate.
+            title: Some("title".into()),
+            artist: Some("artist".into()),
             fingerprint: TrackFingerprint {
                 acoustid: None,
                 recording_mbid: None,

@@ -20,10 +20,21 @@ use crate::http::AppState;
 
 const JWKS_TTL_SECS: u64 = 300;
 
+/// Floor between outbound JWKS fetches, independent of whether the last one helped.
+///
+/// Without it, a cache miss always meant a network call, and the `kid` is attacker-chosen: an
+/// unauthenticated caller could send tokens carrying random `kid`s and turn each one into a request
+/// from this library to the Hub. That is an amplified DoS against the Hub, from any host that can
+/// reach a library.
+const JWKS_MIN_REFRESH_SECS: u64 = 10;
+
 struct CacheInner {
     /// kid → (raw 32-byte public key bytes stored as DecodingKey)
     keys: HashMap<String, DecodingKey>,
     refreshed_at: Option<Instant>,
+    /// When a fetch was last *attempted*, successful or not. Distinct from `refreshed_at`, which
+    /// only moves on success — a failing Hub must not license unlimited retries either.
+    last_attempt: Option<Instant>,
 }
 
 pub struct JwksCache {
@@ -40,14 +51,20 @@ impl JwksCache {
             inner: Mutex::new(CacheInner {
                 keys: HashMap::new(),
                 refreshed_at: None,
+                last_attempt: None,
             }),
         })
     }
 
     /// Return the `DecodingKey` for `kid`, refreshing the JWKS if stale.
+    ///
+    /// A miss only reaches the network when no fetch has been attempted in the last
+    /// `JWKS_MIN_REFRESH_SECS`. Because the attempt is stamped *before* the lock is released, a
+    /// burst of concurrent misses also collapses to a single in-flight fetch rather than one per
+    /// request.
     pub async fn decoding_key(&self, kid: &str) -> anyhow::Result<DecodingKey> {
         {
-            let inner = self.inner.lock().await;
+            let mut inner = self.inner.lock().await;
             if let Some(t) = inner.refreshed_at {
                 if t.elapsed() < Duration::from_secs(JWKS_TTL_SECS) {
                     if let Some(k) = inner.keys.get(kid) {
@@ -55,6 +72,18 @@ impl JwksCache {
                     }
                 }
             }
+            if let Some(t) = inner.last_attempt {
+                if t.elapsed() < Duration::from_secs(JWKS_MIN_REFRESH_SECS) {
+                    // Someone just looked and this kid still is not there. Answer from what we have
+                    // rather than asking the Hub again.
+                    return inner
+                        .keys
+                        .get(kid)
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("unknown kid '{kid}'"));
+                }
+            }
+            inner.last_attempt = Some(Instant::now());
         }
         self.refresh().await?;
         let inner = self.inner.lock().await;

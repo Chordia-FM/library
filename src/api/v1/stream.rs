@@ -17,8 +17,15 @@ use crate::http::AppState;
 use crate::streaming;
 
 /// Verify the capability token's `library_id` claim matches the library that owns `track_id`.
-/// Libraries with no `hub_library_id` set yet (pre-M4 setup) are exempted so existing
-/// installs keep working; once linked after a fresh setup they are enforced strictly.
+///
+/// This used to exempt libraries with no `hub_library_id` (a pre-M4 backwards-compatibility carve
+/// out), which inverted the check: an unlinked local library matched *every* token, so a capability
+/// token legitimately minted for library A streamed its tracks too. Linking is a separate `PATCH`
+/// from creation (`mgmt::create_library` writes `hub_library_id: None`), so that window is real and
+/// permanent for any library whose link call never lands.
+///
+/// An unlinked library is now simply unstreamable, which is the correct reading: the Hub cannot have
+/// issued a token scoped to a library it does not know about.
 async fn check_library_scope(
     db: &sqlx::SqlitePool,
     track_id: &str,
@@ -27,8 +34,7 @@ async fn check_library_scope(
     let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM library_tracks lt \
          JOIN libraries l ON l.id = lt.library_id \
-         WHERE lt.track_id = ? \
-         AND (l.hub_library_id = ? OR l.hub_library_id IS NULL)",
+         WHERE lt.track_id = ? AND l.hub_library_id = ?",
     )
     .bind(track_id)
     .bind(hub_library_id)
