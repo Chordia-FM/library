@@ -80,8 +80,9 @@ async fn main() -> anyhow::Result<()> {
         tracing::error!(
             library_id = %id,
             name = %name,
-            "library is not linked to a Hub library (hub_library_id IS NULL): it will not stream. \
-             Re-run the pairing/setup flow for it, or delete it."
+            "library is not linked to a Hub library (hub_library_id IS NULL): its catalog will \
+             not sync to the Hub, so it is invisible there AND unstreamable. Re-run the \
+             pairing/setup flow for it, or delete it."
         );
     }
 
