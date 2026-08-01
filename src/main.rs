@@ -9,32 +9,10 @@
 //!     If NOT paired: generate a one-time setup token and print the setup URL.
 //!  6. Bind and serve.
 
-#![allow(dead_code)]
-
-mod acquisition;
-mod api;
-mod auth;
-mod catalog;
-mod catalog_sync;
-mod config;
-mod dedupe;
-mod directory;
-mod error;
-mod fingerprint;
-mod http;
-mod index;
-mod loudness;
-mod metadata;
-mod organize;
-mod pairing;
-mod playback;
-mod relay;
-mod scanner;
-mod scrobble;
-mod streaming;
-mod telemetry;
-mod tls;
-mod transcode;
+use chordia_library::{
+    acquisition, catalog_sync, config, dedupe, directory, fingerprint, http, loudness, pairing,
+    scanner, scrobble, telemetry, tls,
+};
 
 use std::net::SocketAddr;
 use std::sync::Arc;

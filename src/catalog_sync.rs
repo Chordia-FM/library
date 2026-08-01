@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use chordia_contracts::catalog::{
     AlbumArtistResolution, CatalogPruneRequest, CatalogSyncRequest, SyncTrack,
 };
+use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -109,17 +110,15 @@ pub async fn sync_all(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn sync_library(
-    state: &AppState,
-    hub: &HubClient,
-    api_key: &str,
-    local_id: &str,
-    hub_id: &str,
-) -> anyhow::Result<()> {
-    let hub_uuid: Uuid = hub_id.parse()?;
-
-    // Rebuild the flat wire shape from the normalized tables. `artist_id IS NOT NULL` skips any row
-    // a re-scan hasn't relinked yet, so we never push an incomplete credit to the Hub.
+/// Rebuild the flat wire shape for one library from the normalized tables.
+///
+/// Extracted from [`sync_library`] so it can be tested directly. This is what the Hub builds its
+/// entire catalog from, so a column missing from this SELECT is a field the Hub can never have —
+/// which is exactly how the artist MBID went unsent while sitting in the local database.
+///
+/// `artist_id IS NOT NULL` skips any row a re-scan hasn't relinked yet, so an incomplete credit is
+/// never pushed.
+pub async fn collect_tracks(db: &SqlitePool, local_id: &str) -> anyhow::Result<Vec<SyncTrack>> {
     let rows: Vec<SyncRow> = sqlx::query_as(
         "SELECT t.id, t.title, COALESCE(ar.name, '') AS artist, \
                 COALESCE(ar.name_normalized, '') AS artist_norm, ar.mbid AS artist_mbid, \
@@ -135,14 +134,25 @@ async fn sync_library(
          ORDER BY t.id",
     )
     .bind(local_id)
-    .fetch_all(&state.db)
+    .fetch_all(db)
     .await?;
+    Ok(rows.into_iter().map(row_to_track).collect())
+}
 
-    // The authoritative ref set for reconciliation, collected before we consume `rows`. An empty
-    // library still runs the prune below so its last deletions propagate.
-    let track_refs: Vec<String> = rows.iter().map(|r| r.id.clone()).collect();
+async fn sync_library(
+    state: &AppState,
+    hub: &HubClient,
+    api_key: &str,
+    local_id: &str,
+    hub_id: &str,
+) -> anyhow::Result<()> {
+    let hub_uuid: Uuid = hub_id.parse()?;
 
-    let tracks: Vec<SyncTrack> = rows.into_iter().map(row_to_track).collect();
+    let tracks = collect_tracks(&state.db, local_id).await?;
+
+    // The authoritative ref set for reconciliation. An empty library still runs the prune below so
+    // its last deletions propagate.
+    let track_refs: Vec<String> = tracks.iter().map(|t| t.track_ref.clone()).collect();
 
     // Skip the push entirely when nothing changed since the last successful cycle (the ORDER BY
     // above makes the serialized payload — and so this hash — deterministic). This is what keeps a

@@ -76,3 +76,6 @@ rustls-pemfile = "2"
 [dev-dependencies]
 # Generate self-signed certs in tests (no external openssl needed).
 rcgen = "0.13"
+# Integration tests migrate a real SQLite file: `sqlx::migrate!` needs a path, and an in-memory
+# pool would give every connection its own blank database.
+tempfile = "3"
