@@ -41,6 +41,7 @@ struct SyncRow {
     title: String,
     artist: String,
     artist_norm: String,
+    artist_mbid: Option<String>,
     album: Option<String>,
     album_norm: Option<String>,
     album_artist: Option<String>,
@@ -63,6 +64,9 @@ fn row_to_track(r: SyncRow) -> SyncTrack {
         title: r.title,
         artist: r.artist,
         artist_normalized: r.artist_norm,
+        // The Hub prefers this over the name when present: a name is not an identity, and matching
+        // on one is what let a former-name tag mint a duplicate artist.
+        artist_mbid: r.artist_mbid,
         album: r.album,
         album_normalized: r.album_norm,
         album_artist: r.album_artist,
@@ -118,7 +122,7 @@ async fn sync_library(
     // a re-scan hasn't relinked yet, so we never push an incomplete credit to the Hub.
     let rows: Vec<SyncRow> = sqlx::query_as(
         "SELECT t.id, t.title, COALESCE(ar.name, '') AS artist, \
-                COALESCE(ar.name_normalized, '') AS artist_norm, \
+                COALESCE(ar.name_normalized, '') AS artist_norm, ar.mbid AS artist_mbid, \
                 al.title AS album, al.title_normalized AS album_norm, aa.name AS album_artist, \
                 t.track_no, t.disc_no, al.year AS year, al.genre AS genre, t.duration_ms, \
                 t.content_hash, t.recording_mbid, al.release_mbid AS release_mbid, t.isrc, \
