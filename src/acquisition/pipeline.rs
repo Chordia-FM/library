@@ -945,12 +945,68 @@ fn copy_into_place(src: &Path, dest_dir: &Path, dest: &Path) -> anyhow::Result<(
         .to_os_string();
     part_name.push(".part");
     let part = dest_dir.join(part_name);
-    if let Err(e) = std::fs::copy(src, &part) {
-        let _ = std::fs::remove_file(&part); // don't leave a half-copied sidecar behind
+
+    // ENOENT here has TWO possible causes and `std::fs::copy` cannot tell them apart — it reports
+    // NotFound whether the SOURCE or the destination's parent is missing, and the message named both
+    // paths without saying which was at fault. Both causes are real and both are transient:
+    //
+    //  - the destination is deleted underneath us. `organize` moves each file out the moment the
+    //    scanner indexes it, then prunes the emptied directory (organize.rs `prune_empty_dirs`), so
+    //    a staging directory can vanish between one file and the next — even a per-job one, once its
+    //    previous file has been organized away.
+    //  - the source stops resolving. rclone caches directory listings with a TTL; a large file can
+    //    outlive that cache while it copies, so a later track in the same album is listed but no
+    //    longer openable.
+    //
+    // The observed failures fit the second at least as well as the first: every FLAC job failed and
+    // every MP3 job in the same batch completed, and file size is what separates them. Either way a
+    // retry is the right response — re-asserting the directory fixes the first, and a fresh path
+    // lookup fixes the second — so retry a few times and, if it still fails, say WHICH path is
+    // actually missing instead of leaving the next reader to guess.
+    const ATTEMPTS: u32 = 4;
+    const BACKOFF: Duration = Duration::from_secs(2);
+    let mut last_err = None;
+    for attempt in 1..=ATTEMPTS {
+        // Cheap and idempotent; covers the destination-pruned case on every attempt, including the
+        // first (the caller asserted it too, but a prune may have landed since).
+        let _ = std::fs::create_dir_all(dest_dir);
+        match std::fs::copy(src, &part) {
+            Ok(_) => {
+                last_err = None;
+                break;
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&part); // don't leave a half-copied sidecar behind
+                let retryable = e.kind() == std::io::ErrorKind::NotFound;
+                if retryable && attempt < ATTEMPTS {
+                    tracing::warn!(
+                        src = %src.display(),
+                        attempt,
+                        src_exists = src.exists(),
+                        dest_dir_exists = dest_dir.exists(),
+                        "import copy vanished mid-flight; retrying"
+                    );
+                    std::thread::sleep(BACKOFF);
+                    continue;
+                }
+                last_err = Some(e);
+                break;
+            }
+        }
+    }
+    if let Some(e) = last_err {
+        // Name the culprit. Checked AFTER the failure, so "both present" means it came back — which
+        // is itself the signature of a cache/race rather than a genuinely absent file.
+        let culprit = match (src.exists(), dest_dir.exists()) {
+            (false, true) => "source is gone",
+            (true, false) => "destination directory is gone",
+            (false, false) => "source AND destination directory are gone",
+            (true, true) => "both paths exist now (transient — a stale mount cache or a race)",
+        };
         return Err(anyhow::Error::new(e).context(format!(
-            "copying {} -> {}",
+            "copying {} -> {} after {ATTEMPTS} attempts ({culprit})",
             src.display(),
-            part.display()
+            part.display(),
         )));
     }
     std::fs::rename(&part, dest)
