@@ -476,11 +476,26 @@ async fn monitor_to_completion(
                 tracing::warn!(job = %job_id, "{reason}; abandoning, will try next candidate");
                 return Ok(MonitorOutcome::Abandoned(Some(reason)));
             }
+            // Stage into a directory of this job's OWN, which is load-bearing rather than tidiness.
+            // Concurrent jobs used to share one import directory, and `organize` deletes that
+            // directory the moment it empties — organize.rs `prune_empty_dirs` climbs from each moved
+            // file's parent and only refuses to remove the library root, so the import dir is fair
+            // game. One album finishing therefore pulled the directory out from under another album
+            // still copying into it, which died with a bare ENOENT naming the destination. Five
+            // Blackbear albums queued together failed exactly this way, each at whatever track it had
+            // reached (01, 05, 09, 10, 09) — the giveaway that it was a race and not the mount.
+            //
+            // `place_one` re-asserts the directory per file, but that only narrows the window; a prune
+            // landing between the create and the copy still wins. A per-job directory closes it: a
+            // job's prune climbs from `<import>/<job>` to `<import>`, which is not empty while any
+            // other job's directory sits in it, so no job can reach another's staging area.
+            let staging = music_root
+                .join(&state.config.acquisition.import_subdir)
+                .join(job_id.to_string());
             import(
                 &state.db,
                 local_id,
-                music_root,
-                &state.config.acquisition.import_subdir,
+                &staging,
                 &content,
                 keep_source,
                 wanted_titles,
@@ -723,22 +738,22 @@ fn to_candidate(r: &Release) -> CandidateInput {
 /// Place the finished torrent's audio files into the library's import folder, then index them so they
 /// appear (and `catalog_sync` pushes them to the Hub). The `notify` watcher would also catch them.
 /// `keep_source` hardlinks/copies (so the torrent keeps its files to seed); otherwise it moves them.
+/// `staging` must be UNIQUE PER JOB (see the call site) — sharing it across concurrent jobs is what
+/// produced the ENOENT import failures.
 async fn import(
     db: &SqlitePool,
     local_lib_id: &str,
-    music_root: &Path,
-    import_subdir: &str,
+    staging: &Path,
     content_path: &str,
     keep_source: bool,
     // When non-empty (a track job), import ONLY the files matching a wanted title; otherwise import all.
     wanted_titles: &[String],
 ) -> anyhow::Result<()> {
-    let dest = music_root.join(import_subdir);
-    std::fs::create_dir_all(&dest)?;
+    std::fs::create_dir_all(staging)?;
     let mut placed = 0usize;
     place_audio(
         Path::new(content_path),
-        &dest,
+        staging,
         keep_source,
         &mut placed,
         wanted_titles,
@@ -746,7 +761,7 @@ async fn import(
     if placed == 0 {
         anyhow::bail!("no matching audio files found in the completed download");
     }
-    scanner::initial_scan(db, local_lib_id, &dest, false).await;
+    scanner::initial_scan(db, local_lib_id, staging, false).await;
     Ok(())
 }
 
