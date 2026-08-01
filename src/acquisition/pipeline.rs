@@ -44,7 +44,11 @@ pub async fn run_job(state: &AppState, job: ClaimedJob) {
     };
     let hub = HubClient::new(state.config.backend_url.clone(), state.http.clone());
     if let Err(e) = run_inner(state, &hub, &creds.server_api_key, &job).await {
-        tracing::warn!(job = %job.job_id, error = %e, "download job failed");
+        // `{:#}` renders the whole context chain. Plain `{}` on an anyhow::Error prints only the
+        // OUTERMOST context, so a failure surfaced as "copying <src> -> <dst>" with the actual
+        // io::Error — permission denied, no space, a dropped rclone mount — silently discarded. The
+        // context is the part you already know; the cause is the part you needed.
+        tracing::warn!(job = %job.job_id, error = %format!("{e:#}"), "download job failed");
         // Tear down any torrent grabbed before the failure so a failed job never orphans a download.
         // Keep the resume bookkeeping if removal fails (transient qBittorrent error) so a later resume
         // re-attempts it; only forget the job once there's nothing left to remove.
@@ -56,7 +60,11 @@ pub async fn run_job(state: &AppState, job: ClaimedJob) {
             };
         }
         let _ = hub
-            .report_job_status(&creds.server_api_key, job.job_id, &failed(&e.to_string()))
+            .report_job_status(
+                &creds.server_api_key,
+                job.job_id,
+                &failed(&format!("{e:#}")),
+            )
             .await;
         if removed {
             let _ = super::clear_job(&state.db, job.job_id).await;
@@ -119,14 +127,14 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
                 .await;
         }
         Err(e) => {
-            tracing::warn!(job = %job_id, error = %e, "download resume failed");
+            tracing::warn!(job = %job_id, error = %format!("{e:#}"), "download resume failed");
             // Symmetric with run_job: tear down the torrent, keep the bookkeeping if removal fails.
             let removed = match AcquisitionClient::from_config(&state.config.acquisition) {
                 Some(client) => client.remove_on_teardown(&hash).await.is_ok(),
                 None => false,
             };
             let _ = hub
-                .report_job_status(&creds.server_api_key, job_id, &failed(&e.to_string()))
+                .report_job_status(&creds.server_api_key, job_id, &failed(&format!("{e:#}")))
                 .await;
             if removed {
                 let _ = super::clear_job(&state.db, job_id).await;
