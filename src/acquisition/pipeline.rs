@@ -466,7 +466,7 @@ async fn monitor_to_completion(
             // (sshfs/rclone) has no push notification and caches directory listings, so the files can
             // be briefly invisible here. Wait for the import source to SETTLE before reading it, so
             // mount-propagation lag doesn't fail (and tear down) a perfectly good download.
-            wait_for_source(&content).await;
+            wait_for_source(client, hash, &content).await;
             if let Some(reason) = verify_content(&content, expected_titles, wanted_titles) {
                 // Mislabelled album, OR (track job) the release lacks the wanted track: drop it and let
                 // the caller try the next-best candidate. Only if none remain does the job fail — so
@@ -850,37 +850,64 @@ fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<(
 ///  - `verify_content` counts audio files to decide whether the torrent is mislabelled, so an
 ///    under-count reads as the wrong album and DELETES the torrent and its files.
 ///
-/// So settle on the file count rather than on existence: poll until it stops changing across two
-/// consecutive reads, which needs no knowledge of how many tracks to expect and works equally for a
-/// single, an album, or a box set. Bounded, and a timeout just proceeds — the callers' own checks
-/// are still downstream, and blocking a job forever would be worse than letting them run.
-async fn wait_for_source(content: &str) {
+/// So wait for a specific number of files, and take that number from the TORRENT'S OWN FILE LIST —
+/// the same manifest `verify_manifest` reads. That is the only authoritative answer to "how many
+/// tracks should be here", because it describes the release actually downloaded rather than the
+/// release requested: ask for a standard edition, get a deluxe, and the manifest lists the deluxe's
+/// files, so the target is the deluxe's count with no special handling. The cached tracklist
+/// (`expected_titles`) is deliberately NOT consulted here — it is the union of titles across every
+/// edition and so matches no single edition exactly.
+///
+/// Stability is only the fallback, for when qBittorrent won't answer: two equal non-zero readings in
+/// a row. It is weaker on purpose — a mount that stalls mid-transfer looks stable — so it is what
+/// runs when there is nothing better, not the primary signal.
+///
+/// Bounded either way, and a timeout just proceeds: the callers' own checks are still downstream,
+/// and blocking a job forever would be worse than letting them run.
+async fn wait_for_source(client: &AcquisitionClient, hash: &str, content: &str) {
     const POLL: Duration = Duration::from_secs(2);
     const MAX_POLLS: u32 = 45; // 90s: generous for a listing to propagate, short of a stuck mount.
+
+    // How many audio files the torrent says it contains. `None` if qBittorrent didn't answer.
+    let target = client.torrent_files(hash).await.ok().and_then(|names| {
+        let n = names.iter().filter(|n| is_audio(Path::new(n))).count();
+        (n > 0).then_some(n)
+    });
     let path = Path::new(content);
     let mut last = usize::MAX;
     let mut stable = 0u32;
     for _ in 0..MAX_POLLS {
         if path.exists() {
             let n = count_audio_files(path);
-            // Two equal non-zero readings in a row: the listing has stopped moving.
-            if n > 0 && n == last {
-                stable += 1;
-                // Two consecutive equal readings. One is not enough: the very first poll often lands
-                // between two renames and would match a count that is still climbing.
-                if stable >= 2 {
-                    return;
+            match target {
+                // `>=` not `==`: the import source may hold extra audio the manifest doesn't (a
+                // rescan folder, a stray sample), and over-count is not a reason to keep waiting.
+                Some(t) => {
+                    if n >= t {
+                        return;
+                    }
                 }
-            } else {
-                stable = 0;
+                None => {
+                    if n > 0 && n == last {
+                        stable += 1;
+                        // Two consecutive equal readings. One is not enough: the very first poll
+                        // often lands between two renames and would match a still-climbing count.
+                        if stable >= 2 {
+                            return;
+                        }
+                    } else {
+                        stable = 0;
+                    }
+                    last = n;
+                }
             }
-            last = n;
         }
         tokio::time::sleep(POLL).await;
     }
     tracing::warn!(
         path = %content,
-        files = last,
+        files = count_audio_files(path),
+        expected = ?target,
         "import source never settled; proceeding anyway"
     );
 }
