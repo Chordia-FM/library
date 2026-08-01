@@ -464,14 +464,9 @@ async fn monitor_to_completion(
                 .local_content_path(&info.content_path);
             // A just-completed torrent is renamed into place on the seedbox, but a network mount
             // (sshfs/rclone) has no push notification and caches directory listings, so the files can
-            // be briefly invisible here. Wait for the import source to appear before reading it, so
+            // be briefly invisible here. Wait for the import source to SETTLE before reading it, so
             // mount-propagation lag doesn't fail (and tear down) a perfectly good download.
-            for _ in 0..15u32 {
-                if Path::new(&content).exists() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
+            wait_for_source(&content).await;
             if let Some(reason) = verify_content(&content, expected_titles, wanted_titles) {
                 // Mislabelled album, OR (track job) the release lacks the wanted track: drop it and let
                 // the caller try the next-best candidate. Only if none remain does the job fail — so
@@ -841,6 +836,53 @@ fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+/// Wait for a just-completed download to become fully readable through a network mount.
+///
+/// Waiting for the directory to *exist* is not enough, and that is what this used to do. rclone and
+/// sshfs cache directory listings and the seedbox renames files into place one at a time, so the
+/// album directory appears while individual tracks are still invisible. Two things then go wrong,
+/// and the second is much worse than the first:
+///
+///  - `place_one` fails on the first track it cannot read, and takes the whole job down with it —
+///    which is how a complete download reported "copying … -> ….part" and failed;
+///  - `verify_content` counts audio files to decide whether the torrent is mislabelled, so an
+///    under-count reads as the wrong album and DELETES the torrent and its files.
+///
+/// So settle on the file count rather than on existence: poll until it stops changing across two
+/// consecutive reads, which needs no knowledge of how many tracks to expect and works equally for a
+/// single, an album, or a box set. Bounded, and a timeout just proceeds — the callers' own checks
+/// are still downstream, and blocking a job forever would be worse than letting them run.
+async fn wait_for_source(content: &str) {
+    const POLL: Duration = Duration::from_secs(2);
+    const MAX_POLLS: u32 = 45; // 90s: generous for a listing to propagate, short of a stuck mount.
+    let path = Path::new(content);
+    let mut last = usize::MAX;
+    let mut stable = 0u32;
+    for _ in 0..MAX_POLLS {
+        if path.exists() {
+            let n = count_audio_files(path);
+            // Two equal non-zero readings in a row: the listing has stopped moving.
+            if n > 0 && n == last {
+                stable += 1;
+                // Two consecutive equal readings. One is not enough: the very first poll often lands
+                // between two renames and would match a count that is still climbing.
+                if stable >= 2 {
+                    return;
+                }
+            } else {
+                stable = 0;
+            }
+            last = n;
+        }
+        tokio::time::sleep(POLL).await;
+    }
+    tracing::warn!(
+        path = %content,
+        files = last,
+        "import source never settled; proceeding anyway"
+    );
 }
 
 /// Copy `src` into the library via a `.part` sidecar, then rename it into place.
