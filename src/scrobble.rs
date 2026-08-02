@@ -189,6 +189,7 @@ mod tests {
             client_type: ClientType::Desktop,
             library_id: None,
             room_id: None,
+            playlist_id: None,
         }
     }
 
