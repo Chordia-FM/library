@@ -1,7 +1,8 @@
 //! Per-job acquisition pipeline: search → score → grab → monitor → import.
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -751,13 +752,11 @@ async fn import(
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(staging)?;
     let mut placed = 0usize;
-    place_audio(
-        Path::new(content_path),
-        staging,
-        keep_source,
-        &mut placed,
-        wanted_titles,
-    )?;
+    // The download's top level is passed as both the walk cursor and the `root` the recursion keeps
+    // unchanged: everything lands in ONE `staging`, so each file's name is disambiguated by the
+    // folders it sat in below `root` (see `free_dest_path`).
+    let root = Path::new(content_path);
+    place_audio(root, root, staging, keep_source, &mut placed, wanted_titles)?;
     if placed == 0 {
         anyhow::bail!("no matching audio files found in the completed download");
     }
@@ -765,8 +764,13 @@ async fn import(
     Ok(())
 }
 
+/// Walk the finished download and place every audio file into the ONE import directory. `root` is
+/// the download's top level, carried through the recursion so each file's name can be disambiguated
+/// by the folders it came from — see [`free_dest_path`], which is what keeps this flattening from
+/// destroying files.
 fn place_audio(
     src: &Path,
+    root: &Path,
     dest_dir: &Path,
     keep_source: bool,
     placed: &mut usize,
@@ -777,12 +781,19 @@ fn place_audio(
         let keep =
             is_audio(src) && (wanted_titles.is_empty() || file_is_wanted(src, wanted_titles));
         if keep {
-            place_one(src, dest_dir, keep_source)?;
+            place_one(src, root, dest_dir, keep_source)?;
             *placed += 1;
         }
     } else if src.is_dir() {
         for entry in std::fs::read_dir(src)? {
-            place_audio(&entry?.path(), dest_dir, keep_source, placed, wanted_titles)?;
+            place_audio(
+                &entry?.path(),
+                root,
+                dest_dir,
+                keep_source,
+                placed,
+                wanted_titles,
+            )?;
         }
     }
     Ok(())
@@ -826,17 +837,14 @@ fn title_matches(file_stem: &str, title: &str) -> bool {
     hit as f32 / toks.len() as f32 >= 0.75
 }
 
-fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<()> {
-    let name = src
-        .file_name()
-        .ok_or_else(|| anyhow::anyhow!("invalid file name"))?;
+fn place_one(src: &Path, root: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<()> {
     // The fs watcher indexes each file the moment it lands here and `organize` moves it into place,
     // then prunes the emptied import dir (organize.rs `prune_empty_dirs`) — so the destination can
     // vanish BETWEEN files. Re-assert it per file rather than once per import, or every track after
     // the first fails with a bare ENOENT and takes the whole album's job down with it.
     std::fs::create_dir_all(dest_dir)
         .with_context(|| format!("creating import dir {}", dest_dir.display()))?;
-    let dest = dest_dir.join(name);
+    let dest = free_dest_path(src, root, dest_dir)?;
     if keep_source {
         // Hardlink so the torrent keeps its copy (free, same volume) and can seed; fall back to a copy
         // across filesystems. Never move, or seeding breaks.
@@ -851,6 +859,182 @@ fn place_one(src: &Path, dest_dir: &Path, keep_source: bool) -> anyhow::Result<(
         }
     }
     Ok(())
+}
+
+/// How many numbered variants of a name are tried before an import gives up. Reached only if a
+/// directory genuinely holds that many files fighting over one name.
+const MAX_NAME_ATTEMPTS: usize = 999;
+/// Longest folder prefix (in bytes) folded into an imported file name, so a deeply nested torrent
+/// can't compose a name past the filesystem's ~255-byte limit. Truncation can make two prefixes
+/// equal; the numbered fallback below picks that up.
+const MAX_PREFIX_BYTES: usize = 60;
+/// Longest composed file name (in bytes). Clamping only the prefix is not enough: the STEM is the
+/// torrent's, and a 240-byte one plus any prefix at all overruns the ~255-byte limit every common
+/// filesystem enforces — so the placement fails and, with `keep_seeding = false`, fails on a file
+/// that has already left the torrent. Well under 255 so the ` (999)` fallback, the `.part` sidecar
+/// `copy_into_place` writes beside it, and the import path itself all still fit.
+const MAX_NAME_BYTES: usize = 200;
+
+/// The name a placed file takes in the import directory: its own, unless something already holds
+/// that name.
+///
+/// [`place_audio`] recurses through the download's subdirectories but places everything into ONE
+/// `dest_dir`, so two audio files sharing a basename in different folders — `CD1/01.flac` plus
+/// `CD2/01.flac`, which is how bare-numbered multi-disc rips and per-album discography torrents are
+/// laid out — used to resolve to the same destination. Every write in [`place_one`] overwrites:
+/// `fs::rename` replaces the destination by definition, and the `keep_source` `hard_link` fails
+/// `AlreadyExists` and falls through to `copy_into_place`, which renames over it just the same.
+/// With `keep_seeding = false` the source is MOVED, so by the time the second file overwrote the
+/// first, the first had already left the torrent's download directory — one track gone from both
+/// places, on a job that goes on to report `completed`. A free name is the whole defence.
+///
+/// Occupancy is read off the filesystem rather than tracked in a list, so it also covers what was
+/// already sitting there: whatever an interrupted earlier run of this same job left behind (staging
+/// is keyed by job id, so a resume revisits the same directory).
+///
+/// Runs out of names rather than reusing one: an error fails this job with the file still where it
+/// was, which is the outcome to prefer over any write that could land on top of another track.
+fn free_dest_path(src: &Path, root: &Path, dest_dir: &Path) -> anyhow::Result<PathBuf> {
+    let name = src
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("invalid file name"))?;
+    // The ordinary case — no collision, so the file keeps exactly the name the torrent gave it,
+    // including names that aren't valid UTF-8. That is why this arm never goes near a conversion.
+    let plain = dest_dir.join(name);
+    if is_free(&plain) {
+        return Ok(plain);
+    }
+    // The stem stays an `OsStr` and the extension is the only piece converted: `is_audio` has
+    // already vouched for the extension being one of the audio extensions, i.e. ASCII, while the
+    // stem is whatever the torrent called it. `file_stem`/`extension` also handle the leading-dot
+    // case the right way round (`.hidden` is a name, not an extension).
+    let stem = src.file_stem().unwrap_or(name);
+    let ext = src
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    // What actually distinguishes this file from its namesake is the folder it came from, so fold
+    // that into the name: `CD2/01.flac` -> `CD2 - 01.flac`.
+    let prefix = folder_prefix(src, root);
+    let lead = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix} - ")
+    };
+    if !lead.is_empty() {
+        let candidate = dest_dir.join(compose_name(&lead, stem, &ext));
+        if is_free(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    // No usable prefix (the file sits in the download's root), or the prefixed name is taken too
+    // (two folders that sanitize alike, or a file already there under that exact name). Count up.
+    for n in 2..=MAX_NAME_ATTEMPTS {
+        let candidate = dest_dir.join(compose_name(&lead, stem, &format!(" ({n}){ext}")));
+        if is_free(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    anyhow::bail!(
+        "no free import name for {} in {} after {MAX_NAME_ATTEMPTS} tries",
+        src.display(),
+        dest_dir.display()
+    )
+}
+
+/// Whether nothing holds this name. `symlink_metadata` rather than `exists()`, so a dangling
+/// symlink still counts as taken (`exists()` reports false for one, and the write would then follow
+/// it out of the import directory).
+fn is_free(dest: &Path) -> bool {
+    std::fs::symlink_metadata(dest).is_err()
+}
+
+/// `<lead><stem><tail>` for a disambiguated import name, clamped to [`MAX_NAME_BYTES`].
+///
+/// Only the STEM is ever cut. `tail` carries the extension, which is the one thing that makes the
+/// imported file audio to the scanner, and `lead` is the folder prefix that makes the name unique in
+/// the first place.
+///
+/// The stem is spliced in BYTE-EXACT whenever it fits, because a torrent's file name need not be
+/// valid UTF-8 and the no-collision arm of [`free_dest_path`] hands such a name through untouched —
+/// so the collision arm must not quietly substitute U+FFFD and produce a different file name for the
+/// same file depending on whether something else happened to be there. Only a stem long enough to
+/// need cutting is converted lossily, and only because a cut needs a character boundary to land on.
+fn compose_name(lead: &str, stem: &OsStr, tail: &str) -> OsString {
+    let budget = MAX_NAME_BYTES.saturating_sub(lead.len() + tail.len());
+    let mut out = OsString::with_capacity(lead.len() + stem.len().min(budget) + tail.len());
+    out.push(lead);
+    if stem.len() <= budget {
+        out.push(stem);
+    } else {
+        out.push(clamp_bytes(&stem.to_string_lossy(), budget));
+    }
+    out.push(tail);
+    out
+}
+
+/// The folders `src` sits in below `root`, flattened into something that can be part of a single
+/// file name (`CD2`, `Disc 1 - Bonus`). Empty when the file sits directly in the root, or when
+/// nothing survives sanitizing — the caller falls back to numbering in that case.
+fn folder_prefix(src: &Path, root: &Path) -> String {
+    let Some(parent) = src.parent() else {
+        return String::new();
+    };
+    let rel = match parent.strip_prefix(root) {
+        Ok(r) => r,
+        // `root` is the download's single file, or some shape we didn't expect: the immediate
+        // folder is still a better disambiguator than nothing.
+        Err(_) => match parent.file_name() {
+            Some(n) => Path::new(n),
+            None => return String::new(),
+        },
+    };
+    let parts: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(part) => {
+                let s = sanitize_component(&part.to_string_lossy());
+                (!s.is_empty()).then_some(s)
+            }
+            _ => None,
+        })
+        .collect();
+    clamp_bytes(&parts.join(" - "), MAX_PREFIX_BYTES)
+}
+
+/// A folder name is a valid path component where it came from, which says nothing about where it is
+/// going: a download arrives over a mount from a filesystem that may allow characters this one
+/// reserves, and the name is about to be embedded in a file name rather than be one. Replace what a
+/// component can't hold, and drop the leading/trailing dots and spaces Windows silently strips.
+fn sanitize_component(part: &str) -> String {
+    let mapped: String = part
+        .chars()
+        .map(|c| {
+            if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    mapped
+        .trim_matches(|c: char| c == '.' || c.is_whitespace())
+        .to_string()
+}
+
+/// Cut a name to at most `max` bytes on a char boundary, then re-trim the edges truncation may have
+/// left ragged.
+fn clamp_bytes(s: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out.trim_matches(|c: char| c == '.' || c.is_whitespace())
+        .to_string()
 }
 
 /// Wait for a just-completed download to become fully readable through a network mount.
@@ -1775,5 +1959,292 @@ mod tests {
         assert_eq!(parse_numeral("2018"), None); // year, not a volume
         assert_eq!(parse_numeral("182"), None); // name-number, not a volume
         assert_eq!(parse_numeral("orange"), None);
+    }
+
+    // ── IMPORT PLACEMENT: files from different folders that want one name ────────────────────────
+
+    use std::fs;
+
+    /// Drive the real import walk over `src`, into `dest`. Nothing is stubbed: this is the
+    /// recursion, `place_one` and `free_dest_path` exactly as `import` calls them.
+    fn place_all(src: &Path, dest: &Path, keep_source: bool) -> anyhow::Result<usize> {
+        let mut placed = 0usize;
+        place_audio(src, src, dest, keep_source, &mut placed, &[])?;
+        Ok(placed)
+    }
+
+    /// Every file's bytes in the import directory, sorted so no assertion depends on walk order.
+    fn imported_contents(dir: &Path) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| fs::read(e.unwrap().path()).unwrap())
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn sorted(mut v: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        v.sort();
+        v
+    }
+
+    /// The names in the import directory, sorted.
+    fn imported_names(dir: &Path) -> Vec<OsString> {
+        let mut out: Vec<OsString> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// DATA LOSS — the reason `free_dest_path` exists. `place_audio` flattens the download's
+    /// subdirectories into ONE import directory, so `CD1/01.flac` and `CD2/01.flac` resolved to the
+    /// same destination. With `keep_source = false` the source is MOVED, and `fs::rename` overwrites
+    /// its destination, so disc 1's file had already left the torrent when disc 2's rename replaced
+    /// it: gone from both places, on a job that goes on to report `completed`.
+    ///
+    /// Asserted on CONTENT. A test that counted files would pass with one disc's bytes sitting under
+    /// both names, which is the exact shape of the loss.
+    #[test]
+    fn a_multi_disc_download_lands_both_files_with_both_sets_of_bytes() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let disc1 = b"disc one audio".to_vec();
+        let disc2 = b"disc two audio".to_vec();
+        for (dir, bytes) in [("CD1", &disc1), ("CD2", &disc2)] {
+            fs::create_dir_all(src.path().join(dir)).unwrap();
+            fs::write(src.path().join(dir).join("01.flac"), bytes).unwrap();
+        }
+
+        // keep_source = false: the destructive mode, where the source is MOVED.
+        let placed = place_all(src.path(), dest.path(), false).unwrap();
+
+        assert_eq!(placed, 2, "both discs' track 1 was imported");
+        assert_eq!(
+            imported_contents(dest.path()),
+            sorted(vec![disc1, disc2]),
+            "both discs' bytes are in the library — neither file was overwritten by the other"
+        );
+    }
+
+    /// `keep_source = true` (seeding) collides just as hard, by a different route: `hard_link` fails
+    /// `AlreadyExists`, and the `copy_into_place` fallback renames its `.part` over the destination.
+    /// The torrent keeping its copy is what makes this survivable, and it must keep it.
+    #[test]
+    fn the_seeding_path_also_keeps_both_files_and_leaves_the_torrent_intact() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let disc1 = b"disc one audio".to_vec();
+        let disc2 = b"disc two audio".to_vec();
+        for (dir, bytes) in [("CD1", &disc1), ("CD2", &disc2)] {
+            fs::create_dir_all(src.path().join(dir)).unwrap();
+            fs::write(src.path().join(dir).join("01.flac"), bytes).unwrap();
+        }
+
+        assert_eq!(place_all(src.path(), dest.path(), true).unwrap(), 2);
+
+        assert_eq!(
+            imported_contents(dest.path()),
+            sorted(vec![disc1.clone(), disc2.clone()]),
+            "both discs' bytes are in the library"
+        );
+        assert_eq!(
+            fs::read(src.path().join("CD1").join("01.flac")).unwrap(),
+            disc1,
+            "and the torrent still has disc 1's file, unchanged, to seed"
+        );
+        assert_eq!(
+            fs::read(src.path().join("CD2").join("01.flac")).unwrap(),
+            disc2
+        );
+    }
+
+    /// The same collision at the sizes that break a naive fix: three folders folded into one name, a
+    /// file sitting directly in the download's root (no folder to disambiguate it with), and a name
+    /// already occupied in the import directory before the import even starts.
+    #[test]
+    fn three_folders_a_root_file_and_an_occupied_name_each_get_their_own_file() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        // Already sitting under the name every one of these files wants.
+        let squatter = b"was already here".to_vec();
+        fs::write(dest.path().join("01.flac"), &squatter).unwrap();
+
+        let root_file = b"root level".to_vec();
+        fs::write(src.path().join("01.flac"), &root_file).unwrap();
+        let discs: Vec<Vec<u8>> = ["cd1 audio", "cd2 audio", "cd3 audio"]
+            .iter()
+            .map(|m| m.as_bytes().to_vec())
+            .collect();
+        for (dir, bytes) in ["CD1", "CD2", "CD3"].iter().zip(&discs) {
+            fs::create_dir_all(src.path().join(dir)).unwrap();
+            fs::write(src.path().join(dir).join("01.flac"), bytes).unwrap();
+        }
+
+        assert_eq!(place_all(src.path(), dest.path(), false).unwrap(), 4);
+
+        let mut want = vec![squatter, root_file];
+        want.extend(discs);
+        assert_eq!(
+            imported_contents(dest.path()),
+            sorted(want),
+            "five files wanted one name and all five sets of bytes survived, including the one \
+             that was there first"
+        );
+    }
+
+    /// A name that does NOT collide is handed through byte-for-byte. Disambiguation is for the
+    /// collision, not a rewrite of every import: `organize` and the scanner see the torrent's own
+    /// names, as they always have.
+    #[test]
+    fn names_that_do_not_collide_are_untouched() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        for (dir, name) in [("CD1", "01 Alpha.flac"), ("CD2", "01 Bravo.flac")] {
+            fs::create_dir_all(src.path().join(dir)).unwrap();
+            fs::write(src.path().join(dir).join(name), b"audio").unwrap();
+        }
+
+        assert_eq!(place_all(src.path(), dest.path(), false).unwrap(), 2);
+
+        assert_eq!(
+            imported_names(dest.path()),
+            vec![
+                OsString::from("01 Alpha.flac"),
+                OsString::from("01 Bravo.flac")
+            ],
+            "no folder prefix on a name nothing was fighting over"
+        );
+    }
+
+    /// The composed name has to fit on the filesystem. Clamping only the PREFIX is not enough — the
+    /// stem is the torrent's, and a 240-character one plus any prefix at all overruns the ~255-byte
+    /// limit, so the placement fails on a file that, with `keep_seeding = false`, has already left
+    /// the torrent's directory.
+    #[test]
+    fn a_very_long_name_still_fits_when_a_collision_forces_it_to_be_composed() {
+        let src = tempfile::tempdir().unwrap();
+        let dest = tempfile::tempdir().unwrap();
+        let long = format!("{}.flac", "z".repeat(240));
+        let discs = [b"cd1 audio".to_vec(), b"cd2 audio".to_vec()];
+        for (dir, bytes) in ["CD1", "CD2"].iter().zip(&discs) {
+            fs::create_dir_all(src.path().join(dir)).unwrap();
+            fs::write(src.path().join(dir).join(&long), bytes).unwrap();
+        }
+
+        assert_eq!(place_all(src.path(), dest.path(), false).unwrap(), 2);
+        assert_eq!(
+            imported_contents(dest.path()),
+            sorted(discs.to_vec()),
+            "both discs' bytes survived the collision"
+        );
+        let composed = imported_names(dest.path())
+            .into_iter()
+            .find(|n| n.as_os_str() != OsStr::new(&long))
+            .expect("one of the two had to be renamed");
+        assert!(
+            composed.len() <= MAX_NAME_BYTES,
+            "composed name is {} bytes: {}",
+            composed.len(),
+            composed.to_string_lossy()
+        );
+        assert!(
+            Path::new(&composed)
+                .extension()
+                .is_some_and(|e| e == OsStr::new("flac")),
+            "and the clamp took it out of the stem, never the extension — the extension is what \
+             makes the imported file audio to the scanner"
+        );
+    }
+
+    /// A multi-byte stem is cut on a CHARACTER boundary. Slicing bytes would panic (or, worse, emit
+    /// a name half a codepoint long) on any non-ASCII title, which is most of them.
+    #[test]
+    fn clamping_a_multi_byte_name_lands_on_a_char_boundary() {
+        let stem = OsString::from("é".repeat(200)); // 400 bytes
+        let name = compose_name("CD2 - ", &stem, ".flac");
+        assert!(name.len() <= MAX_NAME_BYTES, "{} bytes", name.len());
+        let s = name
+            .to_str()
+            .expect("cut on a char boundary, so still UTF-8");
+        assert!(s.starts_with("CD2 - é") && s.ends_with(".flac"));
+    }
+
+    /// A torrent's file name need not be valid UTF-8, and the no-collision arm hands such a name
+    /// through byte-exact. A collision arm that went through `to_string_lossy` would give the SAME
+    /// file a different name — one with U+FFFD baked into it — depending only on whether something
+    /// else happened to be sitting there.
+    #[test]
+    fn composing_a_name_does_not_rewrite_bytes_it_cannot_decode() {
+        let stem = non_utf8_stem();
+        let composed = compose_name("CD2 - ", &stem, ".flac");
+
+        let mut want = OsString::from("CD2 - ");
+        want.push(&stem);
+        want.push(".flac");
+        assert_eq!(composed, want, "the stem is spliced in exactly as it came");
+        assert_ne!(
+            composed,
+            OsString::from(format!("CD2 - {}.flac", stem.to_string_lossy())),
+            "which is NOT what a lossy conversion produces"
+        );
+    }
+
+    #[cfg(windows)]
+    fn non_utf8_stem() -> OsString {
+        use std::os::windows::ffi::OsStringExt;
+        // An unpaired surrogate: a legal Windows file name, and not representable in UTF-8.
+        OsString::from_wide(&[0x41, 0xD800, 0x42])
+    }
+
+    #[cfg(unix)]
+    fn non_utf8_stem() -> OsString {
+        use std::os::unix::ffi::OsStringExt;
+        OsString::from_vec(vec![0x41, 0xFF, 0x42])
+    }
+
+    /// The prefix is spliced into a FILE name, so a folder name that is legal where the download
+    /// came from but illegal here must not become one. Anything left unusable yields no prefix at
+    /// all, and `free_dest_path` falls through to numbering.
+    #[test]
+    fn a_folder_name_that_cannot_go_in_a_file_name_never_does() {
+        let root = Path::new("/dl/Album");
+        assert_eq!(folder_prefix(&root.join("CD 2/01.flac"), root), "CD 2");
+        assert_eq!(
+            folder_prefix(&root.join("Disc 1/Bonus/01.flac"), root),
+            "Disc 1 - Bonus"
+        );
+        assert_eq!(
+            folder_prefix(&root.join("A|B/01.flac"), root),
+            "A_B",
+            "a reserved character is replaced, not carried into the name"
+        );
+        assert_eq!(
+            sanitize_component("tab\there"),
+            "tab_here",
+            "and so is a control character"
+        );
+        assert_eq!(
+            sanitize_component(" .hidden. "),
+            "hidden",
+            "leading/trailing dots and spaces go — Windows strips them silently, which would make \
+             two different prefixes name one file"
+        );
+        assert_eq!(
+            folder_prefix(&root.join(".../01.flac"), root),
+            "",
+            "a folder that sanitizes away leaves no prefix"
+        );
+        assert_eq!(
+            folder_prefix(&root.join("01.flac"), root),
+            "",
+            "a file in the download's root has no folder to be named after"
+        );
+        let long = "z".repeat(200);
+        assert!(
+            folder_prefix(&root.join(&long).join("01.flac"), root).len() <= MAX_PREFIX_BYTES,
+            "a deep/long folder name can't push the composed file name past the fs limit"
+        );
     }
 }
