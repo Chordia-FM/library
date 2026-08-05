@@ -167,12 +167,71 @@ pub async fn prune_missing(db: &SqlitePool, library_id: &str) {
             }
         }
     }
-    info!(library_id, removed, "prune complete: removed deleted files");
+    let superseded = prune_superseded(db, library_id).await;
+    info!(
+        library_id,
+        removed, superseded, "prune complete: removed deleted files"
+    );
 }
 
 /// Has this path already been indexed with the same mtime and size? If so a rescan can skip the
 /// expensive re-probe and content re-hash. Conservative: any stat error, missing row, or NULL
 /// freshness column returns `false` (re-index), so we never skip a file we're unsure about.
+/// Remove tracks whose content is no longer at ANY path — the ones the sweep above cannot see.
+///
+/// [`prune_missing`] walks `file_paths` and removes tracks whose FILE disappeared. That misses a
+/// track whose content was superseded **in place**. Rewriting a file's tags changes its
+/// `content_hash`, so `upsert_track` mints a fresh `files`/`tracks`/`library_tracks` set, and
+/// `file_paths` — `UNIQUE(path)` — is REPOINTED to the new hash rather than gaining a row. The old
+/// track keeps its library membership and is reachable from no path at all, so every prune skipped
+/// it while `catalog_sync` went on pushing it forever. Retagging one album that way put two and
+/// three copies of every track on the Hub.
+///
+/// Deletion order mirrors [`crate::index::remove_track`], including keeping the `files` row: it
+/// carries codec and ReplayGain loudness keyed by content hash, is invisible to track queries once
+/// orphaned, and lets the same bytes be re-indexed without re-analysis.
+///
+/// Callers must have already checked the library root is reachable — an unmounted drive makes every
+/// path look absent, and this would then delete the whole library.
+async fn prune_superseded(db: &SqlitePool, library_id: &str) -> u64 {
+    // Membership first: this library no longer reaches that content through any path of its own.
+    let dropped = sqlx::query(
+        "DELETE FROM library_tracks \
+          WHERE library_id = ?1 \
+            AND track_id IN ( \
+                SELECT t.id FROM tracks t \
+                 WHERE NOT EXISTS ( \
+                     SELECT 1 FROM file_paths fp \
+                      WHERE fp.content_hash = t.content_hash AND fp.library_id = ?1))",
+    )
+    .bind(library_id)
+    .execute(db)
+    .await;
+    let dropped = match dropped {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            warn!(library_id, error = %e, "prune: dropping superseded memberships failed");
+            return 0;
+        }
+    };
+
+    // Then the row itself, but only once NO library reaches it and NO path anywhere points at it.
+    // Both clauses are load-bearing: another library may still hold the same content, and a path in
+    // another library must keep the metadata alive even if this one dropped its membership.
+    if let Err(e) = sqlx::query(
+        "DELETE FROM tracks \
+          WHERE NOT EXISTS (SELECT 1 FROM library_tracks lt WHERE lt.track_id = tracks.id) \
+            AND NOT EXISTS ( \
+                SELECT 1 FROM file_paths fp WHERE fp.content_hash = tracks.content_hash)",
+    )
+    .execute(db)
+    .await
+    {
+        warn!(library_id, error = %e, "prune: deleting superseded tracks failed");
+    }
+    dropped
+}
+
 async fn path_unchanged(db: &SqlitePool, library_id: &str, path: &Path) -> bool {
     let (mtime_ns, size_bytes) = index::file_freshness(path).await;
     let (Some(mtime_ns), Some(size_bytes)) = (mtime_ns, size_bytes) else {
@@ -364,4 +423,123 @@ fn collect_audio_files(root: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod prune_tests {
+    use super::*;
+
+    /// The three tables the sweep reasons over, plus the columns it touches.
+    async fn mem_db() -> SqlitePool {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for ddl in [
+            "CREATE TABLE file_paths (id TEXT PRIMARY KEY, content_hash TEXT NOT NULL, \
+             library_id TEXT NOT NULL, path TEXT NOT NULL UNIQUE)",
+            "CREATE TABLE tracks (id TEXT PRIMARY KEY, content_hash TEXT NOT NULL UNIQUE, \
+             title TEXT NOT NULL)",
+            "CREATE TABLE library_tracks (library_id TEXT NOT NULL, track_id TEXT NOT NULL, \
+             PRIMARY KEY (library_id, track_id))",
+        ] {
+            sqlx::query(ddl).execute(&db).await.unwrap();
+        }
+        db
+    }
+
+    async fn add(db: &SqlitePool, lib: &str, hash: &str, title: &str, path: Option<&str>) {
+        sqlx::query("INSERT INTO tracks (id, content_hash, title) VALUES (?, ?, ?)")
+            .bind(format!("trk-{hash}"))
+            .bind(hash)
+            .bind(title)
+            .execute(db)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO library_tracks (library_id, track_id) VALUES (?, ?)")
+            .bind(lib)
+            .bind(format!("trk-{hash}"))
+            .execute(db)
+            .await
+            .unwrap();
+        if let Some(p) = path {
+            sqlx::query(
+                "INSERT INTO file_paths (id, content_hash, library_id, path) VALUES (?, ?, ?, ?)",
+            )
+            .bind(format!("fp-{hash}"))
+            .bind(hash)
+            .bind(lib)
+            .bind(p)
+            .execute(db)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn titles(db: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT title FROM tracks ORDER BY title")
+            .fetch_all(db)
+            .await
+            .unwrap()
+    }
+
+    /// The reported bug: retagging a file in place left the pre-tag track reachable from nothing,
+    /// and it kept being pushed to the Hub as a duplicate of the track that replaced it.
+    #[tokio::test]
+    async fn a_track_superseded_in_place_is_removed() {
+        let db = mem_db().await;
+        // Same path, two content hashes: the tag rewrite repointed `file_paths` to the new one.
+        add(&db, "lib", "old", "Attention (pre-tag)", None).await;
+        add(
+            &db,
+            "lib",
+            "new",
+            "Attention",
+            Some("/music/Attention.flac"),
+        )
+        .await;
+
+        let dropped = prune_superseded(&db, "lib").await;
+
+        assert_eq!(dropped, 1, "the superseded membership was not dropped");
+        assert_eq!(
+            titles(&db).await,
+            vec!["Attention".to_string()],
+            "the pre-tag track survived and will keep syncing as a duplicate"
+        );
+    }
+
+    /// The guard that stops this deleting a healthy library: a track still at a path must survive.
+    #[tokio::test]
+    async fn a_track_still_at_a_path_is_kept() {
+        let db = mem_db().await;
+        add(&db, "lib", "live", "Kept", Some("/music/Kept.flac")).await;
+
+        assert_eq!(prune_superseded(&db, "lib").await, 0);
+        assert_eq!(titles(&db).await, vec!["Kept".to_string()]);
+    }
+
+    /// Another library still reaching the same bytes keeps the row alive, even though THIS library
+    /// no longer has a path to it. Both `NOT EXISTS` clauses in the delete exist for this case.
+    #[tokio::test]
+    async fn content_another_library_still_holds_is_kept() {
+        let db = mem_db().await;
+        add(&db, "a", "shared", "Shared", None).await;
+        sqlx::query("INSERT INTO library_tracks (library_id, track_id) VALUES ('b', 'trk-shared')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO file_paths (id, content_hash, library_id, path) \
+             VALUES ('fp-b', 'shared', 'b', '/other/Shared.flac')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        prune_superseded(&db, "a").await;
+
+        assert_eq!(
+            titles(&db).await,
+            vec!["Shared".to_string()],
+            "a track another library still reaches through its own path was deleted"
+        );
+    }
 }
