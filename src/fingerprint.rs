@@ -269,6 +269,8 @@ struct PendingRow {
     title: String,
     album: String,
     album_id: Option<String>,
+    /// Needed to CREATE an album when the track has none; `albums.artist_id` is not nullable.
+    artist_id: Option<String>,
     library_id: String,
     path: String,
 }
@@ -278,7 +280,7 @@ struct PendingRow {
 /// file on disk now that it's complete. Returns how many were resolved.
 async fn identify_batch(state: &AppState, api_key: &str, fpcalc_path: &str) -> anyhow::Result<u32> {
     let rows: Vec<PendingRow> = sqlx::query_as(
-        "SELECT t.id, t.title, COALESCE(al.title, '') AS album, t.album_id, \
+        "SELECT t.id, t.title, COALESCE(al.title, '') AS album, t.album_id, t.artist_id, \
                 lt.library_id, fp.path \
          FROM tracks t \
          JOIN file_paths fp ON fp.content_hash = t.content_hash \
@@ -322,7 +324,37 @@ async fn identify_batch(state: &AppState, api_key: &str, fpcalc_path: &str) -> a
                 .execute(&state.db)
                 .await?;
                 // Backfill album-level facts (year / release id) onto the album.
-                if let Some(album_id) = &r.album_id {
+                // The album the fingerprint resolved is only useful to a track that HAS NONE —
+                // which is exactly the branch this used to skip. Create it, then fall through to the
+                // same backfill so year and release id land on it either way.
+                let album_id = match (&r.album_id, &r.artist_id, identity.album.as_deref()) {
+                    (None, Some(artist_id), Some(album)) => {
+                        match crate::index::attach_album_from_identity(
+                            &state.db,
+                            &r.id,
+                            artist_id,
+                            album,
+                            identity.year,
+                            identity.release_mbid.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(id) => {
+                                if id.is_some() {
+                                    info!(track = %r.id, album, "identified an album for an untagged track");
+                                }
+                                id
+                            }
+                            Err(e) => {
+                                warn!(track = %r.id, error = %e, "attaching the identified album failed");
+                                None
+                            }
+                        }
+                    }
+                    _ => r.album_id.clone(),
+                };
+
+                if let Some(album_id) = &album_id {
                     sqlx::query(
                         "UPDATE albums SET year = COALESCE(year, ?), \
                          release_mbid = COALESCE(release_mbid, ?) WHERE id = ?",

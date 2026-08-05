@@ -408,3 +408,153 @@ pub async fn upsert_library(db: &SqlitePool, name: &str, path: &Path) -> AppResu
         .await?;
     Ok(id)
 }
+
+/// Attach a track to an album resolved by acoustic fingerprint.
+///
+/// The identification worker already learns the album, its release MBID and its year from the
+/// AcoustID/MusicBrainz match, and its own doc calls the track/disc numbers "the ones untagged files
+/// lack". It then wrote those back only `if let Some(album_id) = &r.album_id` — i.e. only when the
+/// track ALREADY had an album, which is precisely the case that does not need them. A tagless rip,
+/// the whole reason fingerprinting exists, had its resolved album thrown away and stayed orphaned.
+///
+/// Returns the album id when one was created or matched, `None` when there was nothing to attach to.
+/// Uses the same `upsert_album` as the tag path, so an album the fingerprint names and one the tags
+/// name converge on a single row via `albums_title_artist_uniq` rather than becoming duplicates.
+pub(crate) async fn attach_album_from_identity(
+    db: &SqlitePool,
+    track_id: &str,
+    artist_id: &str,
+    title: &str,
+    year: Option<i64>,
+    release_mbid: Option<&str>,
+) -> AppResult<Option<String>> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Ok(None);
+    }
+    let mut conn = db.acquire().await?;
+    let album_id = upsert_album(
+        &mut conn,
+        title,
+        &crate::metadata::normalize(title),
+        artist_id,
+        year,
+        None,
+        None,
+        None,
+        None,
+        false,
+        release_mbid,
+        None,
+    )
+    .await?;
+
+    // COALESCE, not an overwrite: a track that gained a real ALBUM tag between the fingerprint being
+    // queued and this write must keep the tag's answer. The fingerprint is a fallback for files that
+    // say nothing, not an authority over files that do.
+    sqlx::query("UPDATE tracks SET album_id = COALESCE(album_id, ?) WHERE id = ?")
+        .bind(&album_id)
+        .bind(track_id)
+        .execute(db)
+        .await?;
+    Ok(Some(album_id))
+}
+
+#[cfg(test)]
+mod attach_album_tests {
+    use super::*;
+
+    async fn db_with_schema() -> SqlitePool {
+        let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        for ddl in [
+            "CREATE TABLE artists (id TEXT PRIMARY KEY, name TEXT NOT NULL, \
+             name_normalized TEXT NOT NULL)",
+            "CREATE TABLE albums (id TEXT PRIMARY KEY, title TEXT NOT NULL, \
+             title_normalized TEXT NOT NULL, artist_id TEXT NOT NULL, year INTEGER, genre TEXT, \
+             label TEXT, total_tracks INTEGER, total_discs INTEGER, \
+             compilation INTEGER NOT NULL DEFAULT 0, release_mbid TEXT, cover_hash TEXT)",
+            "CREATE UNIQUE INDEX albums_title_artist_uniq ON albums(title_normalized, artist_id)",
+            "CREATE TABLE tracks (id TEXT PRIMARY KEY, album_id TEXT)",
+            "INSERT INTO artists VALUES ('art1', 'Charlie Puth', 'charlie puth')",
+        ] {
+            sqlx::query(ddl).execute(&db).await.unwrap();
+        }
+        db
+    }
+
+    async fn album_of(db: &SqlitePool, track: &str) -> Option<String> {
+        sqlx::query_scalar::<_, Option<String>>("SELECT album_id FROM tracks WHERE id = ?")
+            .bind(track)
+            .fetch_one(db)
+            .await
+            .unwrap()
+    }
+
+    /// The reported case: a tagless track whose album the fingerprint resolved.
+    #[tokio::test]
+    async fn an_orphaned_track_gets_the_identified_album() {
+        let db = db_with_schema().await;
+        sqlx::query("INSERT INTO tracks VALUES ('t1', NULL)")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        let id = attach_album_from_identity(&db, "t1", "art1", "Voicenotes", Some(2018), None)
+            .await
+            .unwrap();
+
+        assert!(
+            id.is_some(),
+            "no album was created for the identified track"
+        );
+        assert_eq!(album_of(&db, "t1").await, id, "the track was not attached");
+    }
+
+    /// A track that already has an album keeps it: the fingerprint is a fallback for files that say
+    /// nothing, never an authority over files that do.
+    #[tokio::test]
+    async fn an_existing_album_is_not_overwritten() {
+        let db = db_with_schema().await;
+        sqlx::query("INSERT INTO tracks VALUES ('t2', 'already-here')")
+            .execute(&db)
+            .await
+            .unwrap();
+
+        attach_album_from_identity(&db, "t2", "art1", "Voicenotes", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            album_of(&db, "t2").await,
+            Some("already-here".to_string()),
+            "the fingerprint overwrote an album the tags had already established"
+        );
+    }
+
+    /// Tag-derived and fingerprint-derived albums must converge on one row, not duplicate.
+    #[tokio::test]
+    async fn the_same_album_from_two_sources_is_one_row() {
+        let db = db_with_schema().await;
+        for t in ["t3", "t4"] {
+            sqlx::query("INSERT INTO tracks VALUES (?, NULL)")
+                .bind(t)
+                .execute(&db)
+                .await
+                .unwrap();
+        }
+
+        let a = attach_album_from_identity(&db, "t3", "art1", "Voicenotes", None, None)
+            .await
+            .unwrap();
+        let b = attach_album_from_identity(&db, "t4", "art1", "voicenotes", None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(a, b, "the same album under different casing made two rows");
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM albums")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "expected one album row, found {n}");
+    }
+}
