@@ -225,15 +225,18 @@ impl AcquisitionConfig {
     }
 }
 
-/// AcoustID acoustic fingerprinting. When `api_key` is set (and the `fpcalc`/Chromaprint binary is
-/// available), a background pass computes each track's fingerprint and resolves it to a stable
-/// AcoustID + MusicBrainz recording id - so the same recording matches across different encodings
-/// (the preferred own-copy match layer). Disabled when `api_key` is unset.
+/// Acoustic fingerprinting. A background pass computes each track's Chromaprint fingerprint and
+/// asks the paired Hub to resolve it to a stable AcoustID + MusicBrainz recording id - so the same
+/// recording matches across different encodings (the preferred own-copy match layer).
+///
+/// **There is no API key here, and that is the feature.** Identification used to be gated behind
+/// this library's own `[acoustid] api_key`; essentially no self-hoster set one, so untagged imports
+/// stayed untagged forever on every instance. The key now lives on the Hub, which already owns
+/// third-party provider access, so identification is simply on for any library paired to a Hub that
+/// has one — with nothing to configure here. The only knob left is where to find `fpcalc`, because
+/// that binary reads the audio and so must run locally; the whole block can be omitted.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcoustidConfig {
-    /// AcoustID application API key (free, from acoustid.org). Identification is off when unset.
-    #[serde(default)]
-    pub api_key: Option<String>,
     /// Path to the Chromaprint `fpcalc` binary (looked up on `PATH` by default).
     #[serde(default = "default_fpcalc_path")]
     pub fpcalc_path: String,
@@ -242,7 +245,6 @@ pub struct AcoustidConfig {
 impl Default for AcoustidConfig {
     fn default() -> Self {
         Self {
-            api_key: None,
             fpcalc_path: default_fpcalc_path(),
         }
     }

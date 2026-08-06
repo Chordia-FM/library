@@ -38,6 +38,14 @@ pub struct AppState {
     /// startup resume racing a fresh claim) never runs a second monitor that could tear down the first's
     /// torrent. See `acquisition::claim_job`.
     pub inflight_jobs: Arc<std::sync::Mutex<std::collections::HashSet<uuid::Uuid>>>,
+    /// Whether the paired Hub offers AcoustID identification.
+    ///
+    /// Optimistically `true`: identification needs no configuration here, so the only way to learn
+    /// otherwise is to ask, and the answer (`501 not-configured`) flips this to `false` and stops the
+    /// identification worker. Dedupe reads it — it prefers to wait for an authoritative recording id
+    /// before collapsing copies, but *only* while one is actually coming. Without this flag, a Hub
+    /// with no AcoustID key would leave dedupe waiting forever on an `acoustid` that never arrives.
+    pub identify_available: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
@@ -86,6 +94,7 @@ impl AppState {
             transcoder,
             tls_fingerprint,
             inflight_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            identify_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         })
     }
 }

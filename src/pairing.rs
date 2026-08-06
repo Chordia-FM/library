@@ -13,6 +13,7 @@ use chordia_contracts::acquisition::{
 };
 use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, CatalogSyncResponse};
 use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse};
+use chordia_contracts::identify::{IdentifyRequest, IdentifyResponse};
 use chordia_contracts::scrobble::ScrobbleBatch;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -45,6 +46,21 @@ impl PairingCredentials {
 pub struct HubPairResponse {
     pub server_id: Uuid,
     pub server_api_key: String,
+}
+
+/// What the Hub had to say about a fingerprint.
+///
+/// Three separate answers because the library does three different things with them, and collapsing
+/// any two loses the ability to choose: `Identified` is stored, `NoMatch` is shrugged off until a
+/// much later pass, `NotConfigured` stops the identification worker outright. A provider failure is
+/// deliberately NOT a variant here — it is an `Err`, so it can never be mistaken for "no data".
+#[derive(Debug)]
+pub enum IdentifyOutcome {
+    Identified(Box<IdentifyResponse>),
+    /// AcoustID answered and has never heard this fingerprint.
+    NoMatch,
+    /// This Hub has no AcoustID key. Nothing is wrong; identification simply is not offered.
+    NotConfigured,
 }
 
 /// Minimal Hub client - no stored credentials.
@@ -145,6 +161,48 @@ impl HubClient {
             anyhow::bail!("catalog sync failed {status}: {body}");
         }
         Ok(resp.json().await?)
+    }
+
+    /// Ask the Hub to identify one acoustic fingerprint (`POST /v1/catalog/identify`), authenticated
+    /// with this server's own API key exactly like catalog sync.
+    ///
+    /// **No audio leaves this host.** What crosses is the Chromaprint string `fpcalc` produced: a
+    /// lossy, one-way acoustic hash of a few hundred bytes from which nothing listenable can be
+    /// reconstructed. Computing it needs the file and stays here; looking it up is an API call
+    /// carrying a hash, and belongs on the Hub — which holds the one AcoustID key, the rate limiter
+    /// and the shared cache, so a self-hoster needs no key of their own.
+    ///
+    /// The three non-error answers stay distinct in the return type, because the caller has to act
+    /// differently on each: identified, no match, or "this Hub does not do identification". Anything
+    /// else — transport failure, a 5xx, an unparseable body — is an `Err` the caller must treat as
+    /// retryable. Folding a failure into [`IdentifyOutcome::NoMatch`] would make a dead provider
+    /// indistinguishable from an unidentifiable library.
+    pub async fn identify(
+        &self,
+        server_api_key: &str,
+        req: &IdentifyRequest,
+    ) -> anyhow::Result<IdentifyOutcome> {
+        let url = format!("{}/v1/catalog/identify", self.base_url);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(req)
+            .send()
+            .await?;
+        match resp.status() {
+            reqwest::StatusCode::OK => {
+                Ok(IdentifyOutcome::Identified(Box::new(resp.json().await?)))
+            }
+            reqwest::StatusCode::NO_CONTENT => Ok(IdentifyOutcome::NoMatch),
+            // A Hub with no AcoustID key is a supported deployment, not a fault: it answers 501 so
+            // we can stop asking instead of retrying a question it can never answer.
+            reqwest::StatusCode::NOT_IMPLEMENTED => Ok(IdentifyOutcome::NotConfigured),
+            status => {
+                let body = resp.text().await.unwrap_or_default();
+                anyhow::bail!("identify failed {status}: {body}")
+            }
+        }
     }
 
     /// Report the authoritative set of track refs so the Hub drops memberships for deleted files.

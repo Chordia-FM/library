@@ -22,7 +22,7 @@ use std::time::Duration;
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, MetadataStorage};
 use crate::http::AppState;
 use crate::index;
 
@@ -96,11 +96,20 @@ pub fn start_dedupe(state: AppState) {
 
 /// Run one dedupe pass. Returns how many copies were superseded (moved to trash + de-indexed).
 async fn dedupe_pass(state: &AppState) -> anyhow::Result<u32> {
-    // When AcoustID is enabled, only act on tracks that have been identified, because we want the
-    // authoritative recording id (and track metadata) in hand before deduping, not a guess off
-    // half-read tags. Un-identified tracks are skipped this pass and picked up once the AcoustID
-    // worker resolves them. Without an AcoustID key, fall back to grouping on whatever we have.
-    let require_identified = state.config.acoustid.api_key.is_some();
+    // When identification is available, only act on tracks that have been identified, because we
+    // want the authoritative recording id (and track metadata) in hand before deduping, not a guess
+    // off half-read tags. Un-identified tracks are skipped this pass and picked up once the
+    // identification worker resolves them.
+    //
+    // "Available" is a runtime fact now, not a config one: the AcoustID key lives on the Hub, so
+    // this library learns whether identification exists by asking. Waiting must therefore be
+    // conditional on an answer actually being on its way — a local-metadata library, an unpaired
+    // one, or one whose Hub has no key would otherwise wait forever on an `acoustid` that is never
+    // coming, and never dedupe at all.
+    let require_identified = state.config.metadata_storage == MetadataStorage::Hub
+        && state
+            .identify_available
+            .load(std::sync::atomic::Ordering::Relaxed);
     let identified_filter = if require_identified {
         " AND t.acoustid IS NOT NULL"
     } else {

@@ -36,12 +36,15 @@ cache_max_bytes = 5368709120
 # Max simultaneous ffmpeg processes.
 max_concurrent = 2
 
-# Optional AcoustID acoustic fingerprinting. With an API key (free, from acoustid.org) and the
-# Chromaprint `fpcalc` binary installed, a background pass identifies each track so the same
-# recording matches across different encodings (the preferred own-copy match layer). Off by
-# default; own-copy matching still works via content hash and fuzzy metadata.
+# Acoustic fingerprinting. With the Chromaprint `fpcalc` binary installed, a background pass
+# identifies each track so the same recording matches across different encodings (the preferred
+# own-copy match layer), and untagged imports get an album, track numbers and artwork.
+#
+# There is NO API key here. `fpcalc` runs locally because it reads the audio; the AcoustID lookup
+# itself is a call to your Hub, which holds the key (set ACOUSTID_API_KEY there) and does the lookup
+# for every library paired to it. Nothing crosses but the fingerprint - a lossy one-way hash, never
+# audio. This whole block is optional; set fpcalc_path only if the binary isn't on PATH.
 # [acoustid]
-# api_key = "your-acoustid-key"
 # fpcalc_path = "fpcalc"
 
 # EBU R128 loudness analysis (ReplayGain). A background pass measures each track's integrated

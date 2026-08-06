@@ -171,7 +171,8 @@ async fn main() -> anyhow::Result<()> {
     // Scrobble reporter: forward the owner's buffered listening events to the Hub.
     scrobble::start_reporter(state.clone());
 
-    // AcoustID identification (no-op unless [acoustid] api_key is configured).
+    // Acoustic identification. Needs NO configuration here: `fpcalc` runs locally on the audio, and
+    // the AcoustID lookup is a Hub call (the Hub holds the key). No-op unless paired to a Hub.
     fingerprint::start_identification(state.clone());
 
     // Loudness analysis (EBU R128 to ReplayGain; on unless [loudness] enabled = false).
