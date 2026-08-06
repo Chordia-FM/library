@@ -101,15 +101,24 @@ async fn dedupe_pass(state: &AppState) -> anyhow::Result<u32> {
     // off half-read tags. Un-identified tracks are skipped this pass and picked up once the
     // identification worker resolves them.
     //
-    // "Available" is a runtime fact now, not a config one: the AcoustID key lives on the Hub, so
-    // this library learns whether identification exists by asking. Waiting must therefore be
-    // conditional on an answer actually being on its way — a local-metadata library, an unpaired
-    // one, or one whose Hub has no key would otherwise wait forever on an `acoustid` that is never
-    // coming, and never dedupe at all.
-    let require_identified = state.config.metadata_storage == MetadataStorage::Hub
+    // "Available" is partly a runtime fact now, not purely a config one, because a paired library
+    // gets identification from its Hub and only learns whether that Hub has a key by asking. So the
+    // question is whether an `acoustid` is actually on its way from EITHER route — the Hub, or this
+    // library's own key. Get it wrong in one direction and a library whose Hub has no key waits
+    // forever on a value that is never coming and never dedupes at all; wrong in the other and a
+    // standalone library stops waiting for the identification it is perfectly capable of doing, and
+    // collapses copies off half-read tags while the answer was seconds away.
+    let hub_identifies = state.config.metadata_storage == MetadataStorage::Hub
         && state
             .identify_available
             .load(std::sync::atomic::Ordering::Relaxed);
+    let self_identifies = state
+        .config
+        .acoustid
+        .api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty());
+    let require_identified = hub_identifies || self_identifies;
     let identified_filter = if require_identified {
         " AND t.acoustid IS NOT NULL"
     } else {
