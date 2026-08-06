@@ -51,14 +51,32 @@ use crate::pairing::{HubClient, IdentifyOutcome, PairingCredentials};
 const BATCH: i64 = 25;
 /// Idle wait when there's nothing to do (or identification isn't available).
 const IDLE_SECS: u64 = 300;
-/// Spacing between identify requests.
+/// Minimum gap between identify requests, in milliseconds.
 ///
-/// This used to pace *our* calls to AcoustID. It now paces our calls to the **Hub**, which spends a
-/// single AcoustID key on behalf of every library paired to it — so the politeness is owed to the
-/// Hub's shared budget rather than to our own. The Hub queues on its own gate regardless; keeping
-/// the spacing here means one library's backlog does not arrive as a burst that makes every other
-/// library's identification wait behind it.
-const REQ_SPACING: Duration = Duration::from_millis(400);
+/// **On [`Resolver::Local`] this is AcoustID's published rate limit and not a courtesy**: at most
+/// 3 requests/second per application key, and exceeding it earns a 429 and eventually a revoked key.
+/// One spawned loop issues at most one request per iteration, so this spacing IS the rate limit —
+/// there is no other gate behind it on that route.
+///
+/// On [`Resolver::Hub`] it paces calls to the Hub instead, which spends one key across every library
+/// attached to it and queues on its own gate regardless; the spacing here keeps one library's
+/// backlog from arriving as a burst that every other library then waits behind.
+///
+/// 400 ms = 2.5 req/s, deliberately under the ceiling rather than exactly at it.
+const REQ_SPACING_MS: u64 = 400;
+
+/// AcoustID's documented ceiling. Encoded so the assertion below can be read against the source.
+const ACOUSTID_MAX_RPS: u64 = 3;
+
+// A guard, not decoration: [`REQ_SPACING_MS`] is the ONLY thing standing between the standalone path
+// and a rate-limit violation, and "make identification faster" is an obvious-looking edit that would
+// breach it silently — the failure arrives later, as someone else's revoked key.
+const _: () = assert!(
+    REQ_SPACING_MS > 1000 / ACOUSTID_MAX_RPS,
+    "REQ_SPACING_MS would exceed AcoustID's 3 requests/second limit"
+);
+
+const REQ_SPACING: Duration = Duration::from_millis(REQ_SPACING_MS);
 
 /// A computed Chromaprint fingerprint. Produced locally; only ever leaves this host as the two
 /// scalars below, never as audio.
