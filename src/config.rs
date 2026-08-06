@@ -229,23 +229,36 @@ impl AcquisitionConfig {
 /// asks the paired Hub to resolve it to a stable AcoustID + MusicBrainz recording id - so the same
 /// recording matches across different encodings (the preferred own-copy match layer).
 ///
-/// **There is no API key here, and that is the feature.** Identification used to be gated behind
-/// this library's own `[acoustid] api_key`; essentially no self-hoster set one, so untagged imports
-/// stayed untagged forever on every instance. The key now lives on the Hub, which already owns
-/// third-party provider access, so identification is simply on for any library paired to a Hub that
-/// has one — with nothing to configure here. The only knob left is where to find `fpcalc`, because
-/// that binary reads the audio and so must run locally; the whole block can be omitted.
+/// **A paired library needs no key here, and that is the point.** Identification used to be gated
+/// behind this library's own `api_key`; essentially no self-hoster set one, so untagged imports
+/// stayed untagged forever on every instance. A Hub already owns third-party provider access, so it
+/// holds the key and identifies on behalf of every library paired to it — nothing to configure.
+///
+/// `api_key` remains as the **standalone** path. A library is meant to be a complete music server on
+/// its own: client plus library, no Hub. Making identification reachable only through a Hub would
+/// have made a core capability — untagged imports getting an album, track numbers and artwork —
+/// something you cannot have without joining someone's network, which is the opposite of the point.
+/// So set it only if you run unpaired, or on local metadata storage, or your Hub has no key.
+///
+/// Hub first when one is available (it caches, shares a rate budget and needs no setup); this key is
+/// the fallback. `fpcalc_path` is the one knob both paths need, because that binary reads the audio
+/// and so must run locally.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AcoustidConfig {
     /// Path to the Chromaprint `fpcalc` binary (looked up on `PATH` by default).
     #[serde(default = "default_fpcalc_path")]
     pub fpcalc_path: String,
+    /// AcoustID application key (free, from <https://acoustid.org/new-application>) for identifying
+    /// without a Hub. Unset is correct for a paired library.
+    #[serde(default)]
+    pub api_key: Option<String>,
 }
 
 impl Default for AcoustidConfig {
     fn default() -> Self {
         Self {
             fpcalc_path: default_fpcalc_path(),
+            api_key: None,
         }
     }
 }

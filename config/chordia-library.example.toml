@@ -40,12 +40,20 @@ max_concurrent = 2
 # identifies each track so the same recording matches across different encodings (the preferred
 # own-copy match layer), and untagged imports get an album, track numbers and artwork.
 #
-# There is NO API key here. `fpcalc` runs locally because it reads the audio; the AcoustID lookup
-# itself is a call to your Hub, which holds the key (set ACOUSTID_API_KEY there) and does the lookup
-# for every library paired to it. Nothing crosses but the fingerprint - a lossy one-way hash, never
-# audio. This whole block is optional; set fpcalc_path only if the binary isn't on PATH.
+# `fpcalc` always runs locally because it reads the audio. Only the fingerprint leaves this host -
+# a lossy one-way hash, never audio - and the lookup itself can go one of two ways:
+#
+#   Paired to a Hub: nothing to set. The Hub holds one AcoustID key (ACOUSTID_API_KEY there) and
+#   identifies for every library attached to it, caching responses and sharing one rate budget.
+#
+#   Running standalone: set api_key below with a free key from https://acoustid.org/new-application.
+#   A library is a complete music server on its own - client plus library, no Hub - so it identifies
+#   on its own too. Also the fallback if your Hub has no key, or you use local metadata storage.
+#
+# The whole block is optional; set fpcalc_path only if the binary isn't on PATH.
 # [acoustid]
 # fpcalc_path = "fpcalc"
+# api_key = "your-acoustid-key"   # only when there's no Hub to ask
 
 # EBU R128 loudness analysis (ReplayGain). A background pass measures each track's integrated
 # loudness + true peak with ffmpeg (reusing [transcode] ffmpeg_path) and stores a ReplayGain 2.0
