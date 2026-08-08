@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use chordia_contracts::acquisition::{CandidateInput, ClaimedJob, JobCandidates};
+use chordia_contracts::acquisition::{CandidateInput, ClaimedJob, ExpectedTrack, JobCandidates};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -107,6 +107,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
             &music_root,
             &hash,
             &[], // resumed downloads carry no expected tracklist; verification ran on the first pass
+            &[], // nor its lengths, for the same reason
             &[], // and no track filter — a resume imports whatever the first pass grabbed
         )
         .await
@@ -329,6 +330,7 @@ async fn run_inner(
             &music_root,
             &hash,
             &job.expected_titles,
+            &job.expected_tracks,
             &job.wanted_titles,
         )
         .await?
@@ -379,6 +381,7 @@ async fn monitor_to_completion(
     music_root: &Path,
     hash: &str,
     expected_titles: &[String],
+    expected_tracks: &[ExpectedTrack],
     // For a single-track download: the exact title(s) to import; the release must contain them and only
     // the matching file(s) are imported. Empty = import the whole download (album/discography).
     wanted_titles: &[String],
@@ -468,7 +471,9 @@ async fn monitor_to_completion(
             // be briefly invisible here. Wait for the import source to SETTLE before reading it, so
             // mount-propagation lag doesn't fail (and tear down) a perfectly good download.
             wait_for_source(client, hash, &content).await;
-            if let Some(reason) = verify_content(&content, expected_titles, wanted_titles) {
+            if let Some(reason) =
+                verify_content(&content, expected_titles, expected_tracks, wanted_titles)
+            {
                 // Mislabelled album, OR (track job) the release lacks the wanted track: drop it and let
                 // the caller try the next-best candidate. Only if none remain does the job fail — so
                 // downloading one bonus track never dumps a whole, possibly-wrong album into the library.
@@ -1207,15 +1212,41 @@ fn copy_into_place(src: &Path, dest_dir: &Path, dest: &Path) -> anyhow::Result<(
 fn verify_content(
     content_path: &str,
     expected_titles: &[String],
+    expected_tracks: &[ExpectedTrack],
     wanted_titles: &[String],
 ) -> Option<String> {
     // Track job: require every wanted title to be present as a file (reject a release lacking it, so a
     // single-track download can't import a whole wrong album). Import then keeps only those files.
     if !wanted_titles.is_empty() {
-        let stems = audio_file_stems(Path::new(content_path));
+        let files = audio_files(Path::new(content_path));
         for want in wanted_titles {
-            if !stems.iter().any(|s| title_matches(s, want)) {
+            let Some(matched) = files.iter().find(|f| {
+                f.file_stem()
+                    .is_some_and(|s| title_matches(&s.to_string_lossy(), want))
+            }) else {
                 return Some(format!("the wanted track “{want}” isn't in this release"));
+            };
+            // A filename is a claim, not evidence. A whole album uploaded as ONE file named after
+            // its title track satisfies every title check ever written — "All American Nightmare"
+            // arrived as a single 51:57 file and imported clean, because nothing compared it to the
+            // 3-and-a-bit minutes MusicBrainz says that recording runs.
+            if let Some(expected_ms) = expected_tracks
+                .iter()
+                .find(|t| title_matches(&t.title, want))
+                .and_then(|t| t.length_ms)
+            {
+                match crate::metadata::probe(matched) {
+                    Ok(p) => {
+                        if let Some(reason) = length_mismatch(p.duration_ms, expected_ms, want) {
+                            return Some(reason);
+                        }
+                    }
+                    // Unreadable audio is its own kind of wrong: importing a file we cannot even
+                    // decode is never right, and it is exactly what a fake or corrupt release is.
+                    Err(e) => {
+                        return Some(format!("“{want}” could not be read as audio ({e})"));
+                    }
+                }
             }
         }
         return None;
@@ -1275,6 +1306,52 @@ fn verify_manifest(
     })
 }
 
+/// Whether a downloaded file's length disqualifies it from being the track we asked for.
+///
+/// Deliberately loose: masters, pressings and fade-outs differ, and a job that rejects a good
+/// release because it runs four seconds long is worse than useless. So this only fires on a gross
+/// mismatch — off by more than a minute AND by more than half — which is the shape of an actual
+/// wrong file rather than a different edition. A 51:57 album rip standing in for a 3:41 track clears
+/// that bar by a factor of fourteen.
+fn length_mismatch(actual_ms: u32, expected_ms: u32, title: &str) -> Option<String> {
+    if expected_ms == 0 {
+        return None;
+    }
+    let diff = actual_ms.abs_diff(expected_ms);
+    let ratio_ok = actual_ms >= expected_ms / 2 && actual_ms <= expected_ms.saturating_mul(2);
+    if diff <= 60_000 || ratio_ok {
+        return None;
+    }
+    Some(format!(
+        "“{title}” runs {} but the recording is {} — this file is not that track",
+        human_mmss(actual_ms),
+        human_mmss(expected_ms),
+    ))
+}
+
+/// `m:ss`, for a message a user reads rather than parses.
+fn human_mmss(ms: u32) -> String {
+    let secs = ms / 1000;
+    format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// The audio files under `root`, recursively.
+fn audio_files(root: &Path) -> Vec<std::path::PathBuf> {
+    fn walk(p: &Path, out: &mut Vec<std::path::PathBuf>) {
+        if p.is_file() {
+            if is_audio(p) {
+                out.push(p.to_path_buf());
+            }
+        } else if let Ok(rd) = std::fs::read_dir(p) {
+            for entry in rd.flatten() {
+                walk(&entry.path(), out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(root, &mut out);
+    out
+}
 /// Count the audio files under `root` (recursively).
 fn count_audio_files(root: &Path) -> usize {
     fn walk(p: &Path, n: &mut usize) {
@@ -1974,6 +2051,48 @@ mod tests {
     }
 
     /// Every file's bytes in the import directory, sorted so no assertion depends on walk order.
+    /// The reported failure. "All American Nightmare" is both the album and its title track, so a
+    /// full-album rip uploaded as ONE file named after it satisfied every title check and imported
+    /// as a 51:57 "single track". Length is the only signal that separates the two.
+    #[test]
+    fn a_whole_album_masquerading_as_its_title_track_is_rejected() {
+        let reason = length_mismatch(
+            51 * 60_000 + 57_000,
+            3 * 60_000 + 41_000,
+            "All American Nightmare",
+        )
+        .expect("a 51:57 file is not a 3:41 track");
+        assert!(reason.contains("51:57"), "{reason}");
+        assert!(reason.contains("3:41"), "{reason}");
+    }
+
+    /// The check has to stay quiet for the ordinary reasons a file differs from MusicBrainz: a
+    /// different master, a longer fade, a few seconds of trailing silence. Rejecting a good release
+    /// over four seconds would be worse than the bug this fixes.
+    #[test]
+    fn ordinary_length_drift_is_not_a_mismatch() {
+        let expected = 3 * 60_000 + 41_000;
+        for actual in [
+            expected,
+            expected + 4_000,
+            expected - 4_000,
+            expected + 55_000,
+        ] {
+            assert_eq!(length_mismatch(actual, expected, "t"), None, "{actual}ms");
+        }
+        // An unknown expected length can't judge anything.
+        assert_eq!(length_mismatch(999_000, 0, "t"), None);
+    }
+
+    /// Both bars have to be cleared, so a genuinely long track is not rejected for being long: a
+    /// 9-minute recording delivered as 10 minutes is off by 60s+ but nowhere near double.
+    #[test]
+    fn a_long_track_is_judged_by_ratio_not_by_seconds() {
+        assert_eq!(length_mismatch(600_000, 540_000, "epic"), None);
+        // Half-length, though, is a truncated or wrong file.
+        assert!(length_mismatch(120_000, 540_000, "epic").is_some());
+    }
+
     fn imported_contents(dir: &Path) -> Vec<Vec<u8>> {
         let mut out: Vec<Vec<u8>> = fs::read_dir(dir)
             .unwrap()
