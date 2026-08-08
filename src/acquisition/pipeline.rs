@@ -108,6 +108,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
             &hash,
             &[], // resumed downloads carry no expected tracklist; verification ran on the first pass
             &[], // nor its lengths, for the same reason
+            None, // nor its release identity
             &[], // and no track filter — a resume imports whatever the first pass grabbed
         )
         .await
@@ -331,6 +332,7 @@ async fn run_inner(
             &hash,
             &job.expected_titles,
             &job.expected_tracks,
+            job.release_mbid.as_deref(),
             &job.wanted_titles,
         )
         .await?
@@ -382,6 +384,7 @@ async fn monitor_to_completion(
     hash: &str,
     expected_titles: &[String],
     expected_tracks: &[ExpectedTrack],
+    release_mbid: Option<&str>,
     // For a single-track download: the exact title(s) to import; the release must contain them and only
     // the matching file(s) are imported. Empty = import the whole download (album/discography).
     wanted_titles: &[String],
@@ -505,6 +508,10 @@ async fn monitor_to_completion(
                 &content,
                 keep_source,
                 wanted_titles,
+                ReleaseIdentity {
+                    tracks: expected_tracks,
+                    release_mbid,
+                },
             )
             .await?;
             // Push the new tracks to the Hub BEFORE reporting completed, so the catalog reflects them
@@ -754,6 +761,7 @@ async fn import(
     keep_source: bool,
     // When non-empty (a track job), import ONLY the files matching a wanted title; otherwise import all.
     wanted_titles: &[String],
+    known: ReleaseIdentity<'_>,
 ) -> anyhow::Result<()> {
     std::fs::create_dir_all(staging)?;
     let mut placed = 0usize;
@@ -766,7 +774,235 @@ async fn import(
         anyhow::bail!("no matching audio files found in the completed download");
     }
     scanner::initial_scan(db, local_lib_id, staging, false).await;
+    // The scan just read the uploader's tags. Replace what we actually know.
+    if let Err(e) = stamp_identity(db, local_lib_id, staging, known).await {
+        // Never fatal: the files are imported and playable, they are just less well identified than
+        // they could be. Failing the job here would be a worse outcome than a missing MBID.
+        tracing::warn!(error = %e, "stamping the known identity onto the import failed");
+    }
     Ok(())
+}
+
+/// Overwrite an import's scraped tags with the identity the job was queued from.
+///
+/// The Hub queued this download from a MusicBrainz release, so it already knew every track's
+/// canonical title, position, recording id and ISRC. The scanner then read the uploader's tags and
+/// took those as truth instead — which is how "Historic Cemetery" entered the catalog as "Historic
+/// Cemetary" and never resolved against MusicBrainz again, and how tracks arrived with no album,
+/// no track number and no identity at all.
+///
+/// Only fields we are confident about are written, and only over a confident match — see
+/// [`match_expected`]. A file we cannot place keeps its tags, because a wrong stamp is worse than an
+/// untidy one.
+async fn stamp_identity(
+    db: &SqlitePool,
+    local_lib_id: &str,
+    staging: &Path,
+    known: ReleaseIdentity<'_>,
+) -> anyhow::Result<()> {
+    let ReleaseIdentity {
+        tracks: expected,
+        release_mbid,
+    } = known;
+    if expected.is_empty() {
+        return Ok(());
+    }
+    let prefix = format!("{}%", staging.to_string_lossy());
+    let rows: Vec<ScannedRow> = sqlx::query_as(
+        "SELECT t.id, t.title, t.track_no, t.disc_no, t.duration_ms            FROM tracks t            JOIN file_paths fp ON fp.content_hash = t.content_hash           WHERE fp.library_id = ?1 AND fp.path LIKE ?2",
+    )
+    .bind(local_lib_id)
+    .bind(&prefix)
+    .fetch_all(db)
+    .await?;
+
+    let files: Vec<IndexedFile> = rows.into_iter().map(IndexedFile::from).collect();
+
+    let mut stamped = 0usize;
+    for (file, m) in files.iter().zip(match_all(&files, expected)) {
+        let Some(t) = m else { continue };
+        sqlx::query(
+            "UPDATE tracks SET title = ?2, title_norm = ?3,                     track_no = COALESCE(?4, track_no), disc_no = COALESCE(?5, disc_no),                     recording_mbid = COALESCE(?6, recording_mbid),                     isrc = COALESCE(?7, isrc)               WHERE id = ?1",
+        )
+        .bind(&file.id)
+        .bind(&t.title)
+        .bind(crate::metadata::normalize(&t.title))
+        .bind(t.position.map(i64::from))
+        .bind(t.disc_no.map(i64::from))
+        .bind(t.recording_mbid.as_deref())
+        .bind(t.isrc.as_deref())
+        .execute(db)
+        .await?;
+        stamped += 1;
+    }
+
+    // The release is what tells one same-titled album from another — the "Positions" album from the
+    // "positions" single — so it is recorded even though the local uniqueness rule cannot yet act on
+    // it. COALESCE: a release id already established is not second-guessed by a later import.
+    if let Some(mbid) = release_mbid.filter(|m| !m.is_empty()) {
+        sqlx::query(
+            "UPDATE albums SET release_mbid = COALESCE(release_mbid, ?2)               WHERE id IN (SELECT DISTINCT t.album_id FROM tracks t                              JOIN file_paths fp ON fp.content_hash = t.content_hash                             WHERE fp.library_id = ?1 AND fp.path LIKE ?3 AND t.album_id IS NOT NULL)",
+        )
+        .bind(local_lib_id)
+        .bind(mbid)
+        .bind(&prefix)
+        .execute(db)
+        .await?;
+    }
+    tracing::info!(
+        stamped,
+        of = files.len(),
+        "applied the known identity to the import"
+    );
+    Ok(())
+}
+
+/// Tolerance when a length is used to CONFIRM a match rather than to reject a download.
+const MATCH_LENGTH_TOLERANCE_MS: u32 = 15_000;
+
+/// Pair each indexed file with the expected track it is, or `None` where that cannot be established.
+///
+/// Runs in confidence order over the whole set rather than per file, because a decision only counts
+/// as confident if no other file could claim the same track: an exact title match that two files
+/// both satisfy is not evidence, it is a coin toss. Each expected track is consumed once.
+///
+///  1. **Exact title** — the normal case, and unambiguous when only one file carries that title.
+///  2. **Position, confirmed by length** — this is what rescues a misspelling. "Historic Cemetary"
+///     matches no title, but it is track 7 and runs the length track 7 runs. Position alone is not
+///     enough: uploaders renumber, and a wrong number would stamp a stranger's identity.
+///  3. **Length alone** — only when exactly one expected track is anywhere near, which on a real
+///     album is a genuinely distinguishing fact.
+///
+/// A file that survives all three unmatched keeps its own tags.
+fn match_all<'a>(
+    files: &[IndexedFile],
+    expected: &'a [ExpectedTrack],
+) -> Vec<Option<&'a ExpectedTrack>> {
+    let mut out: Vec<Option<&ExpectedTrack>> = vec![None; files.len()];
+    let mut taken = vec![false; expected.len()];
+
+    let claim =
+        |out: &mut Vec<Option<&'a ExpectedTrack>>, taken: &mut Vec<bool>, fi: usize, ei: usize| {
+            out[fi] = Some(&expected[ei]);
+            taken[ei] = true;
+        };
+
+    // Pass 1: exact title, unique on both sides.
+    for (fi, f) in files.iter().enumerate() {
+        if out[fi].is_some() {
+            continue;
+        }
+        let norm = crate::metadata::normalize(&f.title);
+        let hits: Vec<usize> = expected
+            .iter()
+            .enumerate()
+            .filter(|(ei, e)| !taken[*ei] && crate::metadata::normalize(&e.title) == norm)
+            .map(|(ei, _)| ei)
+            .collect();
+        let rivals = files
+            .iter()
+            .filter(|o| crate::metadata::normalize(&o.title) == norm)
+            .count();
+        if hits.len() == 1 && rivals == 1 {
+            claim(&mut out, &mut taken, fi, hits[0]);
+        }
+    }
+
+    // Pass 2: position, confirmed by length. The misspelling case.
+    for (fi, f) in files.iter().enumerate() {
+        if out[fi].is_some() {
+            continue;
+        }
+        let (Some(pos), Some(len)) = (f.track_no, Some(f.duration_ms)) else {
+            continue;
+        };
+        let hits: Vec<usize> = expected
+            .iter()
+            .enumerate()
+            .filter(|(ei, e)| {
+                !taken[*ei]
+                    && e.position == Some(pos)
+                    && f.disc_no.is_none_or(|d| e.disc_no.is_none_or(|ed| ed == d))
+                    && e.length_ms
+                        .is_some_and(|el| len.abs_diff(el) <= MATCH_LENGTH_TOLERANCE_MS)
+            })
+            .map(|(ei, _)| ei)
+            .collect();
+        if hits.len() == 1 {
+            claim(&mut out, &mut taken, fi, hits[0]);
+        }
+    }
+
+    // Pass 3: length alone, and only when nothing else is close — on EITHER side. One expected
+    // track near this file is not enough; if another unplaced file is equally near the same track,
+    // choosing between them would be a coin toss wearing a confidence rating.
+    let near = |f: &IndexedFile, e: &ExpectedTrack| {
+        e.length_ms
+            .is_some_and(|el| f.duration_ms.abs_diff(el) <= MATCH_LENGTH_TOLERANCE_MS)
+    };
+    for fi in 0..files.len() {
+        if out[fi].is_some() {
+            continue;
+        }
+        let hits: Vec<usize> = expected
+            .iter()
+            .enumerate()
+            .filter(|(ei, e)| !taken[*ei] && near(&files[fi], e))
+            .map(|(ei, _)| ei)
+            .collect();
+        if hits.len() != 1 {
+            continue;
+        }
+        let rivals = files
+            .iter()
+            .enumerate()
+            .filter(|(fj, f)| *fj != fi && out[*fj].is_none() && near(f, &expected[hits[0]]))
+            .count();
+        if rivals == 0 {
+            claim(&mut out, &mut taken, fi, hits[0]);
+        }
+    }
+    out
+}
+
+/// What a job already knows about the release it is importing, from the MusicBrainz data the
+/// download was queued against.
+#[derive(Clone, Copy)]
+struct ReleaseIdentity<'a> {
+    tracks: &'a [ExpectedTrack],
+    release_mbid: Option<&'a str>,
+}
+
+/// A row as the scanner left it, straight out of SQLite.
+#[derive(sqlx::FromRow)]
+struct ScannedRow {
+    id: String,
+    title: String,
+    track_no: Option<i64>,
+    disc_no: Option<i64>,
+    duration_ms: i64,
+}
+
+impl From<ScannedRow> for IndexedFile {
+    fn from(r: ScannedRow) -> Self {
+        Self {
+            id: r.id,
+            title: r.title,
+            track_no: r.track_no.map(|n| n as u16),
+            disc_no: r.disc_no.map(|n| n as u16),
+            duration_ms: r.duration_ms.max(0) as u32,
+        }
+    }
+}
+
+/// One freshly-indexed file, as the scanner read it.
+#[derive(Debug, Clone)]
+struct IndexedFile {
+    id: String,
+    title: String,
+    track_no: Option<u16>,
+    disc_no: Option<u16>,
+    duration_ms: u32,
 }
 
 /// Walk the finished download and place every audio file into the ONE import directory. `root` is
@@ -2091,6 +2327,94 @@ mod tests {
         assert_eq!(length_mismatch(600_000, 540_000, "epic"), None);
         // Half-length, though, is a truncated or wrong file.
         assert!(length_mismatch(120_000, 540_000, "epic").is_some());
+    }
+
+    fn ex(title: &str, pos: u16, len_ms: u32) -> ExpectedTrack {
+        ExpectedTrack {
+            title: title.into(),
+            length_ms: Some(len_ms),
+            recording_mbid: Some(format!("mbid-{pos}")),
+            isrc: Some(format!("ISRC{pos:08}")),
+            disc_no: Some(1),
+            position: Some(pos),
+        }
+    }
+
+    fn indexed(title: &str, pos: Option<u16>, len_ms: u32) -> IndexedFile {
+        IndexedFile {
+            id: format!("t-{title}"),
+            title: title.into(),
+            track_no: pos,
+            disc_no: Some(1),
+            duration_ms: len_ms,
+        }
+    }
+
+    /// The reported case. The uploader misspelled "Historic Cemetery", so no title matches — but the
+    /// file is track 7 and runs what track 7 runs, which is enough to place it and stamp the real
+    /// title, recording id and ISRC over the typo.
+    #[test]
+    fn a_misspelled_title_is_placed_by_position_and_length() {
+        let expected = [
+            ex("Historic Cemetery", 7, 259_000),
+            ex("Swimming Pool", 8, 213_000),
+        ];
+        let files = [indexed("Historic Cemetary", Some(7), 259_253)];
+        let got = match_all(&files, &expected);
+        assert_eq!(got[0].map(|t| t.title.as_str()), Some("Historic Cemetery"));
+        assert_eq!(got[0].and_then(|t| t.isrc.as_deref()), Some("ISRC00000007"));
+    }
+
+    /// Position alone must not be trusted — uploaders renumber, and a confident wrong stamp puts a
+    /// stranger's identity (and later, their lyrics) on the track.
+    #[test]
+    fn a_position_that_disagrees_with_the_length_is_refused() {
+        let expected = [ex("Historic Cemetery", 7, 259_000)];
+        // Numbered 7, but three minutes shorter than track 7 actually runs.
+        let files = [indexed("Something Else Entirely", Some(7), 80_000)];
+        assert!(match_all(&files, &expected)[0].is_none());
+    }
+
+    /// Exact titles are the ordinary path, and each expected track is consumed once so two files
+    /// cannot both claim it.
+    #[test]
+    fn exact_titles_match_and_are_not_double_claimed() {
+        let expected = [
+            ex("Swimming Pool", 1, 213_000),
+            ex("Legit Tattoo Gun", 2, 252_000),
+        ];
+        let files = [
+            indexed("Legit Tattoo Gun", None, 252_087),
+            indexed("Swimming Pool", None, 213_310),
+        ];
+        let got = match_all(&files, &expected);
+        assert_eq!(got[0].map(|t| t.title.as_str()), Some("Legit Tattoo Gun"));
+        assert_eq!(got[1].map(|t| t.title.as_str()), Some("Swimming Pool"));
+    }
+
+    /// Two files claiming the same title is a coin toss, not evidence — both stay unstamped and keep
+    /// their own tags rather than one of them being given the other's identity.
+    #[test]
+    fn an_ambiguous_title_is_left_alone() {
+        let expected = [ex("Intro", 1, 60_000)];
+        let files = [
+            indexed("Intro", None, 60_000),
+            indexed("Intro", None, 61_000),
+        ];
+        let got = match_all(&files, &expected);
+        assert!(
+            got.iter().all(Option::is_none),
+            "neither file should be stamped"
+        );
+    }
+
+    /// A file nothing accounts for keeps what it came with. Silence is the right answer when the
+    /// alternative is inventing one.
+    #[test]
+    fn an_unaccounted_file_is_never_stamped() {
+        let expected = [ex("Swimming Pool", 1, 213_000)];
+        let files = [indexed("Some Hidden Bonus Track", Some(99), 400_000)];
+        assert!(match_all(&files, &expected)[0].is_none());
     }
 
     fn imported_contents(dir: &Path) -> Vec<Vec<u8>> {
