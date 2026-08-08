@@ -421,3 +421,160 @@ fn codec_name(codec: symphonia::core::codecs::CodecType) -> String {
     }
     .to_string()
 }
+
+/// The canonical facts a download job already knew, written into the file itself.
+///
+/// `None` leaves the file's existing value alone — we only overwrite what we actually know.
+#[derive(Default)]
+pub struct CanonicalTags<'a> {
+    pub title: Option<&'a str>,
+    pub album: Option<&'a str>,
+    pub track_no: Option<u16>,
+    pub disc_no: Option<u16>,
+    pub isrc: Option<&'a str>,
+    pub recording_mbid: Option<&'a str>,
+    pub release_mbid: Option<&'a str>,
+}
+
+impl CanonicalTags<'_> {
+    fn is_empty(&self) -> bool {
+        self.title.is_none()
+            && self.album.is_none()
+            && self.track_no.is_none()
+            && self.disc_no.is_none()
+            && self.isrc.is_none()
+            && self.recording_mbid.is_none()
+            && self.release_mbid.is_none()
+    }
+}
+
+/// Write canonical metadata into a file's tags.
+///
+/// **Order matters to the caller, not to this function.** `content_hash` is a SHA-256 of the whole
+/// file, tags included, so retagging changes a track's identity. Do this BEFORE the file is
+/// indexed — tagging afterwards makes the next scan compute a different hash, insert a second track
+/// row and orphan the first.
+///
+/// Writes in place. lofty rewrites only the tag block, and the alternative — copy, tag, rename —
+/// costs a full duplicate of every imported file for a failure mode (interrupted mid-write) that
+/// leaves a re-downloadable file damaged rather than anything unrecoverable.
+pub fn write_canonical_tags(path: &Path, want: &CanonicalTags<'_>) -> anyhow::Result<()> {
+    if want.is_empty() {
+        return Ok(());
+    }
+    let mut tagged = Probe::open(path)?.read()?;
+    let kind = tagged.primary_tag_type();
+    if tagged.primary_tag().is_none() {
+        tagged.insert_tag(Tag::new(kind));
+    }
+    let tag = tagged
+        .primary_tag_mut()
+        .ok_or_else(|| anyhow::anyhow!("no writable tag for {}", path.display()))?;
+
+    let mut set = |key: ItemKey, value: Option<String>| {
+        if let Some(v) = value.filter(|v| !v.trim().is_empty()) {
+            tag.insert_text(key, v);
+        }
+    };
+    set(ItemKey::TrackTitle, want.title.map(str::to_string));
+    set(ItemKey::AlbumTitle, want.album.map(str::to_string));
+    set(ItemKey::TrackNumber, want.track_no.map(|n| n.to_string()));
+    set(ItemKey::DiscNumber, want.disc_no.map(|n| n.to_string()));
+    set(ItemKey::Isrc, want.isrc.map(str::to_string));
+    set(
+        ItemKey::MusicBrainzRecordingId,
+        want.recording_mbid.map(str::to_string),
+    );
+    set(
+        ItemKey::MusicBrainzReleaseId,
+        want.release_mbid.map(str::to_string),
+    );
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
+    tagged.save_to(&mut file, lofty::config::WriteOptions::default())?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod canonical_tag_tests {
+    use super::*;
+
+    /// A real (tiny, silent) FLAC, so lofty writes a genuine tag block rather than a stub and the
+    /// test exercises the same reader the scanner uses.
+    const TINY_FLAC: &[u8] = include_bytes!("testdata/tiny.flac");
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join("chordia-tagtest");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, TINY_FLAC).unwrap();
+        path
+    }
+
+    /// The round trip that makes this fix durable: canonical facts go into the FILE, and `probe` —
+    /// what the scanner calls — reads them back. Correcting only the database left the file still
+    /// saying "Back On Top 24", so a forced re-index read the wrong title straight back out.
+    #[test]
+    fn canonical_tags_survive_a_reprobe() {
+        let path = fixture("roundtrip.flac");
+        write_canonical_tags(
+            &path,
+            &CanonicalTags {
+                title: Some("Historic Cemetery"),
+                album: Some("Back on Top"),
+                track_no: Some(6),
+                disc_no: Some(1),
+                isrc: Some("USAT21703201"),
+                recording_mbid: Some("eeb02927-7e25-47d4-b142-287c38e0241c"),
+                release_mbid: Some("0c2ff228-c00c-4c17-bd57-4536a5201ac4"),
+            },
+        )
+        .expect("write tags");
+
+        let got = probe(&path).expect("probe after");
+        assert_eq!(got.title, "Historic Cemetery");
+        assert_eq!(got.album.as_deref(), Some("Back on Top"));
+        assert_eq!(got.track_no, Some(6));
+        assert_eq!(got.disc_no, Some(1));
+        assert_eq!(got.isrc.as_deref(), Some("USAT21703201"));
+        assert_eq!(
+            got.recording_mbid.as_deref(),
+            Some("eeb02927-7e25-47d4-b142-287c38e0241c")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Why the caller must retag BEFORE indexing. `content_hash` covers the whole file, tags
+    /// included, so writing tags moves a track's identity — do it after the scan and the next pass
+    /// computes a different hash, inserts a second row and orphans the first.
+    #[test]
+    fn retagging_moves_the_content_hash() {
+        let path = fixture("hash.flac");
+        let before = probe(&path).expect("probe before").content_hash;
+        write_canonical_tags(
+            &path,
+            &CanonicalTags {
+                album: Some("Back on Top"),
+                ..Default::default()
+            },
+        )
+        .expect("write tags");
+        let after = probe(&path).expect("probe after").content_hash;
+        assert_ne!(before, after, "tags are inside the content hash");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Knowing nothing must write nothing. An empty request that still rewrote the file would move
+    /// every import's content hash for no reason at all.
+    #[test]
+    fn an_empty_request_never_touches_the_file() {
+        let path = fixture("untouched.flac");
+        let before = probe(&path).expect("probe before").content_hash;
+        write_canonical_tags(&path, &CanonicalTags::default()).expect("no-op");
+        assert_eq!(probe(&path).expect("probe after").content_hash, before);
+        let _ = std::fs::remove_file(&path);
+    }
+}

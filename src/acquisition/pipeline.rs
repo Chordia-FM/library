@@ -777,14 +777,78 @@ async fn import(
     if placed == 0 {
         anyhow::bail!("no matching audio files found in the completed download");
     }
+    // BEFORE the scan, not after. `content_hash` is a SHA-256 of the whole file, tags included, so
+    // retagging changes a track's identity — doing it afterwards would make the next scan compute a
+    // different hash, insert a second row and orphan the first. Writing first means the scanner
+    // hashes the final bytes and reads the corrected metadata through its normal path.
+    retag_import(staging, known);
+
     scanner::initial_scan(db, local_lib_id, staging, false).await;
-    // The scan just read the uploader's tags. Replace what we actually know.
+    // Backstop for anything the tags could not carry, and for files we could not place.
     if let Err(e) = stamp_identity(db, local_lib_id, staging, known).await {
         // Never fatal: the files are imported and playable, they are just less well identified than
         // they could be. Failing the job here would be a worse outcome than a missing MBID.
         tracing::warn!(error = %e, "stamping the known identity onto the import failed");
     }
     Ok(())
+}
+
+/// Write the job's canonical metadata into the files it just imported.
+///
+/// This is what makes the fix durable. Correcting only the database left the file still saying
+/// "Back On Top 24", so the two disagreed and a forced re-index — which re-probes every file — read
+/// the wrong title straight back out of the tag and undid the correction. The tag is where the
+/// scanner looks, so the tag is what has to be right.
+///
+/// Best-effort per file: a file that cannot be tagged is still imported and playable, and failing a
+/// finished download over a tag would be the worse outcome. Failures are logged, not swallowed.
+fn retag_import(staging: &Path, known: ReleaseIdentity<'_>) {
+    if known.tracks.is_empty() && known.album_title.is_none() {
+        return;
+    }
+    let paths = audio_files(staging);
+    // Probe rather than read the database: the scan has not run yet, by design.
+    let probed: Vec<(std::path::PathBuf, IndexedFile)> = paths
+        .into_iter()
+        .filter_map(|path| {
+            let p = crate::metadata::probe(&path).ok()?;
+            let file = IndexedFile {
+                id: path.to_string_lossy().into_owned(),
+                title: p.title,
+                track_no: p.track_no.and_then(|n| u16::try_from(n).ok()),
+                disc_no: p.disc_no.and_then(|n| u16::try_from(n).ok()),
+                duration_ms: p.duration_ms,
+            };
+            Some((path, file))
+        })
+        .collect();
+
+    let files: Vec<IndexedFile> = probed.iter().map(|(_, f)| f.clone()).collect();
+    let matches = match_all(&files, known.tracks);
+    let mut written = 0usize;
+    for ((path, _), m) in probed.iter().zip(matches) {
+        // The album title applies to every imported file; the rest only to a confident match.
+        let want = crate::metadata::CanonicalTags {
+            title: m.map(|t| t.title.as_str()),
+            album: known.album_title,
+            track_no: m.and_then(|t| t.position),
+            disc_no: m.and_then(|t| t.disc_no),
+            isrc: m.and_then(|t| t.isrc.as_deref()),
+            recording_mbid: m.and_then(|t| t.recording_mbid.as_deref()),
+            release_mbid: known.release_mbid,
+        };
+        match crate::metadata::write_canonical_tags(path, &want) {
+            Ok(()) => written += 1,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not write canonical tags")
+            }
+        }
+    }
+    tracing::info!(
+        written,
+        of = probed.len(),
+        "wrote canonical tags onto the import"
+    );
 }
 
 /// Give the album its canonical title, merging into an existing row if that title is already taken.
