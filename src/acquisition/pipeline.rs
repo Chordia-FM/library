@@ -1487,6 +1487,12 @@ fn verify_content(
         }
         return None;
     }
+    // An album delivered as ONE long file is the same defect that produced a 51:57 "single track",
+    // and the count check below cannot see it whenever the cached tracklist is too small to judge.
+    // Total playing time can: a release is not this album if it runs nothing like this album.
+    if let Some(reason) = total_length_mismatch(Path::new(content_path), expected_tracks) {
+        return Some(reason);
+    }
     let expected = expected_titles.len();
     if expected < 5 {
         return None; // single / EP / uncached: nothing reliable to check against
@@ -1499,6 +1505,56 @@ fn verify_content(
     (got < floor).then(|| {
         format!(
             "downloaded only {got} tracks but the album has ~{expected}; likely the wrong release or an incomplete download"
+        )
+    })
+}
+
+/// Whether a whole download's playing time disqualifies it from being the release we asked for.
+///
+/// The per-track check only covers track jobs. An album job that receives the right NUMBER of files
+/// still passes today no matter what is inside them, and an album whose cached tracklist is too
+/// short to count against skips verification entirely. Total duration is the one signal that holds
+/// in every one of those cases.
+///
+/// Tolerance is generous — a third either way, and never less than two minutes — because editions
+/// legitimately differ: a standard release against a deluxe tracklist, a hidden track, a different
+/// mastering. It is aimed squarely at the gross case, which is the one that actually happens.
+fn total_length_mismatch(root: &Path, expected: &[ExpectedTrack]) -> Option<String> {
+    let want: u64 = expected
+        .iter()
+        .filter_map(|t| t.length_ms)
+        .map(u64::from)
+        .sum();
+    // Needs a tracklist with real durations to say anything at all.
+    if want == 0 || expected.iter().filter(|t| t.length_ms.is_some()).count() < 3 {
+        return None;
+    }
+    let files = audio_files(root);
+    if files.is_empty() {
+        return None; // the count checks own this case, and say it better
+    }
+    let got: u64 = files
+        .iter()
+        .filter_map(|f| crate::metadata::probe(f).ok())
+        .map(|p| u64::from(p.duration_ms))
+        .sum();
+    if got == 0 {
+        return Some("none of the downloaded files could be read as audio".to_string());
+    }
+    total_length_verdict(got, want)
+}
+
+/// The pure half of [`total_length_mismatch`], so the tolerance is testable without audio fixtures.
+///
+/// A third either way, and never tighter than two minutes, because editions legitimately differ —
+/// a standard release checked against a deluxe tracklist, a hidden track, a different mastering.
+fn total_length_verdict(got: u64, want: u64) -> Option<String> {
+    let slack = (want / 3).max(120_000);
+    (got.abs_diff(want) > slack).then(|| {
+        format!(
+            "the download runs {} but this release is {} — it is not this album",
+            human_mmss(got.min(u64::from(u32::MAX)) as u32),
+            human_mmss(want.min(u64::from(u32::MAX)) as u32),
         )
     })
 }
@@ -2415,6 +2471,32 @@ mod tests {
         let expected = [ex("Swimming Pool", 1, 213_000)];
         let files = [indexed("Some Hidden Bonus Track", Some(99), 400_000)];
         assert!(match_all(&files, &expected)[0].is_none());
+    }
+
+    /// An album job receiving the right number of files still says nothing about what is IN them,
+    /// and a short cached tracklist skips the count check entirely. Total playing time covers both.
+    #[test]
+    fn a_download_that_runs_nothing_like_the_album_is_rejected() {
+        let album = 45 * 60_000;
+        // A couple of tracks grabbed for a whole album — the gross undershoot.
+        assert!(total_length_verdict(8 * 60_000, album).is_some());
+        // A different album entirely, twice as long.
+        assert!(total_length_verdict(95 * 60_000, album).is_some());
+        // Note what this does NOT catch: 52 minutes against a 45-minute tracklist is 15% over, which
+        // is ordinary deluxe-vs-standard variance. Duration is a coarse net by design — the per-file
+        // checks are what catch a single file wearing a track's name.
+        assert_eq!(total_length_verdict(52 * 60_000, album), None);
+    }
+
+    /// Editions differ, and rejecting a good release for it would be worse than the bug. A standard
+    /// album checked against a deluxe tracklist must still import.
+    #[test]
+    fn edition_differences_are_within_tolerance() {
+        let deluxe = 60 * 60_000;
+        assert_eq!(total_length_verdict(45 * 60_000, deluxe), None);
+        assert_eq!(total_length_verdict(60 * 60_000, deluxe), None);
+        // And a short release is judged by the two-minute floor, not by a third of very little.
+        assert_eq!(total_length_verdict(5 * 60_000, 4 * 60_000), None);
     }
 
     fn imported_contents(dir: &Path) -> Vec<Vec<u8>> {
