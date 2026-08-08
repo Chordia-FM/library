@@ -109,6 +109,7 @@ pub async fn resume_job(state: &AppState, job_id: Uuid, hash: String, hub_librar
             &[], // resumed downloads carry no expected tracklist; verification ran on the first pass
             &[], // nor its lengths, for the same reason
             None, // nor its release identity
+            None, // nor the canonical album title
             &[], // and no track filter — a resume imports whatever the first pass grabbed
         )
         .await
@@ -333,6 +334,7 @@ async fn run_inner(
             &job.expected_titles,
             &job.expected_tracks,
             job.release_mbid.as_deref(),
+            job.album_title.as_deref(),
             &job.wanted_titles,
         )
         .await?
@@ -385,6 +387,7 @@ async fn monitor_to_completion(
     expected_titles: &[String],
     expected_tracks: &[ExpectedTrack],
     release_mbid: Option<&str>,
+    album_title: Option<&str>,
     // For a single-track download: the exact title(s) to import; the release must contain them and only
     // the matching file(s) are imported. Empty = import the whole download (album/discography).
     wanted_titles: &[String],
@@ -511,6 +514,7 @@ async fn monitor_to_completion(
                 ReleaseIdentity {
                     tracks: expected_tracks,
                     release_mbid,
+                    album_title,
                 },
             )
             .await?;
@@ -783,6 +787,74 @@ async fn import(
     Ok(())
 }
 
+/// Give the album its canonical title, merging into an existing row if that title is already taken.
+///
+/// The merge branch is not defensive padding: `albums` is UNIQUE on (title_normalized, artist_id),
+/// so renaming "Back On Top 24" to "Back On Top" fails outright when the library already holds a
+/// correctly-tagged copy. Moving the tracks across and dropping the emptied row is both what the
+/// constraint requires and what the user wants — one album, not two spellings of one.
+async fn rename_imported_album(
+    db: &SqlitePool,
+    local_lib_id: &str,
+    path_prefix: &str,
+    want: &str,
+) -> anyhow::Result<()> {
+    let norm = crate::metadata::normalize(want);
+    if norm.is_empty() {
+        return Ok(());
+    }
+    let albums: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT DISTINCT al.id, al.artist_id            FROM albums al            JOIN tracks t ON t.album_id = al.id            JOIN file_paths fp ON fp.content_hash = t.content_hash           WHERE fp.library_id = ?1 AND fp.path LIKE ?2 AND al.title_normalized IS NOT ?3",
+    )
+    .bind(local_lib_id)
+    .bind(path_prefix)
+    .bind(&norm)
+    .fetch_all(db)
+    .await?;
+
+    for (album_id, artist_id) in albums {
+        let existing: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM albums WHERE title_normalized = ?1 AND artist_id IS ?2 AND id <> ?3",
+        )
+        .bind(&norm)
+        .bind(&artist_id)
+        .bind(&album_id)
+        .fetch_optional(db)
+        .await?;
+
+        match existing {
+            Some(keep) => {
+                sqlx::query("UPDATE tracks SET album_id = ?1 WHERE album_id = ?2")
+                    .bind(&keep)
+                    .bind(&album_id)
+                    .execute(db)
+                    .await?;
+                sqlx::query("DELETE FROM albums WHERE id = ?1")
+                    .bind(&album_id)
+                    .execute(db)
+                    .await?;
+                tracing::info!(
+                    title = want,
+                    "merged an imported album into the existing one"
+                );
+            }
+            None => {
+                sqlx::query("UPDATE albums SET title = ?2, title_normalized = ?3 WHERE id = ?1")
+                    .bind(&album_id)
+                    .bind(want)
+                    .bind(&norm)
+                    .execute(db)
+                    .await?;
+                tracing::info!(
+                    title = want,
+                    "renamed an imported album to its canonical title"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Overwrite an import's scraped tags with the identity the job was queued from.
 ///
 /// The Hub queued this download from a MusicBrainz release, so it already knew every track's
@@ -803,6 +875,7 @@ async fn stamp_identity(
     let ReleaseIdentity {
         tracks: expected,
         release_mbid,
+        album_title,
     } = known;
     if expected.is_empty() {
         return Ok(());
@@ -834,6 +907,14 @@ async fn stamp_identity(
         .execute(db)
         .await?;
         stamped += 1;
+    }
+
+    // The album's own title, which the scanner took from the uploader's tags. "Back On Top"
+    // imported as "Back On Top 24" — a bit-depth marker from the release folder — and a title that
+    // matches nothing on MusicBrainz finds no cover art either, so the album sits nameless AND
+    // blank. The canonical title has been on the job all along.
+    if let Some(want) = album_title.map(str::trim).filter(|t| !t.is_empty()) {
+        rename_imported_album(db, local_lib_id, &prefix, want).await?;
     }
 
     // The release is what tells one same-titled album from another — the "Positions" album from the
@@ -971,6 +1052,8 @@ fn match_all<'a>(
 struct ReleaseIdentity<'a> {
     tracks: &'a [ExpectedTrack],
     release_mbid: Option<&'a str>,
+    /// The release's canonical title, which is not what the uploader called the folder.
+    album_title: Option<&'a str>,
 }
 
 /// A row as the scanner left it, straight out of SQLite.
