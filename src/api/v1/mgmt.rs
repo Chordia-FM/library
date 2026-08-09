@@ -546,6 +546,18 @@ struct ScanStatusResponse {
     total: u32,
     done: u32,
     force: bool,
+    /// When the last scan finished, epoch millis, or `None` if none has since this server started.
+    ///
+    /// The progress store is in memory, so this cannot distinguish "never scanned" from "not since
+    /// the last restart". The client says the latter, because claiming a library has never been
+    /// scanned on the strength of a process restart would be worse than saying nothing.
+    last_scan_at: Option<i64>,
+    /// The server-wide automatic rescan interval, in minutes; 0 means the sweep is off.
+    ///
+    /// Server-wide and deliberately not per library: it is a config-file value, and per-library
+    /// scheduling would need a column plus scheduler rework for no demonstrated need. Reported here
+    /// so a page showing "last scanned 2h ago" can also say when the next one is due.
+    interval_minutes: u64,
 }
 
 /// `GET /v1/mgmt/libraries/{id}/scan-status` reports the current scan progress (zeros if never run).
@@ -561,6 +573,8 @@ async fn scan_status(
         total: p.total,
         done: p.done,
         force: p.force,
+        last_scan_at: p.last_finished_ms,
+        interval_minutes: state.config.scan.interval_minutes,
     }))
 }
 

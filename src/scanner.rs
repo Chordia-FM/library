@@ -29,6 +29,13 @@ pub struct ScanProgress {
     pub done: u32,
     /// Whether this pass is a forced full re-index (re-processes unchanged files).
     pub force: bool,
+    /// When the last pass FINISHED, epoch millis, or `None` if none has finished yet.
+    ///
+    /// In memory with the rest of this struct, which bounds what it can answer: after a restart it
+    /// is `None` until the next scan completes. That is why the API returns an option and the UI
+    /// says "not since this server started" rather than "never" — claiming a library has never been
+    /// scanned because the process was restarted would be worse than saying nothing.
+    pub last_finished_ms: Option<i64>,
 }
 
 static SCAN_PROGRESS: LazyLock<Mutex<HashMap<String, ScanProgress>>> =
@@ -41,6 +48,8 @@ pub fn scan_progress(library_id: &str) -> Option<ScanProgress> {
 
 fn progress_begin(library_id: &str, total: u32, force: bool) {
     if let Ok(mut m) = SCAN_PROGRESS.lock() {
+        // Carried across the new pass: a scan STARTING does not un-finish the last one.
+        let last_finished_ms = m.get(library_id).and_then(|p| p.last_finished_ms);
         m.insert(
             library_id.to_string(),
             ScanProgress {
@@ -48,6 +57,7 @@ fn progress_begin(library_id: &str, total: u32, force: bool) {
                 total,
                 done: 0,
                 force,
+                last_finished_ms,
             },
         );
     }
@@ -66,6 +76,10 @@ fn progress_finish(library_id: &str) {
         if let Some(p) = m.get_mut(library_id) {
             p.running = false;
             p.done = p.total;
+            p.last_finished_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|d| d.as_millis() as i64);
         }
     }
 }
