@@ -196,6 +196,29 @@ pub async fn add_folder(
     Ok(id)
 }
 
+/// Forget a folder. The files on disk are never touched.
+///
+/// `library_tracks` cascades from `libraries`, so the membership rows go with it; the `tracks` rows
+/// themselves are left, because a track can belong to more than one folder and the scanner's prune
+/// pass already collects the ones nothing points at any more. Deleting them here would be a second,
+/// worse implementation of that — one that could take a track another folder still holds.
+pub async fn remove_folder(state: &AppState, id: &str) -> anyhow::Result<()> {
+    // SQLite enforces foreign keys per connection and only when asked, so the cascade above is not
+    // guaranteed to have fired on whichever connection this lands on. Explicit is cheaper than
+    // finding out later that removing a folder left its tracks listed.
+    sqlx::query("DELETE FROM library_tracks WHERE library_id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .context("removing the folder's tracks")?;
+    sqlx::query("DELETE FROM libraries WHERE id = ?")
+        .bind(id)
+        .execute(&state.db)
+        .await
+        .context("removing the folder")?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
