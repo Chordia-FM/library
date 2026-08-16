@@ -56,7 +56,7 @@ fn request() -> IdentifyRequest {
 
 async fn ask(reply: Response) -> anyhow::Result<IdentifyOutcome> {
     let base = fake_hub(reply).await;
-    HubClient::new(base, reqwest::Client::new())
+    HubClient::new(Some(base), reqwest::Client::new())
         .identify("test-server-key", &request())
         .await
 }
@@ -124,9 +124,12 @@ async fn a_provider_failure_is_an_error_not_a_no_match() {
     );
 
     // An unreachable Hub is the same class of answer.
-    let unreachable = HubClient::new("http://127.0.0.1:9".to_string(), reqwest::Client::new())
-        .identify("test-server-key", &request())
-        .await;
+    let unreachable = HubClient::new(
+        Some("http://127.0.0.1:9".to_string()),
+        reqwest::Client::new(),
+    )
+    .identify("test-server-key", &request())
+    .await;
     assert!(
         unreachable.is_err(),
         "an unreachable Hub must be an error, not 'no match'"

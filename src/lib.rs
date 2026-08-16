@@ -16,6 +16,7 @@ pub mod catalog_sync;
 pub mod config;
 pub mod dedupe;
 pub mod directory;
+pub mod embedded;
 pub mod error;
 pub mod fingerprint;
 pub mod http;

@@ -14,7 +14,7 @@ use tower_http::cors::{AllowHeaders, Any, CorsLayer};
 use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 
-use crate::auth::JwksCache;
+use crate::auth::{JwksCache, LocalSession};
 use crate::config::Config;
 use crate::pairing::PairingCredentials;
 use crate::transcode::Transcoder;
@@ -46,6 +46,9 @@ pub struct AppState {
     /// before collapsing copies, but *only* while one is actually coming. Without this flag, a Hub
     /// with no AcoustID key would leave dedupe waiting forever on an `acoustid` that never arrives.
     pub identify_available: Arc<std::sync::atomic::AtomicBool>,
+    /// The embedded local session, or `None` — which is every configuration except
+    /// [`crate::embedded`]. See [`LocalSession`] for what it authorises and why.
+    pub local_session: Option<Arc<LocalSession>>,
 }
 
 impl AppState {
@@ -95,6 +98,7 @@ impl AppState {
             tls_fingerprint,
             inflight_jobs: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
             identify_available: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            local_session: None,
         })
     }
 }

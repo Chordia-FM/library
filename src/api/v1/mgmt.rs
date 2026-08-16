@@ -63,6 +63,20 @@ async fn recover_management(
 }
 
 pub(crate) async fn require_mgmt_auth(headers: &HeaderMap, state: &AppState) -> AppResult<()> {
+    // An embedded library has never been paired, so it has no management token — the credential
+    // this normally checks is issued by the Hub's claim flow. Its local session stands in, and has
+    // to: adding a folder is the first thing the desktop app does, and there is no other way to
+    // authorise it. Presented as `Bearer` like everywhere else the session is used.
+    if let Some(session) = &state.local_session {
+        let bearer = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if bearer.is_some_and(|token| session.matches(token)) {
+            return Ok(());
+        }
+    }
+
     let provided = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())

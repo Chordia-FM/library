@@ -65,19 +65,34 @@ pub enum IdentifyOutcome {
 
 /// Minimal Hub client - no stored credentials.
 pub struct HubClient {
-    base_url: String,
+    /// Absent when this library runs with no Hub. See [`base`](HubClient::base) and
+    /// `Config::backend_url`.
+    base_url: Option<String>,
     http: reqwest::Client,
 }
 
 impl HubClient {
-    pub fn new(base_url: String, http: reqwest::Client) -> Self {
+    pub fn new(base_url: Option<String>, http: reqwest::Client) -> Self {
         Self { base_url, http }
+    }
+
+    /// The Hub's base URL, or an error naming why there is not one.
+    ///
+    /// Every call below goes through this rather than each caller checking, so a Hub call made in a
+    /// Hub-less configuration fails immediately with a sentence that says so — instead of composing
+    /// a request against an empty string and failing somewhere in reqwest with a URL parse error.
+    /// No caller should reach it: `run_embedded` starts none of the Hub-dependent subsystems, and
+    /// the rest already no-op until paired.
+    fn base(&self) -> anyhow::Result<&str> {
+        self.base_url
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("this library is configured with no Hub (backend_url)"))
     }
 
     /// Call `POST /v1/libraries/pair` forwarding the user's access token.
     /// Returns the Hub-assigned server credentials.
     pub async fn pair(&self, user_access_token: &str) -> anyhow::Result<HubPairResponse> {
-        let url = format!("{}/v1/libraries/pair", self.base_url);
+        let url = format!("{}/v1/libraries/pair", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -100,7 +115,7 @@ impl HubClient {
         endpoint: &str,
         tls_fingerprint: &str,
     ) -> anyhow::Result<u32> {
-        let url = format!("{}/v1/directory/heartbeat", self.base_url);
+        let url = format!("{}/v1/directory/heartbeat", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -125,7 +140,7 @@ impl HubClient {
         server_api_key: &str,
         batch: &ScrobbleBatch,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/v1/scrobbles:ingest", self.base_url);
+        let url = format!("{}/v1/scrobbles:ingest", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -147,7 +162,7 @@ impl HubClient {
         server_api_key: &str,
         req: &CatalogSyncRequest,
     ) -> anyhow::Result<CatalogSyncResponse> {
-        let url = format!("{}/v1/catalog/sync", self.base_url);
+        let url = format!("{}/v1/catalog/sync", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -182,7 +197,7 @@ impl HubClient {
         server_api_key: &str,
         req: &IdentifyRequest,
     ) -> anyhow::Result<IdentifyOutcome> {
-        let url = format!("{}/v1/catalog/identify", self.base_url);
+        let url = format!("{}/v1/catalog/identify", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -211,7 +226,7 @@ impl HubClient {
         server_api_key: &str,
         req: &CatalogPruneRequest,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/v1/catalog/prune", self.base_url);
+        let url = format!("{}/v1/catalog/prune", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -234,7 +249,7 @@ impl HubClient {
         server_id: Uuid,
         max: u32,
     ) -> anyhow::Result<Vec<ClaimedJob>> {
-        let url = format!("{}/v1/manager/jobs/claim", self.base_url);
+        let url = format!("{}/v1/manager/jobs/claim", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -255,7 +270,7 @@ impl HubClient {
         job_id: Uuid,
         update: &JobStatusUpdate,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/v1/manager/jobs/{job_id}/status", self.base_url);
+        let url = format!("{}/v1/manager/jobs/{job_id}/status", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -274,7 +289,7 @@ impl HubClient {
     /// files. A network/transport error propagates so the caller can treat it as "still active" and
     /// avoid tearing down a healthy download on a transient blip.
     pub async fn job_active(&self, server_api_key: &str, job_id: Uuid) -> anyhow::Result<bool> {
-        let url = format!("{}/v1/manager/jobs/{job_id}/active", self.base_url);
+        let url = format!("{}/v1/manager/jobs/{job_id}/active", self.base()?);
         let resp = self
             .http
             .get(&url)
@@ -297,7 +312,7 @@ impl HubClient {
         server_api_key: &str,
         proposals: &chordia_contracts::acquisition::UpgradeProposals,
     ) -> anyhow::Result<u32> {
-        let url = format!("{}/v1/manager/upgrades", self.base_url);
+        let url = format!("{}/v1/manager/upgrades", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -317,7 +332,7 @@ impl HubClient {
         job_id: Uuid,
         candidates: &JobCandidates,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/v1/manager/jobs/{job_id}/candidates", self.base_url);
+        let url = format!("{}/v1/manager/jobs/{job_id}/candidates", self.base()?);
         let resp = self
             .http
             .post(&url)
@@ -340,7 +355,7 @@ impl HubClient {
     ) -> anyhow::Result<()> {
         let url = format!(
             "{}/v1/manager/libraries/{library_id}/acquisition/report",
-            self.base_url
+            self.base()?
         );
         let resp = self
             .http
@@ -363,7 +378,7 @@ impl HubClient {
         mime: &str,
         bytes: Vec<u8>,
     ) -> anyhow::Result<()> {
-        let url = format!("{}/v1/catalog/covers/{hash}", self.base_url);
+        let url = format!("{}/v1/catalog/covers/{hash}", self.base()?);
         let resp = self
             .http
             .put(&url)

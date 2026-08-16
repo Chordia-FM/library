@@ -89,8 +89,16 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // Heartbeat or setup.
-    if state.credentials.read().await.is_some() {
+    // Heartbeat, setup, or neither.
+    if config.backend_url.is_none() {
+        // Standalone: no Hub to pair with, so there is nothing to print a setup link for. Everything
+        // this server does on its own — scanning, indexing, streaming over Range — still works, and
+        // a client on this machine or this network can use it directly. See `config::Config`.
+        tracing::info!(
+            "no backend_url configured: running standalone, with no Hub identity, no social \
+             features and no capability tokens"
+        );
+    } else if state.credentials.read().await.is_some() {
         let hub = Arc::new(pairing::HubClient::new(
             config.backend_url.clone(),
             state.http.clone(),

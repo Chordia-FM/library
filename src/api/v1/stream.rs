@@ -70,7 +70,12 @@ async fn stream(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    check_library_scope(&state.db, &track_id, &token.claims.library_id.to_string()).await?;
+    // An embedded library has no Hub, so it has no `hub_library_id` to scope against and no Hub
+    // that could have minted a token narrower than "this machine's own music". The check is not
+    // relaxed here — there is simply no statement to check. See `auth::LocalSession`.
+    if !token.local {
+        check_library_scope(&state.db, &track_id, &token.claims.library_id.to_string()).await?;
+    }
 
     let source = std::path::Path::new(&meta.path);
 

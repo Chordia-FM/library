@@ -15,8 +15,16 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default = "default_port")]
     pub bind_port: u16,
-    /// Base URL of the Central Hub.
-    pub backend_url: String,
+    /// Base URL of the Central Hub, or absent to run with no Hub at all.
+    ///
+    /// Absent is a supported configuration, not a broken one. A library with no Hub still scans,
+    /// indexes and streams its own music to a client on the same machine or network — it simply has
+    /// no identity service, no social graph and no capability tokens, so every Hub-dependent
+    /// subsystem (pairing, heartbeat, catalog sync, scrobble forwarding, acoustic identification,
+    /// acquisition) stays switched off. That is the whole of "the library stands alone", and it is
+    /// what the desktop app's embedded mode runs on.
+    #[serde(default)]
+    pub backend_url: Option<String>,
     #[serde(default = "default_data_dir")]
     pub data_dir: PathBuf,
     /// Frontend URL - where to redirect the browser after the /setup/{token} link is visited.
@@ -368,6 +376,45 @@ impl Config {
         let config: Config =
             toml::from_str(&raw).map_err(|e| anyhow::anyhow!("parsing config: {e}"))?;
         Ok(config)
+    }
+
+    /// The configuration an embedded library runs on: no Hub, and nothing that shells out.
+    ///
+    /// Lives here rather than in `embedded.rs` so it sits beside the fields it is setting, and so a
+    /// field added later is a compile error here rather than a silently inherited default.
+    ///
+    /// What is switched off, and why it costs nothing:
+    ///
+    /// - **Transcoding** needs `ffmpeg` on the PATH, which a desktop install cannot assume. It is
+    ///   also unnecessary: the client is on the same machine as the files, so `Original` — a plain
+    ///   Range read of the bytes on disk — is both the best tier and the cheapest.
+    /// - **Loudness analysis** shells out the same way, and ReplayGain is a nicety, not playback.
+    /// - **Acoustic identification** is a Hub call (the Hub holds the AcoustID key).
+    /// - **Acquisition** is a Hub-queued job pipeline and needs a Prowlarr and a qBittorrent.
+    ///
+    /// The periodic rescan stays on: it is the backstop for changes the filesystem watcher missed,
+    /// which is exactly what a laptop that spends most of its life asleep produces.
+    pub fn embedded(data_dir: PathBuf) -> Self {
+        Self {
+            // The listener is bound by `embedded::run`, on a port the OS picks, so this is unused.
+            bind_port: 0,
+            backend_url: None,
+            data_dir,
+            frontend_url: default_frontend_url(),
+            hub_endpoint: None,
+            log_format: default_log_format(),
+            // Nowhere to push a catalog to, so it stays here and the client browses it directly.
+            metadata_storage: MetadataStorage::Local,
+            transcode: TranscodeConfig::default(),
+            tls: TlsConfig::default(),
+            // `fpcalc` is only ever run by the identification worker, which `embedded::run` does
+            // not start; with no Hub and no api_key there is nothing for it to ask anyway.
+            acoustid: AcoustidConfig::default(),
+            loudness: LoudnessConfig { enabled: false },
+            scan: ScanConfig::default(),
+            max_stream_kbps: None,
+            acquisition: AcquisitionConfig::default(),
+        }
     }
 
     /// Resolved transcode cache directory: explicit config value, else `{data_dir}/transcode`.
