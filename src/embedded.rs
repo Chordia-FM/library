@@ -196,6 +196,133 @@ pub async fn add_folder(
     Ok(id)
 }
 
+/// Download a track from somewhere else into one of this library's folders.
+///
+/// The counterpart to browser downloads, and a different thing rather than a better one: a browser
+/// download is a blob in IndexedDB that only that browser profile can play, while this is a file on
+/// the disk, in the layout the library maintains, which the scanner indexes and any other program
+/// can open. It is what "own a copy" means when there is a filesystem.
+///
+/// **The bytes never enter the webview.** The caller hands over a URL — a stream URL with its
+/// capability token — and this fetches it here and streams it to disk. Passing a 50 MB FLAC through
+/// the IPC boundary as base64 would cost several times its size in memory, twice.
+///
+/// Written to a temporary name in the destination folder and renamed into place, so the watcher
+/// never sees a half-written file and index it as a truncated track. Same filesystem by
+/// construction, so the rename is atomic.
+pub async fn download_into(
+    state: &AppState,
+    library_id: &str,
+    url: &str,
+    meta: crate::organize::PlannedTrack,
+) -> anyhow::Result<PathBuf> {
+    let root: String = sqlx::query_scalar("SELECT path FROM libraries WHERE id = ?")
+        .bind(library_id)
+        .fetch_optional(&state.db)
+        .await?
+        .context("unknown folder")?;
+    let root = PathBuf::from(root);
+
+    let response = state
+        .http
+        .get(url)
+        .send()
+        .await
+        .context("requesting the track")?;
+    anyhow::ensure!(
+        response.status().is_success(),
+        "download failed: {}",
+        response.status()
+    );
+
+    // Named after what actually arrived, not what was asked for. The caller knows which quality tier
+    // it requested but not what the server chose to send - a transcoded tier is a different container
+    // from the source, and a spatial track is served as the original whatever was requested. Getting
+    // this wrong writes a file the scanner does not recognise as audio, which fails as a download
+    // that appeared to succeed.
+    let ext = extension_from(&response).context(
+        "the server did not say what kind of audio this is, so there is no name for the file",
+    )?;
+
+    // The template when the folder organises itself, and a flat drop when it does not. Falling back
+    // rather than refusing: someone who turned organising off wants their own layout, and the answer
+    // to that is to leave the file where the scanner will find it, not to decline the download.
+    let target =
+        match crate::organize::planned_path(&state.db, library_id, meta.clone(), &ext).await {
+            Some(path) => path,
+            None => root.join(fallback_name(&meta, &ext)),
+        };
+    if let Some(parent) = target.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    anyhow::ensure!(
+        !tokio::fs::try_exists(&target).await.unwrap_or(false),
+        "already downloaded: {}",
+        target.display()
+    );
+
+    let partial = target.with_extension(format!("{ext}.part"));
+    let bytes = response.bytes().await.context("reading the track")?;
+    tokio::fs::write(&partial, &bytes)
+        .await
+        .with_context(|| format!("writing {}", partial.display()))?;
+    tokio::fs::rename(&partial, &target)
+        .await
+        .with_context(|| format!("moving {} into place", partial.display()))?;
+    Ok(target)
+}
+
+/// The file extension for what the server sent, from its `Content-Type`.
+///
+/// A small explicit table rather than `mime_guess`'s reverse lookup, which returns whichever
+/// extension happens to come first for a type and will answer `audio/mpeg` with `mpga`. These are
+/// the containers this project streams, under the names it already uses on disk.
+fn extension_from(response: &reqwest::Response) -> Option<String> {
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .next()?
+        .trim()
+        .to_ascii_lowercase();
+    let ext = match content_type.as_str() {
+        "audio/flac" | "audio/x-flac" => "flac",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/mp4" | "audio/aac" | "audio/x-m4a" => "m4a",
+        "audio/ogg" | "application/ogg" => "ogg",
+        "audio/opus" => "opus",
+        "audio/wav" | "audio/x-wav" | "audio/wave" => "wav",
+        "audio/aiff" | "audio/x-aiff" => "aiff",
+        "audio/x-ms-wma" => "wma",
+        _ => return None,
+    };
+    Some(ext.to_string())
+}
+
+/// A safe name for a folder that does not organise itself: `Artist - Title.ext`, flat in the root.
+fn fallback_name(meta: &crate::organize::PlannedTrack, ext: &str) -> String {
+    let unsafe_chars = |c: char| r#"/\:*?"<>|"#.contains(c) || c.is_control();
+    let clean = |s: &str| s.replace(unsafe_chars, "_").trim().to_string();
+    let stem = match clean(&meta.artist).as_str() {
+        "" => clean(&meta.title),
+        artist => format!("{artist} - {}", clean(&meta.title)),
+    };
+    let stem = if stem.is_empty() {
+        "Unknown".to_string()
+    } else {
+        stem
+    };
+    if ext.is_empty() {
+        stem
+    } else {
+        format!("{stem}.{ext}")
+    }
+}
+
 /// Forget a folder. The files on disk are never touched.
 ///
 /// `library_tracks` cascades from `libraries`, so the membership rows go with it; the `tracks` rows

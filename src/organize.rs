@@ -568,6 +568,73 @@ async fn align_dir_casing(db: &SqlitePool, library_id: &str, root: &Path, desire
     }
 }
 
+/// What a track that is not here yet should be called, and where it should go.
+///
+/// Everything else in this module organises files the scanner has already indexed. A download has
+/// neither a row nor a file — the metadata comes from the Hub and the bytes are still arriving — so
+/// it needs the same template applied to metadata handed in rather than looked up.
+///
+/// Reusing this rather than composing a path in the downloader is the whole point. A folder someone
+/// downloads into is a folder the scanner then indexes and the organiser then maintains; a second
+/// implementation of the layout would put the first copy of every album in the wrong place and leave
+/// the organiser to move it, which looks exactly like the app misfiling things.
+///
+/// `None` when the library has organising switched off (the caller should fall back to a flat drop)
+/// or when the metadata is missing something the template requires — the same refusal
+/// `organize_file` makes, for the same reason: a path built from absent tags is a degraded path.
+pub async fn planned_path(
+    db: &SqlitePool,
+    library_id: &str,
+    meta: PlannedTrack,
+    ext: &str,
+) -> Option<PathBuf> {
+    let (root, settings) = library_settings(db, library_id).await?;
+    let meta = TrackMeta {
+        title: meta.title,
+        artist: meta.artist,
+        album_artist: meta.album_artist,
+        canonical_album_artist: None,
+        album: meta.album,
+        track_no: meta.track_no,
+        disc_no: meta.disc_no,
+        disc_count: meta.disc_count,
+        edition: meta.edition,
+        year: meta.year,
+        genre: meta.genre,
+    };
+    let kind = classify(&meta);
+    let template = settings.template_for(kind).to_string();
+    let ctx = RenderCtx {
+        // `{filename}` has no meaning for a file that has never had a name, so it resolves to the
+        // title — the closest true answer, and better than an empty segment.
+        filename: meta.title.clone(),
+        meta,
+    };
+    if !ctx.missing_required_vars(&template).is_empty() {
+        return None;
+    }
+    Some(build_target(&root, &template, &ctx, ext))
+}
+
+/// The metadata a caller can supply for a track that has not been indexed here.
+///
+/// A subset of what the scanner learns from a file: the fields a Hub catalog entry can answer, and
+/// no more. `canonical_album_artist` is deliberately absent — that is the Hub's own folding of
+/// artist aliases, and it arrives already applied in `album_artist`.
+#[derive(Debug, Clone, Default)]
+pub struct PlannedTrack {
+    pub title: String,
+    pub artist: String,
+    pub album_artist: Option<String>,
+    pub album: Option<String>,
+    pub track_no: Option<i64>,
+    pub disc_no: Option<i64>,
+    pub disc_count: Option<i64>,
+    pub edition: Option<String>,
+    pub year: Option<i64>,
+    pub genre: Option<String>,
+}
+
 /// `(root, settings)` if `library_id` has organise enabled with a non-empty album template.
 pub async fn library_settings(db: &SqlitePool, library_id: &str) -> Option<(PathBuf, OrgSettings)> {
     let (organize, album, single, unknown, dedupe, path): (
