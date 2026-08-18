@@ -32,4 +32,5 @@ pub mod scrobble;
 pub mod streaming;
 pub mod telemetry;
 pub mod tls;
+pub mod tracklist;
 pub mod transcode;
