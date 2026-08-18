@@ -25,6 +25,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
+      # rebuild spends its time on here — the compile is incremental, the link never is.
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -39,7 +43,14 @@ jobs:
         working-directory: library
 
   audit:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    # 2vCPU on purpose: this job is one script/download, never four cores' worth of work.
+    # Compile jobs stay at 4 — halving cores on parallel work doubles the time for the same
+    # bill, so it would buy latency and nothing else.
+    # x86, NOT arm. `cargo-deny-action` ships a prebuilt x86_64 binary inside its
+    # container, so on aarch64 it dies with `cannot execute binary file: Exec format
+    # error`. "Ships no artifact" is not sufficient to make a job architecture-agnostic —
+    # a third-party action can carry a binary of its own. 2vCPU still applies.
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v7
         with:
@@ -107,6 +118,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
+      # rebuild spends its time on here — the compile is incremental, the link never is.
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
