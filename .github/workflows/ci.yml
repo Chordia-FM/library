@@ -46,7 +46,9 @@ jobs:
     # 2vCPU on purpose: this job is one script/download, never four cores' worth of work.
     # Compile jobs stay at 4 — halving cores on parallel work doubles the time for the same
     # bill, so it would buy latency and nothing else.
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # ...and ARM, which is cheaper again. Safe HERE and nowhere else: this job ships no
+    # artifact, so the architecture it ran on cannot reach production or a user's machine.
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
       - uses: actions/checkout@v7
         with:
