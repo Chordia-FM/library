@@ -137,7 +137,11 @@ pub fn probe(path: &Path) -> anyhow::Result<ProbedTrack> {
     let recording_mbid = str_tag(&ItemKey::MusicBrainzRecordingId);
     let release_mbid = str_tag(&ItemKey::MusicBrainzReleaseId);
     let mb_artist_id = str_tag(&ItemKey::MusicBrainzArtistId);
-    let cover = tag.and_then(extract_cover);
+    // Embedded art first, then the folder's own image. Files that arrive from a downloader routinely
+    // carry no embedded picture and a `cover.jpg` beside them instead — without this the track looks
+    // artless, and the Hub goes off to fetch from fanart.tv something that was already sitting on
+    // disk, usually at lower resolution than the file on disk.
+    let cover = tag.and_then(extract_cover).or_else(|| sidecar_cover(path));
 
     // Codec probe (symphonia).
     let file = std::fs::File::open(path)?;
@@ -227,6 +231,70 @@ pub fn probe(path: &Path) -> anyhow::Result<ProbedTrack> {
         duration_ms,
         content_hash,
     })
+}
+
+/// Names a folder image goes by, in the order they win.
+///
+/// `cover` before `folder` before `front` because that is the order of intent: `cover` is what
+/// taggers and downloaders write deliberately, `folder` is what Windows Media Player leaves behind,
+/// and the rest are ripper fallbacks. Compared lowercased, so `Cover.JPG` matches.
+const SIDECAR_NAMES: [&str; 4] = ["cover", "folder", "front", "album"];
+const SIDECAR_EXTS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+
+/// The album folder's own cover image, for tracks that carry none of their own.
+///
+/// Read per track rather than cached per directory: a scan is I/O-bound on the audio files anyway,
+/// the OS page cache makes the repeat reads nearly free, and a per-directory cache would need
+/// invalidating by the watcher on every art change. Hashed exactly like embedded art, so dedup
+/// treats the two identically and an album whose tracks share one folder image stores it once.
+fn sidecar_cover(path: &Path) -> Option<CoverArt> {
+    let dir = path.parent()?;
+    let mut best: Option<(usize, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let candidate = entry.path();
+        let (Some(stem), Some(ext)) = (
+            candidate.file_stem().and_then(|s| s.to_str()),
+            candidate.extension().and_then(|e| e.to_str()),
+        ) else {
+            continue;
+        };
+        if !SIDECAR_EXTS.contains(&ext.to_ascii_lowercase().as_str()) {
+            continue;
+        }
+        // Rank is the position in SIDECAR_NAMES, so a folder holding both `cover.jpg` and
+        // `folder.jpg` resolves the same way on every scan rather than by readdir order.
+        let stem = stem.to_ascii_lowercase();
+        if let Some(rank) = SIDECAR_NAMES.iter().position(|n| *n == stem) {
+            if best.as_ref().is_none_or(|(r, _)| rank < *r) {
+                best = Some((rank, candidate));
+            }
+        }
+    }
+
+    let data = std::fs::read(best?.1).ok()?;
+    // Sniffed from the bytes, not the extension: a .jpg that is really a PNG is common, and the
+    // stored MIME is what a browser is told when it renders the art. No match means no art rather
+    // than art that will not display.
+    let mime = infer_image_mime(&data)?.to_string();
+    let hash = hex::encode(Sha256::digest(&data));
+    Some(CoverArt { data, mime, hash })
+}
+
+fn infer_image_mime(data: &[u8]) -> Option<&'static str> {
+    const JPEG: [u8; 3] = [0xFF, 0xD8, 0xFF];
+    const PNG: [u8; 4] = [0x89, 0x50, 0x4E, 0x47];
+    const RIFF: [u8; 4] = [0x52, 0x49, 0x46, 0x46];
+    const WEBP: [u8; 4] = [0x57, 0x45, 0x42, 0x50];
+    if data.starts_with(&JPEG) {
+        return Some("image/jpeg");
+    }
+    if data.starts_with(&PNG) {
+        return Some("image/png");
+    }
+    if data.starts_with(&RIFF) && data.len() >= 12 && data[8..12] == WEBP {
+        return Some("image/webp");
+    }
+    None
 }
 
 /// Pick the front cover (or first available picture) from a tag and hash it for dedup.
@@ -576,5 +644,90 @@ mod canonical_tag_tests {
         write_canonical_tags(&path, &CanonicalTags::default()).expect("no-op");
         assert_eq!(probe(&path).expect("probe after").content_hash, before);
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::{infer_image_mime, sidecar_cover};
+    use std::fs;
+
+    /// Smallest bytes that identify each format. Only the magic matters here — nothing decodes these.
+    const JPEG: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0, 0x00];
+    const PNG: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    fn dir_with(files: &[(&str, &[u8])]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (name, bytes) in files {
+            fs::write(dir.path().join(name), bytes).expect("write");
+        }
+        dir
+    }
+
+    #[test]
+    fn finds_the_folder_image_beside_the_track() {
+        let dir = dir_with(&[("cover.jpg", JPEG)]);
+        let cover = sidecar_cover(&dir.path().join("01 - Track.flac")).expect("cover");
+        assert_eq!(cover.mime, "image/jpeg");
+        assert!(!cover.hash.is_empty());
+    }
+
+    /// The whole point of the feature: a downloader's output has no embedded art, so an album with
+    /// nothing beside it must still come back empty rather than pretending.
+    #[test]
+    fn no_image_means_no_cover() {
+        let dir = dir_with(&[("notes.txt", b"nothing here")]);
+        assert!(sidecar_cover(&dir.path().join("01 - Track.flac")).is_none());
+    }
+
+    /// Deterministic across scans. readdir order is not stable, so without the ranking a folder
+    /// holding both files could switch cover between runs and re-sync art to the Hub every time.
+    #[test]
+    fn cover_wins_over_folder() {
+        let dir = dir_with(&[("folder.png", PNG), ("cover.jpg", JPEG)]);
+        let picked = sidecar_cover(&dir.path().join("t.flac")).expect("cover");
+        assert_eq!(picked.mime, "image/jpeg", "cover.jpg outranks folder.png");
+    }
+
+    #[test]
+    fn case_and_extension_do_not_matter() {
+        let dir = dir_with(&[("Folder.PNG", PNG)]);
+        assert_eq!(
+            sidecar_cover(&dir.path().join("t.flac"))
+                .expect("cover")
+                .mime,
+            "image/png"
+        );
+    }
+
+    /// Sniffed from the bytes, never the extension. Mislabelled art is common, and the stored MIME
+    /// is what a browser is told when it renders it.
+    #[test]
+    fn a_png_named_jpg_is_still_a_png() {
+        let dir = dir_with(&[("cover.jpg", PNG)]);
+        assert_eq!(
+            sidecar_cover(&dir.path().join("t.flac"))
+                .expect("cover")
+                .mime,
+            "image/png"
+        );
+    }
+
+    /// Better no art than art that will not display.
+    #[test]
+    fn a_text_file_named_cover_is_not_art() {
+        let dir = dir_with(&[("cover.jpg", b"this is not an image")]);
+        assert!(sidecar_cover(&dir.path().join("t.flac")).is_none());
+        assert!(infer_image_mime(b"this is not an image").is_none());
+    }
+
+    /// Same bytes, same hash — so an album whose tracks all share one folder image stores it once,
+    /// exactly as embedded art already dedupes.
+    #[test]
+    fn every_track_in_the_folder_hashes_to_one_cover() {
+        let dir = dir_with(&[("cover.jpg", JPEG)]);
+        let a = sidecar_cover(&dir.path().join("01.flac")).expect("a");
+        let b = sidecar_cover(&dir.path().join("02.flac")).expect("b");
+        assert_eq!(a.hash, b.hash);
     }
 }
