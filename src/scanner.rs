@@ -308,6 +308,12 @@ pub async fn index_file(db: &SqlitePool, library_id: &str, path: &Path) -> anyho
         }
     }
 
+    // Credits from the album's `Tracklist.txt`, if it has one. Best-effort: a malformed or
+    // mismatched sidecar must never fail the indexing of a track that is otherwise perfectly good.
+    if let Err(e) = crate::credits::apply_for_dir(db, library_id, path).await {
+        warn!(path = ?path, error = %e, "credits: failed to apply tracklist");
+    }
+
     Ok(track_id)
 }
 

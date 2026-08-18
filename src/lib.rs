@@ -14,6 +14,7 @@ pub mod auth;
 pub mod catalog;
 pub mod catalog_sync;
 pub mod config;
+pub mod credits;
 pub mod dedupe;
 pub mod directory;
 pub mod embedded;
