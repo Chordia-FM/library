@@ -1,0 +1,11 @@
+# Link with lld on Linux.
+#
+# Rust's default is the system `ld`, and on a crate graph this size linking is most of what a
+# rebuild spends its time on — the compile is incremental, the link never is. lld does the same job
+# several times faster and produces an equivalent binary; nothing about the output changes.
+#
+# Scoped to the Linux target ON PURPOSE. It is the CI runners and any Linux dev machine that
+# benefit; a Windows or macOS checkout keeps its default toolchain and needs nothing installed. CI
+# installs `lld` alongside the other build dependencies.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

@@ -25,6 +25,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
+      # rebuild spends its time on here — the compile is incremental, the link never is.
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -110,6 +114,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
+      # rebuild spends its time on here — the compile is incremental, the link never is.
+      - name: Install lld
+        run: sudo apt-get update && sudo apt-get install -y lld
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
