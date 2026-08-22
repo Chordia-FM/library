@@ -1,6 +1,5 @@
 //! Version 1 of the library HTTP API.
 
-mod acquisition;
 mod catalog;
 mod health;
 mod matcher;
@@ -16,7 +15,6 @@ use crate::http::AppState;
 
 pub fn router() -> Router<AppState> {
     Router::new()
-        .merge(acquisition::router())
         .merge(catalog::router())
         .merge(stream::router())
         .merge(matcher::router())

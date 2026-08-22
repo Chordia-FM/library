@@ -8,7 +8,6 @@
 
 #![allow(dead_code)]
 
-pub mod acquisition;
 pub mod api;
 pub mod auth;
 pub mod catalog;

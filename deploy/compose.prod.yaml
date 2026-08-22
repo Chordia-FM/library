@@ -38,53 +38,13 @@ services:
       # default; append ":ro" and set dedupe_reuploads = false in the toml to keep files untouched).
       - ${MUSIC_DIR:?set MUSIC_DIR in .env}:/data/music
       - ./chordia-library.toml:/data/chordia-library.toml:ro
-    # Mount the shared download staging volume so the library can import finished torrents (see the
-    # acquisition sidecars below). Harmless when acquisition is disabled.
-    # volumes (merged with the list above):
-    #   - acquisition-staging:/downloads
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "5"
 
-  # ── Optional torrent-based acquisition sidecars (Lidarr-style) ────────────────────────────────
-  # Uncomment these (and the staging volume mount on `library` above + the `acquisition-staging`
-  # volume below) to enable downloads. Configure the [acquisition] block in chordia-library.toml to
-  # point at these, then add your indexers in Prowlarr. Chordia ships NO indexers/trackers; you are
-  # responsible for the legality of what you acquire. Both are internal-only (no host ports needed
-  # beyond the WebUIs you choose to expose for setup).
-  #
-  # prowlarr:
-  #   image: lscr.io/linuxserver/prowlarr:latest
-  #   restart: unless-stopped
-  #   environment:
-  #     PUID: "${PUID:-1000}"
-  #     PGID: "${PGID:-1000}"
-  #   ports:
-  #     - "${LIBRARY_BIND_ADDR:-127.0.0.1}:${PROWLARR_PORT:-9696}:9696"   # configure indexers + copy the API key
-  #   volumes:
-  #     - prowlarr-config:/config
-  #
-  # qbittorrent:
-  #   image: lscr.io/linuxserver/qbittorrent:latest
-  #   restart: unless-stopped
-  #   environment:
-  #     PUID: "${PUID:-1000}"
-  #     PGID: "${PGID:-1000}"
-  #     WEBUI_PORT: "8080"
-  #   ports:
-  #     - "${LIBRARY_BIND_ADDR:-127.0.0.1}:${QBIT_PORT:-8080}:8080"   # WebUI, to set the password the toml uses
-  #   volumes:
-  #     - qbittorrent-config:/config
-  #     # Same staging path the library imports from; finished files are moved out into the music root.
-  #     - acquisition-staging:/downloads
-
 volumes:
   # Holds the SQLite index, transcode cache, and the pairing credentials. MUST persist across
   # restarts or you'll have to re-pair with the Hub.
   library-data:
-  # Shared download staging between qBittorrent and the library (uncomment with the sidecars).
-  # acquisition-staging:
-  # prowlarr-config:
-  # qbittorrent-config:
