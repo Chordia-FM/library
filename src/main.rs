@@ -10,8 +10,8 @@
 //!  6. Bind and serve.
 
 use chordia_library::{
-    acquisition, catalog_sync, config, dedupe, directory, fingerprint, http, loudness, pairing,
-    scanner, scrobble, telemetry, tls,
+    catalog_sync, config, dedupe, directory, fingerprint, http, loudness, pairing, scanner,
+    scrobble, telemetry, tls,
 };
 
 use std::net::SocketAddr;
@@ -188,14 +188,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Re-upload dedupe (keep highest-quality copy; on unless [scan] dedupe_reuploads = false).
     dedupe::start_dedupe(state.clone());
-
-    // Torrent-based acquisition: pull download jobs from the Hub + report health (no-op unless
-    // [acquisition] enabled with Prowlarr + qBittorrent configured).
-    acquisition::start_job_loop(state.clone());
-    acquisition::start_report_loop(state.clone());
-    acquisition::start_resume(state.clone());
-    // Weekly worst-first quality-upgrade sweep (rotates via upgrade_attempts stamps).
-    acquisition::upgrade::start_upgrade_scan(state.clone());
 
     // Bind and serve.
     let app = http::router(state);

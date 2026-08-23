@@ -16,7 +16,7 @@
 //! ## What is different from a normal server
 //!
 //! - **No Hub**, so no pairing, no heartbeat, no catalog sync, no scrobble forwarding, no acoustic
-//!   identification, no acquisition. None of those workers are started.
+//!   identification. None of those workers are started.
 //! - **No capability tokens.** Authorisation is [`LocalSession`] — see there for why that is the
 //!   honest answer rather than a weaker one.
 //! - **Loopback only.** The listener binds `127.0.0.1`, so the server is unreachable from the
@@ -357,7 +357,6 @@ mod tests {
         let config = Config::embedded(PathBuf::from("./data"));
         assert!(config.backend_url.is_none());
         assert!(!config.loudness.enabled);
-        assert!(!config.acquisition.enabled);
         // Local, because there is nowhere to push a catalog to.
         assert_eq!(
             config.metadata_storage,
