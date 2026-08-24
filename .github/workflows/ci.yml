@@ -35,6 +35,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: library
+          # Deliberately no `cache-on-failure`: `cargo fmt --check` runs first and compiles nothing,
+          # so a formatting failure would save an empty entry -- and on a full key match rust-cache
+          # skips the save, so nothing could ever replace it.
       - run: cargo fmt --check
         working-directory: library
       - run: cargo clippy --all-targets -- -D warnings
@@ -120,18 +123,20 @@ jobs:
           path: contracts
       # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
       # rebuild spends its time on here — the compile is incremental, the link never is.
-      - name: Install lld
-        run: sudo apt-get update && sudo apt-get install -y lld
+      # musl-tools rides along in the same step: it supplies musl-gcc for the bundled libsqlite3 in
+      # the static build below, and the `apt-get update` index refresh — most of the cost of an apt
+      # step — was being paid twice for two small packages.
+      - name: Install lld + musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y lld musl-tools
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: library
+          # No `cache-on-failure` here either, for the reason given on the test job above.
       # Static musl build so the "curl and run" install in SELF_HOSTING.md works on any glibc
-      # version and on musl distros (Alpine). musl-tools supplies musl-gcc for bundled libsqlite3.
-      - name: Install musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # version and on musl distros (Alpine); musl-gcc came from musl-tools, installed above.
       - name: Build static release binary
         run: cargo build --release --target x86_64-unknown-linux-musl
         working-directory: library
