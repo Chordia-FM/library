@@ -24,6 +24,10 @@ pub fn router() -> Router<AppState> {
         )
         .route("/mgmt/libraries/{id}/tree", get(library_tree))
         .route(
+            "/mgmt/libraries/{id}/share-dirs/{user_id}",
+            get(get_share_excluded_dirs).put(set_share_excluded_dirs),
+        )
+        .route(
             "/mgmt/libraries/{id}/dirs",
             axum::routing::put(set_excluded_dirs),
         )
@@ -411,6 +415,94 @@ async fn set_excluded_dirs(
     tokio::spawn(async move {
         scanner::initial_scan(&db, &lib, &root_pb, false).await;
     });
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// Per-grantee folder exclusions.
+
+#[derive(Deserialize)]
+struct SetShareDirsRequest {
+    /// Absolute directory paths (under the library root) withheld from this one person.
+    excluded: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ShareDirsResponse {
+    excluded: Vec<String>,
+}
+
+/// `GET /v1/mgmt/libraries/{id}/share-dirs/{user_id}` — folders withheld from one grantee.
+async fn get_share_excluded_dirs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, user_id)): Path<(String, String)>,
+) -> AppResult<Json<ShareDirsResponse>> {
+    require_mgmt_auth(&headers, &state).await?;
+    let excluded: Vec<String> = sqlx::query_scalar(
+        "SELECT path FROM library_share_excluded_dirs \
+         WHERE library_id = ? AND grantee_user_id = ? ORDER BY path",
+    )
+    .bind(&id)
+    .bind(&user_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(ShareDirsResponse { excluded }))
+}
+
+/// `PUT /v1/mgmt/libraries/{id}/share-dirs/{user_id}` replaces them.
+///
+/// Nothing is re-scanned and nothing is removed from the index, which is the whole difference from
+/// `set_excluded_dirs` above: those files stay in the library and stay playable by the owner and by
+/// everyone else. This decides only what ONE person's capability token may reach, and it is enforced
+/// at stream time in `api/v1/stream.rs`.
+async fn set_share_excluded_dirs(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, user_id)): Path<(String, String)>,
+    Json(body): Json<SetShareDirsRequest>,
+) -> AppResult<StatusCode> {
+    require_mgmt_auth(&headers, &state).await?;
+
+    let root: String = sqlx::query_scalar("SELECT path FROM libraries WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    // Same containment check as the library's own exclusions. A path outside the root cannot
+    // withhold anything and would be a way to store arbitrary strings against a library row.
+    let root_set = [root];
+    for p in &body.excluded {
+        if !scanner::is_excluded(std::path::Path::new(p), &root_set) {
+            return Err(AppError::BadRequest(format!(
+                "path outside library root: {p}"
+            )));
+        }
+    }
+
+    let mut tx = state.db.begin().await?;
+    sqlx::query(
+        "DELETE FROM library_share_excluded_dirs WHERE library_id = ? AND grantee_user_id = ?",
+    )
+    .bind(&id)
+    .bind(&user_id)
+    .execute(&mut *tx)
+    .await?;
+    for p in &body.excluded {
+        sqlx::query(
+            "INSERT OR IGNORE INTO library_share_excluded_dirs \
+               (library_id, grantee_user_id, path) VALUES (?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&user_id)
+        .bind(p)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // One transaction, because the delete-then-insert window is a window in which the grantee can
+    // reach EVERYTHING. A stream request landing between the two would find no exclusions at all.
+    tx.commit().await?;
 
     Ok(StatusCode::NO_CONTENT)
 }
