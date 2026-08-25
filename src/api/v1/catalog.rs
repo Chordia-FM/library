@@ -18,6 +18,7 @@ use axum::routing::get;
 use axum::{Json, Router};
 use chordia_contracts::auth::CapabilityAction;
 use chordia_contracts::catalog::Track;
+use chordia_contracts::credits::{Credit, CreditGroup, CreditSource, TrackCredits};
 use serde::Deserialize;
 
 use crate::auth::{require_action, CapToken};
@@ -41,6 +42,7 @@ pub fn router() -> Router<AppState> {
         .route("/libraries", get(list_libraries))
         .route("/libraries/{library_id}/tracks", get(list_tracks))
         .route("/tracks/{track_id}", get(get_track))
+        .route("/tracks/{track_id}/credits", get(track_credits))
 }
 
 /// Assert the token was minted for the library that owns this local row.
@@ -125,4 +127,59 @@ async fn get_track(
         .await?
         .ok_or(AppError::NotFound)?;
     Ok(Json(track))
+}
+
+/// `GET /v1/tracks/{track_id}/credits` - who made this recording, as this library knows it.
+///
+/// The Hub is the credits authority when there is one: it merges MusicBrainz relationships with the
+/// sidecar this library pushed, and resolves names to catalog artists. This endpoint is the answer
+/// when there is no Hub, which is a supported deployment rather than a degraded one - a library and
+/// a client with nothing in between must still be a working music player.
+///
+/// Every credit here is `LibrarySidecar` because that is the only source a library has. It does no
+/// MusicBrainz lookups of its own: that is metadata enrichment, which is the Hub's job, and doing it
+/// in both places would mean two throttles against one rate limit.
+async fn track_credits(
+    State(state): State<AppState>,
+    token: CapToken,
+    Path(track_id): Path<String>,
+) -> AppResult<Json<TrackCredits>> {
+    let claims = require_action(&token, CapabilityAction::StreamRead)?;
+    scope_track(&state.db, &track_id, &claims.library_id.to_string()).await?;
+
+    let rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT name, role, is_org FROM track_credits WHERE track_id = ? ORDER BY ord",
+    )
+    .bind(&track_id)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(e.into()))?;
+
+    // Grouped by role, preserving first-appearance order of both the roles and the names inside
+    // them. That order is the source file's, which puts the main artist first and publishers last -
+    // information the parser deliberately kept and alphabetising would throw away.
+    let mut groups: Vec<CreditGroup> = Vec::new();
+    for (name, role, is_org) in rows {
+        let credit = Credit {
+            name,
+            role: role.clone(),
+            artist_id: None,
+            is_org: is_org != 0,
+            source: CreditSource::LibrarySidecar,
+        };
+        match groups.iter_mut().find(|g| g.role == role) {
+            Some(g) => g.credits.push(credit),
+            None => groups.push(CreditGroup {
+                role,
+                credits: vec![credit],
+            }),
+        }
+    }
+
+    // A local id, not a UUID: the library's track ids are its own. The contract types it as one
+    // because the Hub is the usual speaker, and a hub-less client reads the groups, not the id.
+    Ok(Json(TrackCredits {
+        track_id: uuid::Uuid::parse_str(&track_id).unwrap_or(uuid::Uuid::nil()),
+        groups,
+    }))
 }

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use chordia_contracts::catalog::{
     AlbumArtistResolution, CatalogPruneRequest, CatalogSyncRequest, SyncTrack,
 };
+use chordia_contracts::credits::SyncCredit;
 use sqlx::SqlitePool;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -58,9 +59,10 @@ struct SyncRow {
     cover_hash: Option<String>,
     edition: Option<String>,
     advisory: Option<String>,
+    credits_hash: Option<String>,
 }
 
-fn row_to_track(r: SyncRow) -> SyncTrack {
+fn row_to_track(r: SyncRow, credits: Vec<SyncCredit>) -> SyncTrack {
     SyncTrack {
         title: r.title,
         artist: r.artist,
@@ -84,6 +86,8 @@ fn row_to_track(r: SyncRow) -> SyncTrack {
         cover_hash: r.cover_hash,
         edition: r.edition,
         advisory: r.advisory,
+        credits,
+        credits_hash: r.credits_hash,
     }
 }
 
@@ -125,7 +129,7 @@ pub async fn collect_tracks(db: &SqlitePool, local_id: &str) -> anyhow::Result<V
                 al.title AS album, al.title_normalized AS album_norm, aa.name AS album_artist, \
                 t.track_no, t.disc_no, al.year AS year, al.genre AS genre, t.duration_ms, \
                 t.content_hash, t.recording_mbid, al.release_mbid AS release_mbid, t.isrc, \
-                t.cover_hash, t.edition, t.advisory \
+                t.cover_hash, t.edition, t.advisory, t.credits_source_hash AS credits_hash \
          FROM library_tracks lt JOIN tracks t ON t.id = lt.track_id \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
          LEFT JOIN albums al ON al.id = t.album_id \
@@ -136,7 +140,51 @@ pub async fn collect_tracks(db: &SqlitePool, local_id: &str) -> anyhow::Result<V
     .bind(local_id)
     .fetch_all(db)
     .await?;
-    Ok(rows.into_iter().map(row_to_track).collect())
+
+    let mut credits = collect_credits(db, local_id).await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let c = credits.remove(&r.id).unwrap_or_default();
+            row_to_track(r, c)
+        })
+        .collect())
+}
+
+/// Every sidecar credit in this library, keyed by track id.
+///
+/// One query for the whole library rather than one per track: a 5000-track library would otherwise
+/// pay 5000 round trips per sync to read a table that is usually small and often empty. The join
+/// against `library_tracks` keeps it scoped to the library being pushed - a server hosting several
+/// must not leak one library's personnel into another's payload.
+///
+/// Ordered by `ord`, which is the position in the source file. That order is meaningful (main
+/// artist first, publishers last) and the Hub preserves it, so sorting here would discard
+/// information the parser went to the trouble of keeping.
+async fn collect_credits(
+    db: &SqlitePool,
+    local_id: &str,
+) -> anyhow::Result<HashMap<String, Vec<SyncCredit>>> {
+    let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT tc.track_id, tc.name, tc.role, tc.is_org \
+         FROM track_credits tc \
+         JOIN library_tracks lt ON lt.track_id = tc.track_id \
+         WHERE lt.library_id = ? \
+         ORDER BY tc.track_id, tc.ord",
+    )
+    .bind(local_id)
+    .fetch_all(db)
+    .await?;
+
+    let mut out: HashMap<String, Vec<SyncCredit>> = HashMap::new();
+    for (track_id, name, role, is_org) in rows {
+        out.entry(track_id).or_default().push(SyncCredit {
+            name,
+            role,
+            is_org: is_org != 0,
+        });
+    }
+    Ok(out)
 }
 
 async fn sync_library(
