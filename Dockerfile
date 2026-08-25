@@ -19,7 +19,19 @@ WORKDIR /build/library
 #
 # The binary is copied OUT inside this RUN on purpose: a cache mount is not part of the image layer,
 # so `target/` does not exist for a later `COPY --from=builder`.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
+#
+# `sharing=locked` is NOT optional, and removing it breaks the deploy rather than slowing it.
+# A cache mount with no `id=` is keyed by its TARGET PATH, so every Dockerfile in this workspace
+# that mounts /usr/local/cargo/registry shares one mount - and `docker compose up --build backend
+# frontend` builds them CONCURRENTLY. Cargo's package-cache lock lives at
+# /usr/local/cargo/.package-cache, which is outside the mounted directory, so each container takes
+# its own lock and neither sees the other; two cargo processes then unpack into one registry and
+# race. The symptom is a build that dies with `failed to unpack package ...: failed to open
+# .cargo-ok: File exists (os error 17)` and stays dead until the cache mount is pruned.
+#
+# Locked rather than separate `id=`s on purpose: the point of sharing the registry is downloading
+# the crates once. Separate ids would double the disk and re-download everything per image.
+RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/build/library/target \
     cargo build --release \
     && cp target/release/chordia-library /build/chordia-library
