@@ -49,7 +49,11 @@ fn no_migration_contains_a_carriage_return() {
 
     // A guard over an empty directory is a guard that cannot fail, and this one is here precisely
     // because a check that always passes is how the problem went unnoticed in the first place.
-    assert!(checked > 0, "found no migrations to check in {}", dir.display());
+    assert!(
+        checked > 0,
+        "found no migrations to check in {}",
+        dir.display()
+    );
 
     assert!(
         offenders.is_empty(),
