@@ -1,0 +1,26 @@
+# Line endings, decided by the repository rather than by each machine's git config.
+#
+# Git stores LF in the object database. What it writes to the WORKING TREE is a per-machine setting,
+# and `core.autocrlf=true` on Windows rewrites files to CRLF as it checks them out. The result is a
+# working tree that disagrees with the index on some files and not others, depending on which ones
+# git has happened to write since the setting took effect — which is not a state anyone chose or can
+# see.
+#
+# On 2026-09-01 that mix took the dev stack down. `sqlx` checksums each migration file byte for
+# byte, so a file checked out as CRLF no longer matches the checksum recorded when it was applied as
+# LF, and both the Hub and the library refused to boot with "migration N was previously applied but
+# has been modified". Nothing had been edited; the files' own mtimes were weeks old. The failure is
+# latent too — `sqlx::migrate!` embeds the files at compile time, so the drift sits harmless until
+# the next rebuild and then surfaces as a service that will not start.
+#
+# The same mix had already made the frontend's `biome` gate unusable for months: biome formats to LF
+# with no autodetect, so it reported a format error on all 116 CRLF files in a clean tree while CI
+# passed on its LF checkout.
+#
+# `eol=lf` makes the working tree LF on every platform, so a Windows checkout, a CI runner and a
+# production container hold the same bytes. `text=auto` still detects binaries and leaves them alone
+# — this does not corrupt an image, a font or an audio fixture.
+#
+# Verified safe before landing: no text file in any Chordia repo is committed with CRLF, so
+# `git add --renormalize .` stages nothing and no deployed database sees a migration change.
+* text=auto eol=lf
