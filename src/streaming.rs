@@ -56,19 +56,47 @@ where
     }
 }
 
-/// Parse `bytes=start-end` from a `Range` header value.
+/// Parse `bytes=start-end` from a `Range` header value, clamped to what this file has.
+///
+/// `None` means **unsatisfiable**, and the caller answers 416 — so what counts as unsatisfiable is
+/// the whole point of this function.
+///
+/// Per RFC 7233 a range is unsatisfiable only when its FIRST byte is past the end. An end beyond the
+/// last byte is perfectly valid and the server clamps it; asking for more than is there is how every
+/// client reads the tail of a file, because none of them know where it ends until they are told.
+///
+/// This rejected `end >= total` outright, and that made the last chunk of every track unreachable to
+/// any client that over-asks — which is the normal thing to do. Ours requests a megabyte at a time,
+/// so the final megabyte of every file answered 416, the decoder took that as the end of the stream,
+/// and tracks ended several seconds early and skipped to the next. A conforming request, refused.
 fn parse_range(header: &str, total: u64) -> Option<(u64, u64)> {
     let s = header.strip_prefix("bytes=")?;
     let (start_str, end_str) = s.split_once('-')?;
+    // An empty file has no satisfiable range at all, and this is also what keeps every subtraction
+    // below from wrapping.
+    let last = total.checked_sub(1)?;
+
+    // `bytes=-N`: the last N bytes, which is a suffix length rather than a start. It was read as a
+    // missing start and refused, so a client asking for the tail directly got a 416 as well.
+    if start_str.is_empty() {
+        let n: u64 = end_str.parse().ok()?;
+        if n == 0 {
+            return None;
+        }
+        return Some((total.saturating_sub(n), last));
+    }
 
     let start: u64 = start_str.parse().ok()?;
+    if start > last {
+        return None;
+    }
+    // Clamped, not refused. This is the line the bug was on.
     let end: u64 = if end_str.is_empty() {
-        total.saturating_sub(1)
+        last
     } else {
-        end_str.parse().ok()?
+        end_str.parse::<u64>().ok()?.min(last)
     };
-
-    if start > end || end >= total {
+    if start > end {
         return None;
     }
     Some((start, end))
@@ -191,11 +219,23 @@ mod tests {
         // start > end is rejected.
         assert_eq!(parse_range("bytes=200-100", 1000), None);
         // end past EOF is rejected.
-        assert_eq!(parse_range("bytes=0-1000", 1000), None);
+        // Clamped rather than refused: an end past the last byte is a conforming request, and
+        // every client that reads a file's tail makes one. Asserting `None` here is what let the
+        // last megabyte of every track answer 416 for months — the gate agreed with the bug.
+        assert_eq!(parse_range("bytes=0-1000", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=900-1999", 1000), Some((900, 999)));
+        // Still unsatisfiable when the START is past the end. That is the only case.
+        assert_eq!(parse_range("bytes=1000-1999", 1000), None);
+        assert_eq!(parse_range("bytes=1000-", 1000), None);
+        // A suffix range asks for the last N bytes.
+        assert_eq!(parse_range("bytes=-100", 1000), Some((900, 999)));
+        // More than the file holds is the whole file, not a refusal.
+        assert_eq!(parse_range("bytes=-5000", 1000), Some((0, 999)));
+        assert_eq!(parse_range("bytes=-0", 1000), None);
+        // Nothing satisfies an empty file.
+        assert_eq!(parse_range("bytes=0-99", 0), None);
         // Missing unit prefix.
         assert_eq!(parse_range("0-99", 1000), None);
-        // Suffix ranges (`bytes=-500`) are not supported by this server.
-        assert_eq!(parse_range("bytes=-500", 1000), None);
     }
 
     #[test]
