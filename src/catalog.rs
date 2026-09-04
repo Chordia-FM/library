@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::error::AppResult;
 
 /// Full track row, assembled by joining tracks + files (+ optionally library_tracks).
-#[derive(sqlx::FromRow)]
+#[derive(sqlx::FromRow, Clone, Debug)]
 pub struct TrackRow {
     pub id: String,
     /// The library this track was fetched in context of (may be empty string for match queries).
@@ -84,13 +84,13 @@ fn parse_uuid(s: &str) -> Uuid {
 
 /// Joins that hydrate the artist/album fields + file facts. Goes after `FROM tracks t` (or after the
 /// `library_tracks`→`tracks` join).
-const TRACK_JOINS: &str = "JOIN files f ON f.content_hash = t.content_hash \
+pub(crate) const TRACK_JOINS: &str = "JOIN files f ON f.content_hash = t.content_hash \
      LEFT JOIN artists ar ON ar.id = t.artist_id \
      LEFT JOIN albums al ON al.id = t.album_id \
      LEFT JOIN artists aa ON aa.id = al.artist_id";
 
 /// SQL fragment shared by all "with library context" track queries.
-const TRACK_COLS_WITH_LIB: &str =
+pub(crate) const TRACK_COLS_WITH_LIB: &str =
     "t.id, lt.library_id, t.content_hash, t.title, COALESCE(ar.name, '') AS artist, \
      aa.name AS album_artist, al.title AS album, al.year AS year, al.genre AS genre, \
      t.track_no, t.disc_no, t.duration_ms, t.acoustid, t.recording_mbid, \
@@ -99,7 +99,8 @@ const TRACK_COLS_WITH_LIB: &str =
      f.rg_gain_db, f.rg_peak";
 
 /// SQL fragment for match queries (no specific library context - returns first library found).
-const TRACK_COLS_NO_LIB: &str = "t.id, COALESCE((SELECT lt2.library_id FROM library_tracks lt2 \
+pub(crate) const TRACK_COLS_NO_LIB: &str =
+    "t.id, COALESCE((SELECT lt2.library_id FROM library_tracks lt2 \
                      WHERE lt2.track_id = t.id LIMIT 1), '') AS library_id, \
      t.content_hash, t.title, COALESCE(ar.name, '') AS artist, aa.name AS album_artist, \
      al.title AS album, al.year AS year, al.genre AS genre, t.track_no, t.disc_no, t.duration_ms, \
@@ -285,4 +286,47 @@ pub async fn find_track_fuzzy(
         .bind(dur + FUZZ)
         .fetch_optional(db)
         .await?)
+}
+
+/// One track as a [`TrackRow`] — the raw row rather than the contract type, so a caller that
+/// needs the file facts (`codec`, `rg_gain_db`, `rg_peak`, the normalized keys) keeps them.
+pub async fn get_track_row(db: &SqlitePool, track_id: &str) -> AppResult<Option<TrackRow>> {
+    let sql = format!(
+        "SELECT {TRACK_COLS_NO_LIB} FROM tracks t \
+         {TRACK_JOINS} \
+         WHERE t.id = ?"
+    );
+    Ok(sqlx::query_as::<_, TrackRow>(AssertSqlSafe(sql))
+        .bind(track_id)
+        .fetch_optional(db)
+        .await?)
+}
+
+/// The cover art a track shows: its own, else its album's. `(mime, bytes)`.
+pub async fn get_track_cover(
+    db: &SqlitePool,
+    track_id: &str,
+) -> AppResult<Option<(String, Vec<u8>)>> {
+    Ok(sqlx::query_as::<_, (String, Vec<u8>)>(
+        "SELECT c.mime, c.bytes FROM tracks t \
+         LEFT JOIN albums al ON al.id = t.album_id \
+         JOIN cover_art c ON c.hash = COALESCE(t.cover_hash, al.cover_hash) \
+         WHERE t.id = ? LIMIT 1",
+    )
+    .bind(track_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+/// Embedded lyrics from the file's tags (plain text or LRC), if the tag had any. The column has
+/// been written since 0005 and this is its first reader.
+pub async fn get_track_lyrics(db: &SqlitePool, track_id: &str) -> AppResult<Option<String>> {
+    Ok(
+        sqlx::query_scalar::<_, Option<String>>("SELECT lyrics FROM tracks WHERE id = ?")
+            .bind(track_id)
+            .fetch_optional(db)
+            .await?
+            .flatten()
+            .filter(|l| !l.trim().is_empty()),
+    )
 }

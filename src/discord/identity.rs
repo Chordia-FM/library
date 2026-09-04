@@ -1,0 +1,410 @@
+//! One bot identity: a token, and everything that exists because of it.
+//!
+//! An `Identity` outlives any single gateway connection. The supervisor in `client.rs` builds a
+//! serenity client for it, runs it until it exits, and rebuilds it; the identity keeps the settings,
+//! the per-guild players and the profile across those restarts, and hands out the connection-scoped
+//! handles (`Http`, `Cache`, `Songbird`) as `Option`s that are `None` between connections.
+//!
+//! Locks here are `std::sync` because every critical section is a field read or a map lookup —
+//! never an await — which also lets songbird's event thread and snapshot code read them without an
+//! async context.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
+
+use serenity::all::{Cache, ChannelId, ChannelType, Context, GuildId, Http, ShardManager, UserId};
+use songbird::driver::Scheduler;
+use songbird::Songbird;
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
+
+use crate::discord::player::GuildPlayer;
+use crate::discord::settings::{self, BotSettings};
+use crate::http::AppState;
+
+/// What Discord told us about the application behind a token.
+#[derive(Debug, Clone)]
+pub struct Profile {
+    pub app_id: u64,
+    pub user_id: UserId,
+    pub name: String,
+    pub avatar_url: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Status {
+    /// Not yet connected for the first time.
+    Starting,
+    /// Client built, gateway connecting.
+    Connecting,
+    Online,
+    /// Last attempt failed; the supervisor will retry.
+    Failed(String),
+    /// Shut down on purpose.
+    Stopped,
+}
+
+impl Status {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Status::Starting => "starting",
+            Status::Connecting => "connecting",
+            Status::Online => "online",
+            Status::Failed(_) => "failed",
+            Status::Stopped => "stopped",
+        }
+    }
+}
+
+pub struct Identity {
+    /// Position in the configured token list; part of every custom id.
+    pub index: u8,
+    pub(crate) token: String,
+    pub state: AppState,
+    /// Shared across identities so N bots share one pool of mixer threads.
+    pub scheduler: Scheduler,
+    pub cancel: CancellationToken,
+    pub command_guilds: Vec<u64>,
+    profile: RwLock<Option<Profile>>,
+    status: RwLock<Status>,
+    settings: RwLock<BotSettings>,
+    http: RwLock<Option<Arc<Http>>>,
+    cache: RwLock<Option<Arc<Cache>>>,
+    songbird: RwLock<Option<Arc<Songbird>>>,
+    shard_manager: RwLock<Option<Arc<ShardManager>>>,
+    /// A gateway context, kept from the Ready event so presence can be set outside event handlers.
+    ctx: RwLock<Option<Context>>,
+    players: Mutex<HashMap<GuildId, Arc<GuildPlayer>>>,
+    restart: Notify,
+    /// Last presence text sent, to skip duplicate updates.
+    pub(crate) last_activity: Mutex<Option<String>>,
+    /// Last voice-channel status sent per channel, same reason.
+    pub(crate) last_vc_status: Mutex<HashMap<ChannelId, String>>,
+}
+
+impl Identity {
+    pub fn new(
+        index: u8,
+        token: String,
+        state: AppState,
+        scheduler: Scheduler,
+        cancel: CancellationToken,
+        command_guilds: Vec<u64>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            index,
+            token,
+            state,
+            scheduler,
+            cancel,
+            command_guilds,
+            profile: RwLock::new(None),
+            status: RwLock::new(Status::Starting),
+            settings: RwLock::new(BotSettings::defaults("")),
+            http: RwLock::new(None),
+            cache: RwLock::new(None),
+            songbird: RwLock::new(None),
+            shard_manager: RwLock::new(None),
+            ctx: RwLock::new(None),
+            players: Mutex::new(HashMap::new()),
+            restart: Notify::new(),
+            last_activity: Mutex::new(None),
+            last_vc_status: Mutex::new(HashMap::new()),
+        })
+    }
+
+    // ---- profile / status / settings ---------------------------------------------------------------
+
+    pub fn profile(&self) -> Option<Profile> {
+        self.profile
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_profile(&self, p: Profile) {
+        *self.profile.write().unwrap_or_else(|e| e.into_inner()) = Some(p);
+    }
+
+    pub fn app_id_sync(&self) -> Option<u64> {
+        self.profile().map(|p| p.app_id)
+    }
+
+    pub fn user_id(&self) -> Option<UserId> {
+        self.profile().map(|p| p.user_id)
+    }
+
+    pub fn status(&self) -> Status {
+        self.status
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_status(&self, s: Status) {
+        *self.status.write().unwrap_or_else(|e| e.into_inner()) = s;
+    }
+
+    pub fn settings(&self) -> BotSettings {
+        self.settings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_settings(&self, s: BotSettings) {
+        *self.settings.write().unwrap_or_else(|e| e.into_inner()) = s;
+    }
+
+    /// Load this identity's settings once the application id is known.
+    pub async fn load_settings(&self) {
+        let Some(app_id) = self.app_id_sync() else {
+            return;
+        };
+        match settings::load_bot(&self.state.db, &app_id.to_string()).await {
+            Ok(s) => self.set_settings(s),
+            Err(e) => tracing::warn!(error = %e, "loading bot settings; using defaults"),
+        }
+    }
+
+    pub async fn save_settings(&self) {
+        let s = self.settings();
+        if s.app_id.is_empty() {
+            return;
+        }
+        if let Err(e) = settings::save_bot(&self.state.db, &s).await {
+            tracing::warn!(error = %e, "saving bot settings");
+        }
+    }
+
+    /// The name views show: the dashboard override, else the bot user's name, else a placeholder.
+    pub fn display_name_sync(&self) -> String {
+        if let Some(n) = self.settings().display_name {
+            return n;
+        }
+        if let Some(p) = self.profile() {
+            return p.name;
+        }
+        format!("Chordia {}", self.index + 1)
+    }
+
+    // ---- connection handles ------------------------------------------------------------------------
+
+    pub fn http(&self) -> Option<Arc<Http>> {
+        self.http.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn cache(&self) -> Option<Arc<Cache>> {
+        self.cache.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn songbird(&self) -> Option<Arc<Songbird>> {
+        self.songbird
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn shard_manager(&self) -> Option<Arc<ShardManager>> {
+        self.shard_manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn context(&self) -> Option<Context> {
+        self.ctx.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub(crate) fn attach_connection(
+        &self,
+        http: Arc<Http>,
+        cache: Arc<Cache>,
+        songbird: Arc<Songbird>,
+        shard_manager: Arc<ShardManager>,
+    ) {
+        *self.http.write().unwrap_or_else(|e| e.into_inner()) = Some(http);
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) = Some(cache);
+        *self.songbird.write().unwrap_or_else(|e| e.into_inner()) = Some(songbird);
+        *self
+            .shard_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shard_manager);
+    }
+
+    pub(crate) fn set_context(&self, ctx: Context) {
+        *self.ctx.write().unwrap_or_else(|e| e.into_inner()) = Some(ctx);
+    }
+
+    pub(crate) fn detach_connection(&self) {
+        *self.http.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.cache.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self.songbird.write().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .shard_manager
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self.ctx.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.last_activity
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        self.last_vc_status
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Ask the supervisor to tear the gateway down and reconnect.
+    pub fn request_restart(&self) {
+        self.restart.notify_one();
+    }
+
+    pub(crate) async fn restart_requested(&self) {
+        self.restart.notified().await;
+    }
+
+    // ---- players -----------------------------------------------------------------------------------
+
+    /// The player for a guild, created on first use with that guild's saved settings.
+    pub async fn player(self: &Arc<Self>, guild: GuildId) -> Arc<GuildPlayer> {
+        if let Some(p) = self.player_arc(guild) {
+            return p;
+        }
+        let app_id = self.app_id_sync().unwrap_or(0).to_string();
+        let gs = settings::load_guild(&self.state.db, &app_id, &guild.to_string())
+            .await
+            .unwrap_or_else(|_| settings::GuildSettings::defaults(&app_id, &guild.to_string()));
+        let default_volume = self.settings().default_volume;
+        let mut players = self.players.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(
+            players
+                .entry(guild)
+                .or_insert_with(|| GuildPlayer::new(self, guild, gs, default_volume)),
+        )
+    }
+
+    pub fn player_arc(&self, guild: GuildId) -> Option<Arc<GuildPlayer>> {
+        self.players
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&guild)
+            .cloned()
+    }
+
+    pub fn players(&self) -> Vec<Arc<GuildPlayer>> {
+        self.players
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    // ---- cache lookups -----------------------------------------------------------------------------
+
+    /// A voice channel's configured bitrate in kbps, from the cache.
+    pub fn channel_bitrate_kbps(&self, guild: GuildId, channel: ChannelId) -> Option<u32> {
+        let cache = self.cache()?;
+        let guild = cache.guild(guild)?;
+        guild.channels.get(&channel)?.bitrate.map(|b| b / 1000)
+    }
+
+    pub fn channel_name(&self, guild: GuildId, channel: ChannelId) -> Option<String> {
+        let cache = self.cache()?;
+        let guild = cache.guild(guild)?;
+        guild.channels.get(&channel).map(|c| c.name.clone())
+    }
+
+    pub fn guild_name(&self, guild: GuildId) -> Option<String> {
+        let cache = self.cache()?;
+        cache.guild(guild).map(|g| g.name.clone())
+    }
+
+    /// The voice channel a member is in right now, from the cache.
+    pub fn member_voice_channel(&self, guild: GuildId, user: UserId) -> Option<ChannelId> {
+        let cache = self.cache()?;
+        let guild = cache.guild(guild)?;
+        guild.voice_states.get(&user)?.channel_id
+    }
+
+    pub fn is_voice_channel(&self, guild: GuildId, channel: ChannelId) -> bool {
+        let Some(cache) = self.cache() else {
+            return true;
+        };
+        let Some(guild) = cache.guild(guild) else {
+            return true;
+        };
+        guild
+            .channels
+            .get(&channel)
+            .map(|c| matches!(c.kind, ChannelType::Voice | ChannelType::Stage))
+            .unwrap_or(true)
+    }
+
+    /// Recompute who is listening in a player's channel from the cache and tell the player.
+    pub async fn refresh_listeners(&self, player: &GuildPlayer) {
+        let Some(vc) = player.voice_channel().await else {
+            return;
+        };
+        let me = self.user_id();
+        let users: HashSet<UserId> = match self.cache().and_then(|c| {
+            c.guild(player.guild_id).map(|g| {
+                g.voice_states
+                    .values()
+                    .filter(|v| v.channel_id == Some(vc))
+                    .filter(|v| Some(v.user_id) != me)
+                    .filter(|v| !v.member.as_ref().is_some_and(|m| m.user.bot))
+                    .map(|v| v.user_id)
+                    .collect()
+            })
+        }) {
+            Some(u) => u,
+            None => return,
+        };
+        player.set_listeners(users).await;
+    }
+
+    /// Guilds the bot is in, from the cache.
+    pub fn guild_ids(&self) -> Vec<GuildId> {
+        self.cache().map(|c| c.guilds()).unwrap_or_default()
+    }
+
+    /// The `SET_VOICE_CHANNEL_STATUS` bit and the rest of what an invite must grant.
+    pub const INVITE_PERMISSIONS: u64 = (1 << 10) // VIEW_CHANNEL
+        | (1 << 11) // SEND_MESSAGES
+        | (1 << 14) // EMBED_LINKS
+        | (1 << 15) // ATTACH_FILES
+        | (1 << 16) // READ_MESSAGE_HISTORY
+        | (1 << 20) // CONNECT
+        | (1 << 21) // SPEAK
+        | (1 << 48); // SET_VOICE_CHANNEL_STATUS
+
+    pub fn invite_url(app_id: u64) -> String {
+        format!(
+            "https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot%20applications.commands&permissions={}",
+            Self::INVITE_PERMISSIONS
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serenity::all::Permissions;
+
+    #[test]
+    fn invite_permission_bits_match_serenity() {
+        let want = Permissions::VIEW_CHANNEL
+            | Permissions::SEND_MESSAGES
+            | Permissions::EMBED_LINKS
+            | Permissions::ATTACH_FILES
+            | Permissions::READ_MESSAGE_HISTORY
+            | Permissions::CONNECT
+            | Permissions::SPEAK
+            | Permissions::SET_VOICE_CHANNEL_STATUS;
+        assert_eq!(Identity::INVITE_PERMISSIONS, want.bits());
+        assert!(Identity::invite_url(42)
+            .contains("client_id=42&scope=bot%20applications.commands&permissions="));
+    }
+}

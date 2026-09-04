@@ -16,6 +16,8 @@ pub mod config;
 pub mod credits;
 pub mod dedupe;
 pub mod directory;
+#[cfg(feature = "discord")]
+pub mod discord;
 pub mod embedded;
 pub mod error;
 pub mod fingerprint;
@@ -29,6 +31,7 @@ pub mod playback;
 pub mod relay;
 pub mod scanner;
 pub mod scrobble;
+pub mod search;
 pub mod streaming;
 pub mod telemetry;
 pub mod tls;
