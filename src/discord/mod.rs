@@ -26,10 +26,12 @@
 //! The whole module is behind the `discord` cargo feature (on by default) so the desktop app, which
 //! embeds this crate, never builds any of it.
 
+pub mod autoplay;
 pub mod avatar;
 pub mod client;
 pub mod commands;
 pub mod emoji;
+pub mod hub;
 pub mod identity;
 pub mod interactions;
 pub mod lyrics;
@@ -61,6 +63,8 @@ pub struct Runtime {
     /// Who owns this library, per the Hub. The owner is an implicit owner of every bot here.
     /// `None` until the Hub answered (or when there is no Hub).
     owner: std::sync::RwLock<Option<ServerOwner>>,
+    /// What the bots learned from the Hub about listeners, tracks and artists.
+    pub hub: hub::Caches,
 }
 
 impl Runtime {
@@ -155,6 +159,7 @@ pub fn start(state: AppState) -> Option<Arc<Runtime>> {
         identities,
         cancel,
         owner: std::sync::RwLock::new(None),
+        hub: hub::Caches::default(),
     });
     let runtime = match RUNTIME.set(runtime.clone()) {
         Ok(()) => runtime,

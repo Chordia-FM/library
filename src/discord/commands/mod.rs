@@ -50,6 +50,7 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         control::radio(),
         info::bots(),
         info::lyrics(),
+        info::stats(),
         settings::settings(),
         settings::dj(),
         settings::always_on(),

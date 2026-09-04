@@ -39,6 +39,7 @@ use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
 use crate::discord::player::{Cover, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem};
 use crate::discord::settings::GuildSettings;
 use crate::search::{HitKind, SearchHit};
+use chordia_contracts::discord::ResolvedTrack;
 
 pub const QUEUE_PAGE_SIZE: usize = 10;
 
@@ -56,42 +57,83 @@ fn header(icon: &Emoji, title: &str, subtitle: Option<&str>) -> Vec<Component> {
     vec![text(line), separator(true, Spacing::Small)]
 }
 
-/// Escaped text, linked to a web-client search for `query` when the library has a web client to
-/// link to.
-fn linked(text: &str, web: Option<&str>, query: &str) -> String {
+/// Escaped text, linked to a page on the web client when the Hub told us where it is, else to a
+/// search for `query` when there is a web client at all.
+fn linked_to(text: &str, web: Option<&str>, page: Option<String>, query: &str) -> String {
     let shown = fmt::escape_md(text);
-    match web {
-        Some(base) if !query.trim().is_empty() => {
+    match (web, page) {
+        (Some(base), Some(path)) => format!("[{shown}]({base}{path})"),
+        (Some(base), None) if !query.trim().is_empty() => {
             format!("[{shown}]({base}/app/search?q={})", fmt::urlencode(query))
         }
         _ => shown,
     }
 }
 
+fn linked(text: &str, web: Option<&str>, query: &str) -> String {
+    linked_to(text, web, None, query)
+}
+
+/// A track has no page of its own on the web client; its album's is where it lives.
+fn album_page(links: Option<&ResolvedTrack>) -> Option<String> {
+    links
+        .and_then(|l| l.album_id)
+        .map(|id| format!("/app/albums/{id}"))
+}
+
+fn artist_page(links: Option<&ResolvedTrack>) -> Option<String> {
+    links
+        .and_then(|l| l.artist_id)
+        .map(|id| format!("/app/artists/{id}"))
+}
+
 /// `**Title** · Artist`, one line.
 fn title_line(t: &TrackRow, web: Option<&str>) -> String {
+    title_line_with(t, web, None)
+}
+
+fn title_line_with(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> String {
     let mut s = format!(
         "**{}**",
-        linked(&t.title, web, &format!("{} {}", t.title, t.artist))
+        linked_to(
+            &t.title,
+            web,
+            album_page(links),
+            &format!("{} {}", t.title, t.artist)
+        )
     );
     if !t.artist.is_empty() {
         s.push_str(" · ");
-        s.push_str(&linked(&t.artist, web, &t.artist));
+        s.push_str(&linked_to(&t.artist, web, artist_page(links), &t.artist));
     }
     s
 }
 
 /// `**Title**` over `Artist · *Album*`.
 fn track_block(t: &TrackRow, web: Option<&str>) -> String {
+    track_block_with(t, web, None)
+}
+
+fn track_block_with(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> String {
     let mut s = format!(
         "**{}**\n{}",
-        linked(&t.title, web, &format!("{} {}", t.title, t.artist)),
-        linked(&t.artist, web, &t.artist)
+        linked_to(
+            &t.title,
+            web,
+            album_page(links),
+            &format!("{} {}", t.title, t.artist)
+        ),
+        linked_to(&t.artist, web, artist_page(links), &t.artist)
     );
     if let Some(album) = t.album.as_deref().filter(|a| !a.is_empty()) {
         s.push_str(&format!(
             " · *{}*",
-            linked(album, web, &format!("{album} {}", t.artist))
+            linked_to(
+                album,
+                web,
+                album_page(links),
+                &format!("{album} {}", t.artist)
+            )
         ));
     }
     s
@@ -126,6 +168,19 @@ fn with_art(lines: Vec<Component>, cover: Option<&Cover>) -> Vec<Component> {
         )],
         None => lines,
     }
+}
+
+/// The same, with a picture Discord fetches itself (an artist's, from the Hub).
+fn with_art_url(lines: Vec<Component>, url: &str) -> Vec<Component> {
+    vec![section(
+        lines,
+        thumbnail(
+            Media {
+                url: url.to_string(),
+            },
+            None,
+        ),
+    )]
 }
 
 /// Attach the cover to the message: either upload the bytes, or (`reuse`, on an edit of the same
@@ -204,7 +259,11 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
     } else {
         (Icon::Play, "Now playing", icons.accent())
     };
-    let mut meta = vec![format!("Requested by {}", mention(cur.item.requested_by))];
+    let mut meta = vec![if cur.item.autoplay {
+        "Autoplay".to_string()
+    } else {
+        format!("Requested by {}", mention(cur.item.requested_by))
+    }];
     meta.push(match snap.queue.len() {
         0 => "queue empty".to_string(),
         n => format!("{n} in queue"),
@@ -212,10 +271,19 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
     if snap.volume != 100 {
         meta.push(format!("vol {}%", snap.volume));
     }
+    // Transparency: whose Chordia history this play lands in.
+    if !snap.counting.is_empty() {
+        let names: Vec<String> = snap
+            .counting
+            .iter()
+            .map(|h| format!("@{}", fmt::escape_md(h)))
+            .collect();
+        meta.push(format!("counting for {}", names.join(", ")));
+    }
     let mut body = header(&icons.get(icon), title, Some(&where_line(snap)));
     body.extend(with_art(
         vec![
-            text(track_block(t, web)),
+            text(track_block_with(t, web, cur.links.as_ref())),
             text(small(fmt::badges(&cur.facts).join(" · "))),
         ],
         cur.cover.as_ref(),
@@ -307,6 +375,7 @@ pub fn queued(
     enq: &Enqueued,
     source: Option<&str>,
     cover: Option<&Cover>,
+    art_url: Option<&str>,
 ) -> Message {
     let Some(first) = items.first() else {
         return notice(&snap.icons, "Nothing added", "No tracks matched.");
@@ -354,15 +423,33 @@ pub fn queued(
         )
     };
     let mut body = header(&snap.icons.get(icon), &title, None);
-    body.extend(with_art(
-        vec![text(format!("{line}\n{}", small(meta)))],
-        cover,
-    ));
+    let lines = vec![text(format!("{line}\n{}", small(meta)))];
+    // One picture: the artist's when there is one, else the cover. A cover attached but not
+    // shown would be an upload for nothing, and an invalid message.
+    let cover = if art_url.is_some() { None } else { cover };
+    body.extend(match art_url {
+        Some(url) => with_art_url(lines, url),
+        None => with_art(lines, cover),
+    });
     carry_cover(
         Message::new(vec![container(icons.accent(), body)]),
         cover,
         false,
     )
+}
+
+/// What a server has played through the bot: a few headed sections of text.
+pub fn stats(
+    icons: &IconSet,
+    title: &str,
+    subtitle: &str,
+    sections: &[(String, String)],
+) -> Message {
+    let mut body = header(&icons.get(Icon::Listening), title, Some(subtitle));
+    for (heading, lines) in sections {
+        body.push(text(format!("**{heading}**\n{lines}")));
+    }
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
 /// One page of the queue (0-based, clamped), with paging buttons.
@@ -867,6 +954,7 @@ mod tests {
         QueueItem {
             track: track(id, title),
             requested_by: UserId::new(42),
+            autoplay: false,
         }
     }
 
@@ -895,6 +983,7 @@ mod tests {
                 position_ms: 65_000,
                 paused: false,
                 cover: with_cover.then(cover),
+                links: None,
             }),
             queue: (0..queue)
                 .map(|i| item(&i.to_string(), &format!("Track {i}")))
@@ -905,6 +994,7 @@ mod tests {
             volume: 80,
             normalize: true,
             listeners: 3,
+            counting: vec![],
         }
     }
 
@@ -929,6 +1019,7 @@ mod tests {
                 },
                 None,
                 Some(&c),
+                None,
             ),
             queued(
                 &s,
@@ -937,6 +1028,7 @@ mod tests {
                     position: 0,
                     count: 1,
                 },
+                None,
                 None,
                 None,
             ),
@@ -949,6 +1041,7 @@ mod tests {
                 },
                 Some("Discovery"),
                 Some(&c),
+                Some("https://hub.example/v1/images/abc"),
             ),
             queue_page(&s, 0),
             queue_page(&s, 99),
@@ -1273,6 +1366,7 @@ mod tests {
                 position: 1,
                 count: 1,
             },
+            None,
             None,
             None,
         );

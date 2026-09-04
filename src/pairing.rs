@@ -10,8 +10,13 @@ use std::path::Path;
 
 use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, CatalogSyncResponse};
 use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse, ServerOwner};
+use chordia_contracts::discord::{
+    ArtistArtRequest, ArtistArtResponse, AttributedScrobbleBatch, ResolveListenersRequest,
+    ResolveListenersResponse, ResolveTracksRequest, ResolveTracksResponse,
+};
 use chordia_contracts::identify::{IdentifyRequest, IdentifyResponse};
 use chordia_contracts::scrobble::ScrobbleBatch;
+use chordia_contracts::scrobble::ScrobbleBatchResponse;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -118,6 +123,69 @@ impl HubClient {
             anyhow::bail!("owner lookup failed {}", resp.status());
         }
         Ok(resp.json::<ServerOwner>().await?)
+    }
+
+    /// `POST` a JSON body with the server's own key and decode the JSON answer: the shape of
+    /// everything the Discord bot asks the Hub for.
+    async fn library_post<Req: serde::Serialize, Res: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        server_api_key: &str,
+        body: &Req,
+    ) -> anyhow::Result<Res> {
+        let url = format!("{}{path}", self.base()?);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("{path} failed {}", resp.status());
+        }
+        Ok(resp.json::<Res>().await?)
+    }
+
+    /// `POST /v1/directory/listeners:resolve`: which of these Discord users this server may
+    /// attribute plays to.
+    pub async fn resolve_listeners(
+        &self,
+        server_api_key: &str,
+        req: &ResolveListenersRequest,
+    ) -> anyhow::Result<ResolveListenersResponse> {
+        self.library_post("/v1/directory/listeners:resolve", server_api_key, req)
+            .await
+    }
+
+    /// `POST /v1/scrobbles:ingest-attributed`: plays the bot heard listeners hear.
+    pub async fn forward_attributed_scrobbles(
+        &self,
+        server_api_key: &str,
+        batch: &AttributedScrobbleBatch,
+    ) -> anyhow::Result<ScrobbleBatchResponse> {
+        self.library_post("/v1/scrobbles:ingest-attributed", server_api_key, batch)
+            .await
+    }
+
+    /// `POST /v1/catalog/resolve-tracks`: the Hub's ids for the library's own track ids.
+    pub async fn resolve_tracks(
+        &self,
+        server_api_key: &str,
+        req: &ResolveTracksRequest,
+    ) -> anyhow::Result<ResolveTracksResponse> {
+        self.library_post("/v1/catalog/resolve-tracks", server_api_key, req)
+            .await
+    }
+
+    /// `POST /v1/catalog/artists:art`: an artist's page and pictures.
+    pub async fn artists_art(
+        &self,
+        server_api_key: &str,
+        req: &ArtistArtRequest,
+    ) -> anyhow::Result<ArtistArtResponse> {
+        self.library_post("/v1/catalog/artists:art", server_api_key, req)
+            .await
     }
 
     /// Call `POST /v1/directory/heartbeat` using the server's own API key.

@@ -9,7 +9,7 @@
 //! [`TrackEnd`]; each carries the epoch of the track it belongs to, so a late event from a track that
 //! was already skipped cannot advance the queue twice.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -20,6 +20,10 @@ use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
 use songbird::tracks::{PlayMode, TrackHandle};
 use tokio::sync::{Mutex, Notify};
 
+use chordia_contracts::discord::ResolvedTrack;
+use chordia_contracts::scrobble::{ClientType, ListeningEvent, PlaybackSource};
+use uuid::Uuid;
+
 use crate::catalog::TrackRow;
 use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
@@ -27,6 +31,7 @@ use crate::discord::presence;
 use crate::discord::settings::{self, GuildSettings};
 use crate::discord::source::{self, TrackFacts};
 use crate::discord::ui::{self, views};
+use crate::discord::{autoplay, hub};
 
 /// How many finished tracks `/back` and `/history` can reach.
 const HISTORY_CAP: usize = 50;
@@ -71,6 +76,8 @@ pub enum Position {
 pub struct QueueItem {
     pub track: Arc<TrackRow>,
     pub requested_by: UserId,
+    /// Picked by the radio when the queue ran out, not asked for by anyone.
+    pub autoplay: bool,
 }
 
 /// Why the bot left a voice channel — the Left notice says so.
@@ -162,12 +169,67 @@ struct Playing {
     /// Wall-clock accounting for `ms_played`: time spent unpaused so far.
     played: Duration,
     resumed_at: Option<Instant>,
+    /// Wall clock when it started, for the listening events.
+    started_wall: i64,
+    /// Unpaused milliseconds each listener was present for, settled whenever who is present
+    /// changes and when the track ends.
+    heard: HashMap<UserId, u64>,
+    settled_at: Instant,
+    /// Set once the play's listening events were queued: a stop and the end event that follows
+    /// it must not both report.
+    reported: bool,
+    /// The Hub's ids for the track, once the lookup answered.
+    links: Option<ResolvedTrack>,
+}
+
+/// What is left of a play once it ended: what the local log needs, and who heard how much.
+struct Concluded {
+    play_id: Option<i64>,
+    ms_played: u64,
+    heard: Vec<(UserId, u64)>,
+    track: Arc<TrackRow>,
+    started_wall: i64,
 }
 
 impl Playing {
     fn ms_played(&self) -> u64 {
         let live = self.resumed_at.map(|t| t.elapsed()).unwrap_or_default();
         (self.played + live).as_millis() as u64
+    }
+
+    /// Credit everyone `present` with the unpaused time since the last settle.
+    fn settle(&mut self, present: &HashSet<UserId>) {
+        let now = Instant::now();
+        if let Some(resumed) = self.resumed_at {
+            let from = if resumed > self.settled_at {
+                resumed
+            } else {
+                self.settled_at
+            };
+            let ms = now.saturating_duration_since(from).as_millis() as u64;
+            if ms > 0 {
+                for user in present {
+                    *self.heard.entry(*user).or_insert(0) += ms;
+                }
+            }
+        }
+        self.settled_at = now;
+    }
+
+    /// Close the books on this play, once.
+    fn conclude(&mut self, present: &HashSet<UserId>) -> Option<Concluded> {
+        if self.reported {
+            return None;
+        }
+        self.settle(present);
+        self.reported = true;
+        Some(Concluded {
+            play_id: self.play_id,
+            ms_played: self.ms_played(),
+            heard: self.heard.iter().map(|(u, ms)| (*u, *ms)).collect(),
+            track: self.item.track.clone(),
+            started_wall: self.started_wall,
+        })
     }
 }
 
@@ -208,6 +270,8 @@ pub struct CurrentSnapshot {
     pub position_ms: u64,
     pub paused: bool,
     pub cover: Option<Cover>,
+    /// The Hub's ids for the track, for deep links; absent until looked up, or without a Hub.
+    pub links: Option<ResolvedTrack>,
 }
 
 #[derive(Debug, Clone)]
@@ -228,6 +292,8 @@ pub struct PlayerSnapshot {
     pub volume: u8,
     pub normalize: bool,
     pub listeners: usize,
+    /// Handles of the listeners whose history this play counts in, as far as the bot knows.
+    pub counting: Vec<String>,
 }
 
 impl PlayerSnapshot {
@@ -779,6 +845,7 @@ impl GuildPlayer {
                     position_ms: 0,
                     paused: c.paused,
                     cover: c.cover.clone(),
+                    links: c.links.clone(),
                 }),
                 queue: s.queue.iter().cloned().collect(),
                 history: s.history.iter().cloned().collect(),
@@ -787,6 +854,13 @@ impl GuildPlayer {
                 volume: s.volume,
                 normalize: s.normalize,
                 listeners: s.listeners.len(),
+                counting: {
+                    let ids: Vec<u64> = s.listeners.iter().map(|u| u.get()).collect();
+                    hub::cached_listeners(&ids)
+                        .into_iter()
+                        .map(|l| l.handle)
+                        .collect()
+                },
             };
             (handle, snap)
         };
@@ -821,15 +895,38 @@ impl GuildPlayer {
 
     /// The gateway's view of who is in the bot's channel, minus bots.
     pub async fn set_listeners(&self, users: HashSet<UserId>) {
-        let mut s = self.inner.lock().await;
-        let was_alone = s.listeners.is_empty();
-        s.listeners = users;
-        if s.listeners.is_empty() {
-            if !was_alone || s.alone_since.is_none() {
-                s.alone_since = Some(Instant::now());
+        let ids: Vec<u64> = {
+            let mut s = self.inner.lock().await;
+            let was_alone = s.listeners.is_empty();
+            // Whoever was here gets credited up to now before the set changes.
+            let present = s.listeners.clone();
+            if let Some(cur) = s.current.as_mut() {
+                cur.settle(&present);
             }
-        } else {
-            s.alone_since = None;
+            s.listeners = users;
+            if s.listeners.is_empty() {
+                if !was_alone || s.alone_since.is_none() {
+                    s.alone_since = Some(Instant::now());
+                }
+            } else {
+                s.alone_since = None;
+            }
+            s.listeners.iter().map(|u| u.get()).collect()
+        };
+        // Who among them is a Chordia user: asked once, remembered, shown on the controller.
+        let me = self
+            .identity
+            .upgrade()
+            .and_then(|i| i.player_arc(self.guild_id));
+        if let (Ok(identity), Some(me)) = (self.identity(), me) {
+            let state = identity.state.clone();
+            tokio::spawn(async move {
+                let before = hub::cached_listeners(&ids).len();
+                let after = hub::resolve_listeners(&state, &ids).await.len();
+                if after != before {
+                    me.controller_wake.notify_one();
+                }
+            });
         }
     }
 
@@ -980,6 +1077,11 @@ impl GuildPlayer {
                 seekable,
                 played: Duration::ZERO,
                 resumed_at: Some(Instant::now()),
+                started_wall: settings::now_ms(),
+                heard: HashMap::new(),
+                settled_at: Instant::now(),
+                reported: false,
+                links: None,
             });
             s.idle_since = None;
             s.alone_since = if s.listeners.is_empty() {
@@ -1010,12 +1112,100 @@ impl GuildPlayer {
                 cur.play_id = play_id;
             }
         }
+        // Where the track's page is on the Hub, for the controller's links. Off the hot path:
+        // the first render goes out without them and the next edit carries them.
+        if let Some(p) = &self_arc {
+            let p = p.clone();
+            let state = identity.state.clone();
+            let track = item.track.clone();
+            tokio::spawn(async move {
+                let Some(links) = hub::resolve_track(&state, &track).await else {
+                    return;
+                };
+                let mut s = p.inner.lock().await;
+                if let Some(cur) = s.current.as_mut().filter(|c| c.epoch == epoch) {
+                    cur.links = Some(links);
+                    drop(s);
+                    p.controller_wake.notify_one();
+                }
+            });
+        }
         self.controller_wake.notify_one();
         presence::update(&identity).await;
         if let Some(vc) = self.inner.lock().await.voice_channel {
             presence::set_voice_status(&identity, vc, Some(&item.track)).await;
         }
         Ok(())
+    }
+
+    /// The radio's pick when the queue ran out and autoplay is on here and allowed: nearest to
+    /// `seed` (else the last thing that played), skipping recent history.
+    async fn autoplay_pick(&self, seed: Option<&TrackRow>) -> Option<QueueItem> {
+        let (on, exclude, last) = {
+            let s = self.inner.lock().await;
+            let on = s.autoplay && s.settings.can_autoplay && s.voice_channel.is_some();
+            let exclude: Vec<String> = s.history.iter().map(|i| i.track.id.clone()).collect();
+            (on, exclude, s.history.back().map(|i| i.track.clone()))
+        };
+        if !on {
+            return None;
+        }
+        let identity = self.identity().ok()?;
+        let seed_owned;
+        let seed: &TrackRow = match seed {
+            Some(t) => t,
+            None => {
+                seed_owned = last?;
+                &seed_owned
+            }
+        };
+        let track = autoplay::pick(&identity.state.db, seed, &exclude).await?;
+        Some(QueueItem {
+            track: Arc::new(track),
+            requested_by: identity.user_id().unwrap_or(UserId::new(1)),
+            autoplay: true,
+        })
+    }
+
+    /// Finish the local play log and queue a listening event for everyone who heard enough of
+    /// the track: thirty seconds, or half of a shorter one. Which of them the Hub counts for is
+    /// the Hub's decision when the reporter sends.
+    async fn report(&self, concluded: Option<Concluded>) {
+        let Some(c) = concluded else { return };
+        let Ok(identity) = self.identity() else {
+            return;
+        };
+        let db = &identity.state.db;
+        if let Some(id) = c.play_id {
+            let _ = settings::finish_play(db, id, c.ms_played).await;
+        }
+        let duration = c.track.duration_ms.max(0) as u64;
+        let min = (duration / 2).clamp(1_000, 30_000);
+        let heard: Vec<(UserId, u64)> = c.heard.into_iter().filter(|(_, ms)| *ms >= min).collect();
+        if heard.is_empty() {
+            return;
+        }
+        let library_id = hub::hub_library_id(&identity.state, &c.track.library_id).await;
+        let fingerprint = (*c.track).clone().into_contract().fingerprint;
+        for (user, ms) in heard {
+            let event = ListeningEvent {
+                event_id: Uuid::now_v7(),
+                fingerprint: fingerprint.clone(),
+                title: Some(c.track.title.clone()),
+                artist: Some(c.track.artist.clone()),
+                started_at: c.started_wall,
+                ms_played: ms.min(u32::MAX as u64) as u32,
+                duration_ms: duration.min(u32::MAX as u64) as u32,
+                source: PlaybackSource::OwnLibrary,
+                client_type: ClientType::Discord,
+                library_id,
+                room_id: None,
+                playlist_id: None,
+            };
+            if let Err(e) = crate::scrobble::enqueue_attributed(db, &event, user.get()).await {
+                tracing::warn!(error = %e, guild = %self.guild_id, "queueing a listener's play");
+            }
+        }
     }
 
     /// Called from the songbird event task when the track with `epoch` ended or errored.
@@ -1027,20 +1217,19 @@ impl GuildPlayer {
                 _ => None,
             }
         };
-        let Some(ended) = ended else { return };
+        let Some(mut ended) = ended else { return };
         if errored {
             tracing::warn!(guild = %self.guild_id, track = %ended.item.track.id, "track errored during playback");
         }
-        if let Ok(identity) = self.identity() {
-            if let Some(id) = ended.play_id {
-                let _ = settings::finish_play(&identity.state.db, id, ended.ms_played()).await;
-            }
-        }
+        let present = self.inner.lock().await.listeners.clone();
+        self.report(ended.conclude(&present)).await;
+        let mut stopped = false;
         let next = {
             let mut s = self.inner.lock().await;
             if s.stopping {
                 s.stopping = false;
                 s.skip_requested = false;
+                stopped = true;
                 None
             } else {
                 let repeat = s.loop_mode == LoopMode::Track
@@ -1064,6 +1253,10 @@ impl GuildPlayer {
                     s.queue.pop_front()
                 }
             }
+        };
+        let next = match next {
+            None if !stopped => self.autoplay_pick(Some(&ended.item.track)).await,
+            other => other,
         };
         match next {
             Some(item) => {
@@ -1093,16 +1286,12 @@ impl GuildPlayer {
     }
 
     async fn finish_current_play(&self) {
-        let (play_id, ms) = {
-            let s = self.inner.lock().await;
-            match s.current.as_ref() {
-                Some(c) => (c.play_id, c.ms_played()),
-                None => (None, 0),
-            }
+        let concluded = {
+            let mut s = self.inner.lock().await;
+            let present = s.listeners.clone();
+            s.current.as_mut().and_then(|c| c.conclude(&present))
         };
-        if let (Some(id), Ok(identity)) = (play_id, self.identity()) {
-            let _ = settings::finish_play(&identity.state.db, id, ms).await;
-        }
+        self.report(concluded).await;
     }
 
     async fn announce_error(&self, item: &QueueItem, err: &PlayerError) {
@@ -1329,6 +1518,7 @@ mod tests {
         let item = |id: &str, d: i64| QueueItem {
             track: row(id, d),
             requested_by: UserId::new(1),
+            autoplay: false,
         };
         let snap = PlayerSnapshot {
             bot_index: 0,
@@ -1344,6 +1534,7 @@ mod tests {
                 position_ms: 40_000,
                 paused: false,
                 cover: None,
+                links: None,
             }),
             queue: vec![item("a", 10_000), item("b", 20_000)],
             history: vec![],
@@ -1352,6 +1543,7 @@ mod tests {
             volume: 100,
             normalize: true,
             listeners: 0,
+            counting: Vec::new(),
         };
         assert_eq!(snap.queue_duration_ms(), 30_000);
         assert_eq!(snap.eta_ms(0), 60_000);

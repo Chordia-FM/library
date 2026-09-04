@@ -599,6 +599,69 @@ pub async fn record_play(
     Ok(id)
 }
 
+/// What one server played through the bot in a window, for `/stats`.
+pub struct GuildStats {
+    pub plays: i64,
+    pub ms: i64,
+    /// `(title, artist, plays)`, most played first.
+    pub top_tracks: Vec<(String, String, i64)>,
+    /// `(discord user id, plays)`, most first.
+    pub top_requesters: Vec<(String, i64)>,
+}
+
+pub async fn guild_stats(
+    db: &SqlitePool,
+    app_id: &str,
+    guild_id: &str,
+    since_ms: i64,
+    requested_by: Option<u64>,
+) -> AppResult<GuildStats> {
+    let who = requested_by.map(|u| u.to_string());
+    let (plays, ms): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COALESCE(SUM(ms_played), 0) FROM discord_plays \
+         WHERE app_id = ? AND guild_id = ? AND started_at >= ? \
+           AND (? IS NULL OR requested_by = ?)",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .bind(since_ms)
+    .bind(&who)
+    .bind(&who)
+    .fetch_one(db)
+    .await?;
+    let top_tracks: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT t.title, COALESCE(ar.name, ''), COUNT(*) AS n FROM discord_plays p \
+         JOIN tracks t ON t.id = p.track_id \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         WHERE p.app_id = ? AND p.guild_id = ? AND p.started_at >= ? \
+           AND (? IS NULL OR p.requested_by = ?) \
+         GROUP BY p.track_id ORDER BY n DESC, SUM(p.ms_played) DESC LIMIT 5",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .bind(since_ms)
+    .bind(&who)
+    .bind(&who)
+    .fetch_all(db)
+    .await?;
+    let top_requesters: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT requested_by, COUNT(*) AS n FROM discord_plays \
+         WHERE app_id = ? AND guild_id = ? AND started_at >= ? AND requested_by IS NOT NULL \
+         GROUP BY requested_by ORDER BY n DESC LIMIT 3",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .bind(since_ms)
+    .fetch_all(db)
+    .await?;
+    Ok(GuildStats {
+        plays,
+        ms,
+        top_tracks,
+        top_requesters,
+    })
+}
+
 pub async fn finish_play(db: &SqlitePool, play_id: i64, ms_played: u64) -> AppResult<()> {
     sqlx::query("UPDATE discord_plays SET ms_played = ? WHERE id = ?")
         .bind(ms_played as i64)

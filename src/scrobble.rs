@@ -1,18 +1,25 @@
 //! Scrobble buffering + forwarding (M5 / Phase A3).
 //!
-//! - **queue**    - a durable SQLite-backed queue (`pending_scrobbles`) of the owner's
-//!   `ListeningEvent`s. The library reports on its owner's behalf and buffers here whenever the Hub
-//!   is unreachable. Owner-scoped: events arrive via the management-token `POST /v1/scrobbles`
-//!   endpoint, so the Hub can safely attribute them to the server's owner.
-//! - **reporter** - a background loop that flushes batches to the Hub `POST /v1/scrobbles:ingest`
-//!   (server-API-key authed) with retry + backoff; the Hub dedupes on `event_id`, so a re-send
-//!   after a partial failure never double-counts. Rows are deleted only once the Hub acks.
+//! - **queue**    - a durable SQLite-backed queue (`pending_scrobbles`) of `ListeningEvent`s. The
+//!   owner's arrive via the management-token `POST /v1/scrobbles` endpoint, so the Hub can safely
+//!   attribute them to the server's owner. The Discord bot's arrive with the Discord id of the
+//!   listener who heard them ([`enqueue_attributed`]); the Hub decides at send time whether that
+//!   person is a Chordia user it may count them for.
+//! - **reporter** - a background loop that flushes batches to the Hub (`POST /v1/scrobbles:ingest`
+//!   for the owner's, `:ingest-attributed` for the bot's, both server-API-key authed) with retry +
+//!   backoff; the Hub dedupes on `event_id`, so a re-send after a partial failure never
+//!   double-counts. Rows are deleted only once the Hub acks, or once the Hub says the listener is
+//!   nobody it may count for.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use chordia_contracts::discord::{
+    AttributedEvent, AttributedScrobbleBatch, ResolveListenersRequest,
+};
 use chordia_contracts::scrobble::{ListeningEvent, ScrobbleBatch};
 use sqlx::SqlitePool;
+use std::collections::HashMap;
 use tracing::{info, warn};
 
 use crate::error::{AppError, AppResult};
@@ -48,11 +55,40 @@ pub async fn enqueue(db: &SqlitePool, event: &ListeningEvent) -> AppResult<()> {
     Ok(())
 }
 
-/// Oldest queued events (up to `BATCH_SIZE`), as `(event_id, event)`. Rows whose payload no longer
-/// parses against the current contract are dropped so they can't wedge the queue forever.
-async fn take_batch(db: &SqlitePool) -> AppResult<Vec<(String, ListeningEvent)>> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT event_id, payload FROM pending_scrobbles ORDER BY created_at LIMIT ?",
+/// Durably enqueue a play the Discord bot heard `discord_user_id` listen to.
+pub async fn enqueue_attributed(
+    db: &SqlitePool,
+    event: &ListeningEvent,
+    discord_user_id: u64,
+) -> AppResult<()> {
+    let payload = serde_json::to_string(event)
+        .map_err(|e| AppError::Internal(anyhow::anyhow!("serializing scrobble: {e}")))?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO pending_scrobbles (event_id, payload, created_at, discord_user_id) \
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(event.event_id.to_string())
+    .bind(payload)
+    .bind(now_millis())
+    .bind(discord_user_id.to_string())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+/// One queued row: the owner's when `discord_user_id` is absent, a listener's otherwise.
+struct Queued {
+    id: String,
+    event: ListeningEvent,
+    discord_user_id: Option<String>,
+}
+
+/// Oldest queued events (up to `BATCH_SIZE`). Rows whose payload no longer parses against the
+/// current contract are dropped so they can't wedge the queue forever.
+async fn take_batch(db: &SqlitePool) -> AppResult<Vec<Queued>> {
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT event_id, payload, discord_user_id FROM pending_scrobbles \
+         ORDER BY created_at LIMIT ?",
     )
     .bind(BATCH_SIZE)
     .fetch_all(db)
@@ -60,9 +96,13 @@ async fn take_batch(db: &SqlitePool) -> AppResult<Vec<(String, ListeningEvent)>>
 
     let mut out = Vec::with_capacity(rows.len());
     let mut poison = Vec::new();
-    for (id, payload) in rows {
+    for (id, payload, discord_user_id) in rows {
         match serde_json::from_str::<ListeningEvent>(&payload) {
-            Ok(ev) => out.push((id, ev)),
+            Ok(event) => out.push(Queued {
+                id,
+                event,
+                discord_user_id,
+            }),
             Err(e) => {
                 warn!(event_id = %id, error = %e, "dropping unparseable queued scrobble");
                 poison.push(id);
@@ -122,30 +162,95 @@ pub fn start_reporter(state: AppState) {
                 continue;
             }
 
-            let ids: Vec<String> = batch.iter().map(|(id, _)| id.clone()).collect();
-            let events: Vec<ListeningEvent> = batch.into_iter().map(|(_, ev)| ev).collect();
-            let payload = ScrobbleBatch { events };
+            let (owner, listened): (Vec<Queued>, Vec<Queued>) =
+                batch.into_iter().partition(|q| q.discord_user_id.is_none());
 
-            match hub.forward_scrobbles(&api_key, &payload).await {
-                Ok(()) => {
-                    let n = ids.len();
-                    if let Err(e) = delete_ids(&state.db, &ids).await {
-                        // The Hub already accepted them (and dedupes on event_id), so a re-send is
-                        // safe - but back off so a persistent DB error can't hot-loop.
-                        warn!(error = %e, "deleting forwarded scrobbles failed - backing off");
-                        tokio::time::sleep(Duration::from_secs(BACKOFF_SECS)).await;
-                    } else {
-                        info!(count = n, "forwarded scrobbles to Hub");
-                        // Loop immediately to drain any backlog; no sleep on a clean success.
+            let mut acked: Vec<String> = Vec::new();
+            let mut failed = false;
+            if !owner.is_empty() {
+                let ids: Vec<String> = owner.iter().map(|q| q.id.clone()).collect();
+                let payload = ScrobbleBatch {
+                    events: owner.into_iter().map(|q| q.event).collect(),
+                };
+                match hub.forward_scrobbles(&api_key, &payload).await {
+                    Ok(()) => acked.extend(ids),
+                    Err(e) => {
+                        warn!(error = %e, "forwarding scrobbles failed - retrying after backoff");
+                        failed = true;
                     }
                 }
-                Err(e) => {
-                    warn!(error = %e, "forwarding scrobbles failed - retrying after backoff");
-                    tokio::time::sleep(Duration::from_secs(BACKOFF_SECS)).await;
+            }
+            if !listened.is_empty() && !failed {
+                match forward_attributed(&hub, &api_key, listened).await {
+                    Ok(done) => acked.extend(done),
+                    Err(e) => {
+                        warn!(error = %e, "forwarding listeners' scrobbles failed - retrying after backoff");
+                        failed = true;
+                    }
                 }
+            }
+
+            let n = acked.len();
+            if let Err(e) = delete_ids(&state.db, &acked).await {
+                // The Hub already accepted them (and dedupes on event_id), so a re-send is safe -
+                // but back off so a persistent DB error can't hot-loop.
+                warn!(error = %e, "deleting forwarded scrobbles failed - backing off");
+                tokio::time::sleep(Duration::from_secs(BACKOFF_SECS)).await;
+            } else if failed {
+                tokio::time::sleep(Duration::from_secs(BACKOFF_SECS)).await;
+            } else if n > 0 {
+                info!(count = n, "forwarded scrobbles to Hub");
+                // Loop immediately to drain any backlog; no sleep on a clean success.
             }
         }
     });
+}
+
+/// Send the bot's plays: the listeners' Discord ids become Hub users through the Hub's own trust
+/// rule, and a play whose listener the Hub will not count for is done with (deleted, not resent).
+/// Returns the row ids that are finished either way.
+async fn forward_attributed(
+    hub: &HubClient,
+    api_key: &str,
+    rows: Vec<Queued>,
+) -> anyhow::Result<Vec<String>> {
+    let mut discord_ids: Vec<String> = rows
+        .iter()
+        .filter_map(|q| q.discord_user_id.clone())
+        .collect();
+    discord_ids.sort();
+    discord_ids.dedup();
+    let resolved = hub
+        .resolve_listeners(api_key, &ResolveListenersRequest { discord_ids })
+        .await?;
+    let users: HashMap<String, uuid::Uuid> = resolved
+        .listeners
+        .into_iter()
+        .map(|l| (l.discord_id, l.user_id))
+        .collect();
+
+    let mut done: Vec<String> = Vec::new();
+    let mut events: Vec<AttributedEvent> = Vec::new();
+    let mut sent_ids: Vec<String> = Vec::new();
+    for q in rows {
+        match q.discord_user_id.as_deref().and_then(|d| users.get(d)) {
+            Some(user_id) => {
+                sent_ids.push(q.id);
+                events.push(AttributedEvent {
+                    user_id: *user_id,
+                    event: q.event,
+                });
+            }
+            // Not a Chordia user this server may count for (or they opted out): nothing to keep.
+            None => done.push(q.id),
+        }
+    }
+    if !events.is_empty() {
+        hub.forward_attributed_scrobbles(api_key, &AttributedScrobbleBatch { events })
+            .await?;
+        done.extend(sent_ids);
+    }
+    Ok(done)
 }
 
 #[cfg(test)]
@@ -158,7 +263,7 @@ mod tests {
     async fn mem_db() -> SqlitePool {
         let db = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::query(
-            "CREATE TABLE pending_scrobbles (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL)",
+            "CREATE TABLE pending_scrobbles (event_id TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at INTEGER NOT NULL, discord_user_id TEXT)",
         )
         .execute(&db)
         .await
@@ -209,7 +314,26 @@ mod tests {
         delete_ids(&db, &[a.event_id.to_string()]).await.unwrap();
         let remaining = take_batch(&db).await.unwrap();
         assert_eq!(remaining.len(), 1);
-        assert_eq!(remaining[0].1.event_id, b.event_id);
+        assert_eq!(remaining[0].event.event_id, b.event_id);
+        assert!(remaining[0].discord_user_id.is_none(), "the owner's play");
+    }
+
+    #[tokio::test]
+    async fn a_listeners_play_keeps_who_heard_it() {
+        let db = mem_db().await;
+        let heard = event();
+        enqueue_attributed(&db, &heard, 424242).await.unwrap();
+        enqueue(&db, &event()).await.unwrap();
+        let batch = take_batch(&db).await.unwrap();
+        let theirs = batch
+            .iter()
+            .find(|q| q.event.event_id == heard.event_id)
+            .unwrap();
+        assert_eq!(theirs.discord_user_id.as_deref(), Some("424242"));
+        assert_eq!(
+            batch.iter().filter(|q| q.discord_user_id.is_none()).count(),
+            1
+        );
     }
 
     #[tokio::test]

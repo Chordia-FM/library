@@ -33,6 +33,23 @@ impl From<Option<PlayPosition>> for Position {
 pub struct Resolved {
     pub tracks: Vec<Arc<TrackRow>>,
     pub source: Option<String>,
+    /// Set when the query was an artist, so the toast can show their picture rather than the
+    /// first album's cover.
+    pub artist: Option<ArtistRef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArtistRef {
+    pub name_normalized: String,
+    pub mbid: Option<String>,
+}
+
+/// The artist's picture from the Hub, as a URL Discord can fetch, when the query was an artist
+/// the Hub knows.
+pub async fn art_for(state: &crate::http::AppState, resolved: &Resolved) -> Option<String> {
+    let a = resolved.artist.as_ref()?;
+    let art = crate::discord::hub::artist_art(state, &a.name_normalized, a.mbid.as_deref()).await?;
+    crate::discord::hub::absolute(state, art.image_url.as_deref()?)
 }
 
 /// How many tracks an artist hit queues at most.
@@ -50,6 +67,7 @@ pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResu
                 .into_iter()
                 .collect(),
             source: None,
+            artist: None,
         });
     }
     if let Some(id) = q.strip_prefix("al:") {
@@ -63,6 +81,7 @@ pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResu
         None => Ok(Resolved {
             tracks: Vec::new(),
             source: None,
+            artist: None,
         }),
         Some(hit) => resolve_hit(db, hit).await,
     }
@@ -77,6 +96,7 @@ pub async fn resolve_hit(db: &SqlitePool, hit: &SearchHit) -> AppResult<Resolved
                 .into_iter()
                 .collect(),
             source: None,
+            artist: None,
         }),
         HitKind::Album => resolve_album(db, &hit.id).await,
         HitKind::Artist => resolve_artist(db, &hit.id).await,
@@ -89,15 +109,32 @@ async fn resolve_album(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
     Ok(Resolved {
         tracks: tracks.into_iter().map(Arc::new).collect(),
         source,
+        artist: None,
     })
 }
 
 async fn resolve_artist(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
     let tracks = search::artist_tracks(db, id, ARTIST_CAP).await?;
     let source = tracks.first().map(|t| t.artist.clone());
+    let artist = match tracks.first() {
+        Some(t) => {
+            let mbid =
+                sqlx::query_scalar::<_, Option<String>>("SELECT mbid FROM artists WHERE id = ?")
+                    .bind(id)
+                    .fetch_optional(db)
+                    .await?
+                    .flatten();
+            Some(ArtistRef {
+                name_normalized: t.artist_norm.clone(),
+                mbid,
+            })
+        }
+        None => None,
+    };
     Ok(Resolved {
         tracks: tracks.into_iter().map(Arc::new).collect(),
         source,
+        artist,
     })
 }
 
@@ -187,15 +224,21 @@ async fn queue_resolved(
             .await;
         }
     }
+    // An artist's own picture beats the first album's cover, when the Hub has one.
+    let art_url = art_for(&identity.state, &resolved).await;
     let items: Vec<QueueItem> = resolved
         .tracks
         .into_iter()
         .map(|track| QueueItem {
             track,
             requested_by: ctx.author().id,
+            autoplay: false,
         })
         .collect();
-    let cover = Cover::load(&identity.state.db, &items[0].track).await;
+    let cover = match art_url {
+        Some(_) => None,
+        None => Cover::load(&identity.state.db, &items[0].track).await,
+    };
     let enq = player.enqueue(items.clone(), position).await?;
     let snap = player.snapshot().await;
     send::respond(
@@ -206,6 +249,7 @@ async fn queue_resolved(
             &enq,
             resolved.source.as_deref(),
             cover.as_ref(),
+            art_url.as_deref(),
         ),
     )
     .await
