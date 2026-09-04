@@ -54,8 +54,11 @@ async fn activity_text(identity: &Identity) -> String {
     fmt::ellipsize(text.trim(), ACTIVITY_MAX)
 }
 
-/// The one active guild's track through the template; nothing while nothing plays.
+/// The one active guild's track through the status whose turn it is; nothing while nothing plays.
 async fn single_text(identity: &Identity, settings: &BotSettings) -> Option<String> {
+    let list = &settings.single_statuses;
+    let slot = identity.status_slot(list.len(), settings.status_rotate_secs);
+    let template = list.get(slot)?;
     // The one active guild — or the first one playing, if the bot was invited to several.
     for player in identity.players() {
         let snap = player.snapshot().await;
@@ -69,7 +72,7 @@ async fn single_text(identity: &Identity, settings: &BotSettings) -> Option<Stri
         let t = &cur.item.track;
         let album = t.album.clone().unwrap_or_default();
         return Some(fmt::render_template(
-            &settings.presence_template,
+            template,
             &[
                 ("title", t.title.as_str()),
                 ("artist", t.artist.as_str()),

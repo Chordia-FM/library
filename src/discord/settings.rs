@@ -24,9 +24,14 @@ pub enum BotMode {
     #[default]
     Multi,
     /// One guild is the point. Presence follows that guild's now-playing, rendered through
-    /// [`BotSettings::presence_template`].
+    /// [`BotSettings::single_statuses`].
     Single,
 }
+
+/// What a single-server bot says until its owner writes their own statuses.
+pub const SINGLE_DEFAULT: &str = "{title} · {artist}";
+/// What a multi-server bot says until its owner writes their own statuses.
+pub const MULTI_DEFAULT: &str = "/play";
 
 /// The most statuses a multi-server bot rotates through.
 pub const MAX_STATUSES: usize = 20;
@@ -57,8 +62,9 @@ pub struct BotSettings {
     pub app_id: String,
     pub display_name: Option<String>,
     pub mode: BotMode,
-    /// Single-server mode: `{title} {artist} {album} {guild} {channel} {listeners}`.
-    pub presence_template: String,
+    /// Single-server mode: statuses shown in turn while a track plays, every
+    /// `status_rotate_secs`. Variables: `{title} {artist} {album} {guild} {channel} {listeners}`.
+    pub single_statuses: Vec<String>,
     /// Multi-server mode: statuses shown in turn, every `status_rotate_secs`. Variables:
     /// `{servers} {playing} {listeners} {tracks} {bot}`.
     pub multi_statuses: Vec<String>,
@@ -97,8 +103,8 @@ impl BotSettings {
             app_id: app_id.to_string(),
             display_name: None,
             mode: BotMode::Multi,
-            presence_template: "{title} · {artist}".to_string(),
-            multi_statuses: vec!["/play".to_string()],
+            single_statuses: vec![SINGLE_DEFAULT.to_string()],
+            multi_statuses: vec![MULTI_DEFAULT.to_string()],
             status_rotate_secs: 60,
             default_volume: 100,
             idle_timeout_secs: 300,
@@ -140,7 +146,7 @@ pub struct BotSettingsPatch {
     #[serde(default, deserialize_with = "double_option")]
     pub display_name: Option<Option<String>>,
     pub mode: Option<BotMode>,
-    pub presence_template: Option<String>,
+    pub single_statuses: Option<Vec<String>>,
     pub multi_statuses: Option<Vec<String>>,
     pub status_rotate_secs: Option<u32>,
     pub default_volume: Option<u8>,
@@ -171,21 +177,11 @@ impl BotSettingsPatch {
         if let Some(v) = self.mode {
             s.mode = v;
         }
-        if let Some(v) = self.presence_template {
-            s.presence_template = v;
+        if let Some(v) = self.single_statuses {
+            s.single_statuses = clean_statuses(v, SINGLE_DEFAULT);
         }
         if let Some(v) = self.multi_statuses {
-            let list: Vec<String> = v
-                .into_iter()
-                .map(|t| t.trim().chars().take(STATUS_MAX_CHARS).collect::<String>())
-                .filter(|t| !t.is_empty())
-                .take(MAX_STATUSES)
-                .collect();
-            s.multi_statuses = if list.is_empty() {
-                vec!["/play".to_string()]
-            } else {
-                list
-            };
+            s.multi_statuses = clean_statuses(v, MULTI_DEFAULT);
         }
         if let Some(v) = self.status_rotate_secs {
             s.status_rotate_secs = v.max(MIN_ROTATE_SECS);
@@ -218,12 +214,34 @@ impl BotSettingsPatch {
     }
 }
 
+/// Trimmed, capped in length and count, never empty: a bot with nothing to say says the default.
+fn clean_statuses(list: Vec<String>, default: &str) -> Vec<String> {
+    let list: Vec<String> = list
+        .into_iter()
+        .map(|t| t.trim().chars().take(STATUS_MAX_CHARS).collect::<String>())
+        .filter(|t| !t.is_empty())
+        .take(MAX_STATUSES)
+        .collect();
+    if list.is_empty() {
+        vec![default.to_string()]
+    } else {
+        list
+    }
+}
+
+fn parse_statuses(json: &str, default: &str) -> Vec<String> {
+    serde_json::from_str::<Vec<String>>(json)
+        .ok()
+        .filter(|l| !l.is_empty())
+        .unwrap_or_else(|| vec![default.to_string()])
+}
+
 #[derive(sqlx::FromRow)]
 struct BotRow {
     app_id: String,
     display_name: Option<String>,
     mode: String,
-    presence_template: String,
+    single_statuses: String,
     multi_statuses: String,
     status_rotate_secs: i64,
     default_volume: i64,
@@ -245,7 +263,7 @@ struct BotRow {
 
 pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
     let row = sqlx::query_as::<_, BotRow>(
-        "SELECT app_id, display_name, mode, presence_template, multi_statuses, \
+        "SELECT app_id, display_name, mode, single_statuses, multi_statuses, \
                 status_rotate_secs, default_volume, \
                 idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, emoji_hex, \
                 emoji_hex_applied, avatar_managed, avatar_hex_applied, avatar_custom_path, \
@@ -261,11 +279,8 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
             app_id: r.app_id,
             display_name: r.display_name,
             mode: BotMode::parse(&r.mode),
-            presence_template: r.presence_template,
-            multi_statuses: serde_json::from_str::<Vec<String>>(&r.multi_statuses)
-                .ok()
-                .filter(|l| !l.is_empty())
-                .unwrap_or_else(|| vec!["/play".to_string()]),
+            single_statuses: parse_statuses(&r.single_statuses, SINGLE_DEFAULT),
+            multi_statuses: parse_statuses(&r.multi_statuses, MULTI_DEFAULT),
             status_rotate_secs: (r.status_rotate_secs.max(0) as u32).max(MIN_ROTATE_SECS),
             default_volume: r.default_volume.clamp(0, 150) as u8,
             idle_timeout_secs: r.idle_timeout_secs.max(0) as u32,
@@ -292,9 +307,10 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
         .as_ref()
         .map(|l| serde_json::to_string(l).unwrap_or_else(|_| "[]".into()));
     let owners = serde_json::to_string(&s.owner_discord_ids).unwrap_or_else(|_| "[]".into());
+    let single = serde_json::to_string(&s.single_statuses).unwrap_or_else(|_| "[]".into());
     let statuses = serde_json::to_string(&s.multi_statuses).unwrap_or_else(|_| "[]".into());
     sqlx::query(
-        "INSERT INTO discord_bot_settings (app_id, display_name, mode, presence_template, \
+        "INSERT INTO discord_bot_settings (app_id, display_name, mode, single_statuses, \
              multi_statuses, status_rotate_secs, \
              default_volume, idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, \
              emoji_hex, emoji_hex_applied, avatar_managed, avatar_hex_applied, \
@@ -303,7 +319,7 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id) DO UPDATE SET \
              display_name = excluded.display_name, mode = excluded.mode, \
-             presence_template = excluded.presence_template, \
+             single_statuses = excluded.single_statuses, \
              multi_statuses = excluded.multi_statuses, \
              status_rotate_secs = excluded.status_rotate_secs, \
              default_volume = excluded.default_volume, \
@@ -322,7 +338,7 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     .bind(&s.app_id)
     .bind(&s.display_name)
     .bind(s.mode.as_str())
-    .bind(&s.presence_template)
+    .bind(single)
     .bind(statuses)
     .bind(s.status_rotate_secs as i64)
     .bind(s.default_volume as i64)
@@ -624,9 +640,11 @@ mod tests {
         p.apply(&mut s);
         assert_eq!(s.multi_statuses, vec!["/play", "{servers} servers"]);
         assert_eq!(s.status_rotate_secs, MIN_ROTATE_SECS);
-        let p: BotSettingsPatch = serde_json::from_str(r#"{"multi_statuses": []}"#).unwrap();
+        let p: BotSettingsPatch =
+            serde_json::from_str(r#"{"multi_statuses": [], "single_statuses": [" "]}"#).unwrap();
         p.apply(&mut s);
-        assert_eq!(s.multi_statuses, vec!["/play"]);
+        assert_eq!(s.multi_statuses, vec![MULTI_DEFAULT]);
+        assert_eq!(s.single_statuses, vec![SINGLE_DEFAULT]);
     }
 
     #[test]
