@@ -41,7 +41,7 @@ pub struct ThemeStatus {
 
 pub fn status(s: &BotSettings) -> ThemeStatus {
     let hex = desired_hex(s);
-    let emoji_applied = s.emoji_hex_applied.as_deref() == Some(hex.as_str());
+    let emoji_applied = s.emoji_hex_applied.as_deref() == Some(emoji::applied_stamp(&hex).as_str());
     let avatar_applied = if s.avatar_managed {
         s.avatar_hex_applied.as_deref() == Some(hex.as_str())
     } else {
@@ -88,17 +88,18 @@ pub async fn tick(identity: &Arc<Identity>) {
         return;
     }
     let hex = desired_hex(&s);
+    let stamp = emoji::applied_stamp(&hex);
     let rest = Rest::new(identity.state.http.clone(), identity.token.clone());
 
-    // Icons: list on every connect (cheap), rebuild only when the colour moved or something is
-    // missing.
-    if identity.icons().is_empty() || s.emoji_hex_applied.as_deref() != Some(hex.as_str()) {
-        let replace = s.emoji_hex_applied.as_deref() != Some(hex.as_str());
+    // Icons: list on every connect (cheap), rebuild only when the colour or the set version moved
+    // or something is missing.
+    if identity.icons().is_empty() || s.emoji_hex_applied.as_deref() != Some(stamp.as_str()) {
+        let replace = s.emoji_hex_applied.as_deref() != Some(stamp.as_str());
         match emoji::provision(&rest, &hex, replace).await {
             Ok(set) => {
                 tracing::info!(bot = identity.index, icons = set.len(), colour = %hex, replaced = replace, "application emojis ready");
                 identity.set_icons(Arc::new(set));
-                s.emoji_hex_applied = Some(hex.clone());
+                s.emoji_hex_applied = Some(stamp.clone());
                 s.theme_warning = None;
                 s.theme_retry_at = None;
                 s.theme_backoff = 0;
@@ -270,7 +271,7 @@ mod tests {
         assert_eq!(st.hex, DEFAULT_HEX);
         assert!(st.pending && !st.emoji_applied && !st.avatar_applied);
 
-        s.emoji_hex_applied = Some(DEFAULT_HEX.into());
+        s.emoji_hex_applied = Some(emoji::applied_stamp(DEFAULT_HEX));
         s.avatar_hex_applied = Some(DEFAULT_HEX.into());
         assert!(!status(&s).pending);
 

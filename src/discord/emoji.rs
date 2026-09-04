@@ -33,6 +33,14 @@ pub const DEFAULT_HEX: &str = "#f2258c";
 /// few kilobytes.
 const SIZE: u32 = 128;
 const NAME_PREFIX: &str = "cd_";
+/// Bumped whenever an existing emoji name changes meaning (a redrawn segment, say). It is part of
+/// the applied stamp, so a set made by an older build is regenerated rather than reused by name.
+pub const SET_VERSION: u32 = 2;
+
+/// What `emoji_hex_applied` records: the colour and the set version it was made with.
+pub fn applied_stamp(hex: &str) -> String {
+    format!("{hex}@v{SET_VERSION}")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
