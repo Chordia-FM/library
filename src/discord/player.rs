@@ -216,6 +216,8 @@ pub struct PlayerSnapshot {
     pub bot_index: u8,
     pub bot_name: String,
     pub icons: Arc<IconSet>,
+    /// The web client's origin when the library is paired to a Hub; views link into it.
+    pub web_base: Option<String>,
     pub guild_id: GuildId,
     pub voice_channel: Option<ChannelId>,
     pub voice_channel_name: Option<String>,
@@ -743,9 +745,13 @@ impl GuildPlayer {
     }
 
     pub async fn snapshot(&self) -> PlayerSnapshot {
+        let identity = self.identity.upgrade();
+        let web_base = match &identity {
+            Some(i) => i.web_base().await,
+            None => None,
+        };
         let (handle, mut snap) = {
             let s = self.inner.lock().await;
-            let identity = self.identity.upgrade();
             let (bot_index, bot_name) = match &identity {
                 Some(i) => (i.index, i.display_name_sync()),
                 None => (0, "Chordia".to_string()),
@@ -760,6 +766,7 @@ impl GuildPlayer {
                 bot_index,
                 bot_name,
                 icons,
+                web_base,
                 guild_id: self.guild_id,
                 voice_channel: s.voice_channel,
                 voice_channel_name,
@@ -850,6 +857,33 @@ impl GuildPlayer {
         }
     }
 
+    /// The gateway reported a channel edit. If it is the bot's channel and the bitrate moved, the
+    /// encoder and the badge follow immediately rather than at the next track.
+    pub async fn refresh_bitrate(&self, channel: ChannelId, kbps: Option<u32>) {
+        let Some(kbps) = kbps else { return };
+        {
+            let mut s = self.inner.lock().await;
+            if s.voice_channel != Some(channel) || s.bitrate_kbps == Some(kbps) {
+                return;
+            }
+            s.bitrate_kbps = Some(kbps);
+            if let Some(cur) = s.current.as_mut() {
+                cur.facts.opus_kbps = Some(kbps);
+            }
+        }
+        if let Some(call) = self
+            .identity()
+            .ok()
+            .and_then(|i| i.songbird())
+            .and_then(|sb| sb.get(self.guild_id))
+        {
+            call.lock()
+                .await
+                .set_bitrate(Bitrate::Bits((kbps * 1000) as i32));
+        }
+        self.controller_wake.notify_one();
+    }
+
     /// A message landed in the controller's channel; past a threshold the controller re-posts.
     pub async fn note_channel_message(&self, channel: ChannelId) {
         let mut s = self.inner.lock().await;
@@ -892,8 +926,15 @@ impl GuildPlayer {
             .map_err(|e| PlayerError::Source(e.to_string()))?;
         let seekable = !matches!(input, songbird::input::Input::Live(..));
         let cover = Cover::load(&identity.state.db, &item.track).await;
+        // The channel's bitrate can be changed while the bot sits in it; every track starts at the
+        // current value so the encoder (and the badge) follow it.
+        let voice = self.inner.lock().await.voice_channel;
+        let kbps = voice.and_then(|vc| identity.channel_bitrate_kbps(self.guild_id, vc));
         let handle = {
             let mut call = call.lock().await;
+            if let Some(k) = kbps {
+                call.set_bitrate(Bitrate::Bits((k * 1000) as i32));
+            }
             call.play_only_input(input)
         };
         let self_arc = self
@@ -903,6 +944,9 @@ impl GuildPlayer {
         let (epoch, listeners, guild_id, app_id) = {
             let mut s = self.inner.lock().await;
             s.epoch += 1;
+            if kbps.is_some() {
+                s.bitrate_kbps = kbps;
+            }
             facts.opus_kbps = s.bitrate_kbps;
             let volume = effective_volume(&s, &facts);
             let _ = handle.set_volume(volume);
@@ -1285,6 +1329,7 @@ mod tests {
             bot_index: 0,
             bot_name: "Chordia".into(),
             icons: Arc::new(IconSet::default()),
+            web_base: None,
             guild_id: GuildId::new(1),
             voice_channel: None,
             voice_channel_name: None,

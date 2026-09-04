@@ -7,7 +7,7 @@ use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::error::AppResult;
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -60,6 +60,19 @@ pub struct BotSettings {
     /// The colour the set on Discord was last generated in; differs from `emoji_hex` until the
     /// next (re)generation.
     pub emoji_hex_applied: Option<String>,
+    /// The avatar is the Chordia mark in the accent, kept in step with `emoji_hex`. Off once the
+    /// owner uploads their own image; nothing touches the avatar again until it is turned back on.
+    pub avatar_managed: bool,
+    pub avatar_hex_applied: Option<String>,
+    /// The owner's own avatar file (under `data_dir/discord/`), and whether Discord has it yet.
+    pub avatar_custom_path: Option<String>,
+    pub avatar_custom_applied: bool,
+    /// Epoch millis before which no theme request may go out (from a 429's retry_after).
+    pub theme_retry_at: Option<i64>,
+    /// What the dashboard shows while a change is waiting or was refused.
+    pub theme_warning: Option<String>,
+    /// Consecutive rate limits; widens the margin added to the next retry.
+    pub theme_backoff: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commands_hash: Option<String>,
 }
@@ -78,6 +91,13 @@ impl BotSettings {
             vc_status: true,
             emoji_hex: None,
             emoji_hex_applied: None,
+            avatar_managed: true,
+            avatar_hex_applied: None,
+            avatar_custom_path: None,
+            avatar_custom_applied: false,
+            theme_retry_at: None,
+            theme_warning: None,
+            theme_backoff: 0,
             commands_hash: None,
         }
     }
@@ -113,6 +133,7 @@ pub struct BotSettingsPatch {
     pub vc_status: Option<bool>,
     #[serde(default, deserialize_with = "double_option")]
     pub emoji_hex: Option<Option<String>>,
+    pub avatar_managed: Option<bool>,
 }
 
 /// `null` clears, absent leaves alone: the standard serde trick for a nullable patch field.
@@ -153,6 +174,13 @@ impl BotSettingsPatch {
         if let Some(v) = self.emoji_hex {
             s.emoji_hex = v.and_then(|h| crate::discord::emoji::normalize_hex(&h));
         }
+        if let Some(v) = self.avatar_managed {
+            if v && !s.avatar_managed {
+                // Back to the mark: forget what was applied so the job re-uploads it.
+                s.avatar_hex_applied = None;
+            }
+            s.avatar_managed = v;
+        }
     }
 }
 
@@ -169,6 +197,13 @@ struct BotRow {
     vc_status: i64,
     emoji_hex: Option<String>,
     emoji_hex_applied: Option<String>,
+    avatar_managed: i64,
+    avatar_hex_applied: Option<String>,
+    avatar_custom_path: Option<String>,
+    avatar_custom_applied: i64,
+    theme_retry_at: Option<i64>,
+    theme_warning: Option<String>,
+    theme_backoff: i64,
     commands_hash: Option<String>,
 }
 
@@ -176,7 +211,8 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
     let row = sqlx::query_as::<_, BotRow>(
         "SELECT app_id, display_name, mode, presence_template, default_volume, \
                 idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, emoji_hex, \
-                emoji_hex_applied, commands_hash \
+                emoji_hex_applied, avatar_managed, avatar_hex_applied, avatar_custom_path, \
+                avatar_custom_applied, theme_retry_at, theme_warning, theme_backoff, commands_hash \
          FROM discord_bot_settings WHERE app_id = ?",
     )
     .bind(app_id)
@@ -196,6 +232,13 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
             vc_status: r.vc_status != 0,
             emoji_hex: r.emoji_hex,
             emoji_hex_applied: r.emoji_hex_applied,
+            avatar_managed: r.avatar_managed != 0,
+            avatar_hex_applied: r.avatar_hex_applied,
+            avatar_custom_path: r.avatar_custom_path,
+            avatar_custom_applied: r.avatar_custom_applied != 0,
+            theme_retry_at: r.theme_retry_at,
+            theme_warning: r.theme_warning,
+            theme_backoff: r.theme_backoff.max(0) as u32,
             commands_hash: r.commands_hash,
         },
     })
@@ -210,8 +253,10 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO discord_bot_settings (app_id, display_name, mode, presence_template, \
              default_volume, idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, \
-             emoji_hex, emoji_hex_applied, commands_hash, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             emoji_hex, emoji_hex_applied, avatar_managed, avatar_hex_applied, \
+             avatar_custom_path, avatar_custom_applied, theme_retry_at, theme_warning, \
+             theme_backoff, commands_hash, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id) DO UPDATE SET \
              display_name = excluded.display_name, mode = excluded.mode, \
              presence_template = excluded.presence_template, \
@@ -220,6 +265,12 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
              allowed_guilds = excluded.allowed_guilds, \
              owner_discord_ids = excluded.owner_discord_ids, vc_status = excluded.vc_status, \
              emoji_hex = excluded.emoji_hex, emoji_hex_applied = excluded.emoji_hex_applied, \
+             avatar_managed = excluded.avatar_managed, \
+             avatar_hex_applied = excluded.avatar_hex_applied, \
+             avatar_custom_path = excluded.avatar_custom_path, \
+             avatar_custom_applied = excluded.avatar_custom_applied, \
+             theme_retry_at = excluded.theme_retry_at, theme_warning = excluded.theme_warning, \
+             theme_backoff = excluded.theme_backoff, \
              commands_hash = excluded.commands_hash, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
@@ -233,6 +284,13 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     .bind(s.vc_status as i64)
     .bind(&s.emoji_hex)
     .bind(&s.emoji_hex_applied)
+    .bind(s.avatar_managed as i64)
+    .bind(&s.avatar_hex_applied)
+    .bind(&s.avatar_custom_path)
+    .bind(s.avatar_custom_applied as i64)
+    .bind(s.theme_retry_at)
+    .bind(&s.theme_warning)
+    .bind(s.theme_backoff as i64)
     .bind(&s.commands_hash)
     .bind(now_ms())
     .execute(db)

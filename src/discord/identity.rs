@@ -84,6 +84,9 @@ pub struct Identity {
     /// The bot's application emojis, resolved on connect; empty until then (views fall back to
     /// Unicode glyphs).
     icons: RwLock<Arc<IconSet>>,
+    /// Held while the theme job (emoji set + avatar) runs, so a ticker beat and a dashboard request
+    /// never race each other into Discord's rate limits.
+    pub(crate) theme_lock: tokio::sync::Mutex<()>,
 }
 
 impl Identity {
@@ -115,6 +118,7 @@ impl Identity {
             last_activity: Mutex::new(None),
             last_vc_status: Mutex::new(HashMap::new()),
             icons: RwLock::new(Arc::new(IconSet::default())),
+            theme_lock: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -312,6 +316,19 @@ impl Identity {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// The web client to link to, when there is one: the library must be paired to a Hub and
+    /// publishing its catalog there, otherwise the pages a link would open do not exist.
+    pub async fn web_base(&self) -> Option<String> {
+        if self.state.config.metadata_storage != crate::config::MetadataStorage::Hub {
+            return None;
+        }
+        if self.state.credentials.read().await.is_none() {
+            return None;
+        }
+        let base = self.state.config.frontend_url.trim_end_matches('/');
+        (!base.is_empty()).then(|| base.to_string())
     }
 
     // ---- cache lookups -----------------------------------------------------------------------------

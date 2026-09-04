@@ -2,8 +2,9 @@
 //!
 //! ## Visual language
 //!
-//! - **One container per message**, with an accent that means something: brand while playing,
-//!   grey when paused/idle, red for an error, yellow for a notice. Nothing else.
+//! - **One container per message**, with an accent that means something: the bot's colour (the
+//!   icon colour, pink by default) while playing, grey when paused/idle, red for an error, yellow
+//!   for a notice. Nothing else.
 //! - **Header line** `### <icon> Title`, optionally a `-# subtitle`, then a divider. Body. A wide
 //!   gap before the button rows.
 //! - **Icons** come from the bot's own application emoji set ([`crate::discord::emoji`]): Phosphor
@@ -11,11 +12,14 @@
 //!   glyphs, so nothing depends on it.
 //! - **Typography by markdown**: title `**bold**`, artist plain, album `*italic*`, meta `-# small`.
 //!   Never a heading below `###`. Every piece of user data goes through [`fmt::escape_md`].
-//!   Separators are middle dots, never dashes.
+//!   Separators are middle dots, never dashes. Channels are mentions, so they are clickable.
+//! - **Links**: when the library is paired to a Hub, titles, artists and albums link to the web
+//!   client, so a listener can open what they hear.
 //! - **Art**: when a track has cover art it sits beside the title as a section thumbnail, on the
 //!   controller and on the queued toast alike.
-//! - **Buttons**: one Primary per view (the main thing), Secondary for the rest, Danger only for
-//!   destructive. At most five per row.
+//! - **Buttons** are all the neutral grey style: Discord's blue and red fight the accent colour.
+//!   State lives in the icon and the label (play shows a pause icon while playing; the loop and
+//!   autoplay buttons say what they are set to). At most five per row.
 //! - **Ephemeral** for anything only the asker cares about (errors, notices, search results, the
 //!   queue). Public for the controller, the queued toast and the goodbye.
 //!
@@ -31,7 +35,7 @@ use super::v2::{
     Emoji, Media, Message, SelectOption, Spacing,
 };
 use crate::catalog::TrackRow;
-use crate::discord::emoji::{Icon, IconSet};
+use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
 use crate::discord::player::{Cover, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem};
 use crate::search::{HitKind, SearchHit};
 
@@ -51,25 +55,43 @@ fn header(icon: &Emoji, title: &str, subtitle: Option<&str>) -> Vec<Component> {
     vec![text(line), separator(true, Spacing::Small)]
 }
 
+/// Escaped text, linked to a web-client search for `query` when the library has a web client to
+/// link to.
+fn linked(text: &str, web: Option<&str>, query: &str) -> String {
+    let shown = fmt::escape_md(text);
+    match web {
+        Some(base) if !query.trim().is_empty() => {
+            format!("[{shown}]({base}/app/search?q={})", fmt::urlencode(query))
+        }
+        _ => shown,
+    }
+}
+
 /// `**Title** · Artist`, one line.
-fn title_line(t: &TrackRow) -> String {
-    let mut s = format!("**{}**", fmt::escape_md(&t.title));
+fn title_line(t: &TrackRow, web: Option<&str>) -> String {
+    let mut s = format!(
+        "**{}**",
+        linked(&t.title, web, &format!("{} {}", t.title, t.artist))
+    );
     if !t.artist.is_empty() {
         s.push_str(" · ");
-        s.push_str(&fmt::escape_md(&t.artist));
+        s.push_str(&linked(&t.artist, web, &t.artist));
     }
     s
 }
 
 /// `**Title**` over `Artist · *Album*`.
-fn track_block(t: &TrackRow) -> String {
+fn track_block(t: &TrackRow, web: Option<&str>) -> String {
     let mut s = format!(
         "**{}**\n{}",
-        fmt::escape_md(&t.title),
-        fmt::escape_md(&t.artist)
+        linked(&t.title, web, &format!("{} {}", t.title, t.artist)),
+        linked(&t.artist, web, &t.artist)
     );
     if let Some(album) = t.album.as_deref().filter(|a| !a.is_empty()) {
-        s.push_str(&format!(" · *{}*", fmt::escape_md(album)));
+        s.push_str(&format!(
+            " · *{}*",
+            linked(album, web, &format!("{album} {}", t.artist))
+        ));
     }
     s
 }
@@ -82,19 +104,13 @@ fn id(snap: &PlayerSnapshot, action: Action) -> String {
     CustomId::new(snap.bot_index, snap.guild_id.get(), action).to_string()
 }
 
-fn btn(snap: &PlayerSnapshot, style: ButtonStyle, action: Action, icon: Icon) -> Component {
-    button(Button::new(style, id(snap, action)).emoji(snap.icons.get(icon)))
+fn btn(snap: &PlayerSnapshot, action: Action, icon: Icon) -> Component {
+    button(Button::new(ButtonStyle::Secondary, id(snap, action)).emoji(snap.icons.get(icon)))
 }
 
-fn btn_labeled(
-    snap: &PlayerSnapshot,
-    style: ButtonStyle,
-    action: Action,
-    icon: Icon,
-    label: &str,
-) -> Component {
+fn btn_labeled(snap: &PlayerSnapshot, action: Action, icon: Icon, label: &str) -> Component {
     button(
-        Button::new(style, id(snap, action))
+        Button::new(ButtonStyle::Secondary, id(snap, action))
             .emoji(snap.icons.get(icon))
             .label(label),
     )
@@ -123,6 +139,49 @@ fn carry_cover(msg: Message, cover: Option<&Cover>, reuse: bool) -> Message {
     }
 }
 
+/// How many segments the progress bar has. Twelve emojis at Discord's inline size is about the
+/// width of the title line; more and the row wraps on a phone.
+pub const PROGRESS_CELLS: usize = 12;
+
+/// The progress bar as a row of bar-segment emojis (or their text fallbacks), then the times.
+fn progress_row(icons: &IconSet, position_ms: u64, duration_ms: u64) -> String {
+    let cells = fmt::progress_cells(position_ms, duration_ms, PROGRESS_CELLS);
+    let last = cells.len() - 1;
+    let bar: String = cells
+        .iter()
+        .enumerate()
+        .map(|(i, seg)| {
+            let cap = match i {
+                0 => Cap::Left,
+                n if n == last => Cap::Right,
+                _ => Cap::Middle,
+            };
+            let state = match seg {
+                fmt::Segment::Empty => BarState::Empty,
+                fmt::Segment::HalfDot => BarState::HalfDot,
+                fmt::Segment::Full => BarState::Full,
+                fmt::Segment::FullDot => BarState::FullDot,
+            };
+            icons.get(Icon::bar(cap, state)).markup()
+        })
+        .collect();
+    format!(
+        "{bar} {} / {}",
+        fmt::duration(position_ms.min(duration_ms)),
+        fmt::duration(duration_ms)
+    )
+}
+
+/// "in 🎧 #channel" as a real channel mention when the id is known.
+fn where_line(snap: &PlayerSnapshot) -> String {
+    let icon = snap.icons.get(Icon::Listening).markup();
+    match (snap.voice_channel, &snap.voice_channel_name) {
+        (Some(ch), _) => format!("in {icon} <#{}>", ch.get()),
+        (None, Some(name)) => format!("in {icon} {}", fmt::escape_md(name)),
+        (None, None) => snap.bot_name.clone(),
+    }
+}
+
 // ---- controller ----------------------------------------------------------------------------------
 
 /// The now-playing controller: the one public message per guild that is edited in place.
@@ -134,38 +193,25 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
         return idle(snap);
     };
     let icons = &snap.icons;
+    let web = snap.web_base.as_deref();
     let t = &cur.item.track;
     let (icon, title, color) = if cur.paused {
         (Icon::Pause, "Paused", accent::PAUSED)
     } else {
-        (Icon::Play, "Now playing", accent::BRAND)
-    };
-    let subtitle = match &snap.voice_channel_name {
-        Some(ch) => format!(
-            "in {} {}",
-            icons.get(Icon::Listening).markup(),
-            fmt::escape_md(ch)
-        ),
-        None => snap.bot_name.clone(),
+        (Icon::Play, "Now playing", icons.accent())
     };
     let mut meta = vec![format!("Requested by {}", mention(cur.item.requested_by))];
     meta.push(match snap.queue.len() {
         0 => "queue empty".to_string(),
         n => format!("{n} in queue"),
     });
-    if snap.loop_mode != LoopMode::Off {
-        meta.push(format!("loop: {}", snap.loop_mode.label()));
-    }
-    if snap.autoplay {
-        meta.push("autoplay on".into());
-    }
     if snap.volume != 100 {
         meta.push(format!("vol {}%", snap.volume));
     }
-    let mut body = header(&icons.get(icon), title, Some(&subtitle));
+    let mut body = header(&icons.get(icon), title, Some(&where_line(snap)));
     body.extend(with_art(
         vec![
-            text(track_block(t)),
+            text(track_block(t, web)),
             text(small(fmt::badges(&cur.facts).join(" · "))),
         ],
         cur.cover.as_ref(),
@@ -173,61 +219,42 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
     body.push(separator(false, Spacing::Small));
     body.push(text(format!(
         "{}\n{}",
-        fmt::progress_line(cur.position_ms, t.duration_ms.max(0) as u64),
+        progress_row(icons, cur.position_ms, t.duration_ms.max(0) as u64),
         small(meta.join(" · "))
     )));
     body.push(separator(false, Spacing::Large));
+    // The play/pause button shows what pressing it will do.
+    let play_icon = if cur.paused { Icon::Play } else { Icon::Pause };
     body.push(row(vec![
-        btn(snap, ButtonStyle::Secondary, Action::Previous, Icon::Prev),
-        btn(
-            snap,
-            ButtonStyle::Primary,
-            Action::PlayPause,
-            Icon::PlayPause,
-        ),
-        btn(snap, ButtonStyle::Secondary, Action::Skip, Icon::Next),
-        btn(snap, ButtonStyle::Danger, Action::Stop, Icon::Stop),
-        btn(snap, ButtonStyle::Secondary, Action::Shuffle, Icon::Shuffle),
+        btn(snap, Action::Previous, Icon::Prev),
+        btn(snap, Action::PlayPause, play_icon),
+        btn(snap, Action::Skip, Icon::Next),
+        btn(snap, Action::Stop, Icon::Stop),
+        btn(snap, Action::Shuffle, Icon::Shuffle),
     ]));
     let loop_icon = match snap.loop_mode {
         LoopMode::Track => Icon::LoopTrack,
         _ => Icon::LoopQueue,
     };
-    let on = |b: bool| {
-        if b {
-            ButtonStyle::Primary
-        } else {
-            ButtonStyle::Secondary
-        }
-    };
     body.push(row(vec![
         btn_labeled(
             snap,
-            on(snap.loop_mode != LoopMode::Off),
             Action::LoopCycle,
             loop_icon,
             &format!("Loop: {}", snap.loop_mode.label()),
         ),
-        btn(
-            snap,
-            ButtonStyle::Secondary,
-            Action::VolumeDown,
-            Icon::VolumeDown,
-        ),
-        btn(snap, ButtonStyle::Secondary, Action::VolumeUp, Icon::Volume),
+        btn(snap, Action::VolumeDown, Icon::VolumeDown),
+        btn(snap, Action::VolumeUp, Icon::Volume),
+        btn_labeled(snap, Action::QueueOpen, Icon::Queue, "Queue"),
         btn_labeled(
             snap,
-            ButtonStyle::Secondary,
-            Action::QueueOpen,
-            Icon::Queue,
-            "Queue",
-        ),
-        btn_labeled(
-            snap,
-            on(snap.autoplay),
             Action::AutoplayToggle,
             Icon::Radio,
-            "Autoplay",
+            if snap.autoplay {
+                "Autoplay: on"
+            } else {
+                "Autoplay: off"
+            },
         ),
     ]));
     carry_cover(
@@ -242,7 +269,7 @@ pub fn idle(snap: &PlayerSnapshot) -> Message {
     let mut body = header(
         &snap.icons.get(Icon::Note),
         "Nothing playing",
-        Some(&snap.bot_name),
+        Some(&where_line(snap)),
     );
     body.push(text(small("The queue is empty. `/play` something.")));
     Message::new(vec![container(accent::PAUSED, body)])
@@ -280,6 +307,8 @@ pub fn queued(
     let Some(first) = items.first() else {
         return notice(&snap.icons, "Nothing added", "No tracks matched.");
     };
+    let icons = &snap.icons;
+    let web = snap.web_base.as_deref();
     let by = mention(first.requested_by);
     let (icon, title, line, meta) = if enq.count > 1 {
         let total_ms: u64 = items
@@ -287,7 +316,7 @@ pub fn queued(
             .map(|i| i.track.duration_ms.max(0) as u64)
             .sum();
         let what = source
-            .map(|s| format!("**{}**", fmt::escape_md(s)))
+            .map(|s| format!("**{}**", linked(s, web, s)))
             .unwrap_or_else(|| fmt::count(enq.count, "track"));
         let position = if enq.position == 0 {
             "playing now".to_string()
@@ -304,7 +333,7 @@ pub fn queued(
         (
             Icon::Play,
             "Playing now".to_string(),
-            track_block(&first.track),
+            track_block(&first.track, web),
             format!("by {by}"),
         )
     } else {
@@ -312,7 +341,7 @@ pub fn queued(
         (
             Icon::Note,
             "Added to queue".to_string(),
-            track_block(&first.track),
+            track_block(&first.track, web),
             format!(
                 "#{} · plays in ~{} · by {by}",
                 enq.position,
@@ -326,15 +355,16 @@ pub fn queued(
         cover,
     ));
     carry_cover(
-        Message::new(vec![container(accent::BRAND, body)]),
+        Message::new(vec![container(icons.accent(), body)]),
         cover,
         false,
     )
 }
 
-/// One page of the queue (0-based), with paging buttons.
+/// One page of the queue (0-based, clamped), with paging buttons.
 pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
     let icons = &snap.icons;
+    let web = snap.web_base.as_deref();
     let total = snap.queue.len();
     let pages = total.div_ceil(QUEUE_PAGE_SIZE).max(1);
     let page = page.min(pages - 1);
@@ -354,7 +384,7 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
             icons
                 .get(if cur.paused { Icon::Pause } else { Icon::Play })
                 .markup(),
-            title_line(&cur.item.track),
+            title_line(&cur.item.track, web),
             fmt::duration(cur.position_ms)
         ))),
         None => body.push(text(small("Nothing playing"))),
@@ -373,7 +403,7 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
                 format!(
                     "`{:>2}.` {} · {} · {}",
                     i + 1,
-                    title_line(&item.track),
+                    title_line(&item.track, web),
                     fmt::duration(item.track.duration_ms.max(0) as u64),
                     mention(item.requested_by)
                 )
@@ -385,9 +415,11 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
     if pages > 1 {
         body.push(separator(false, Spacing::Large));
         let last = pages - 1;
+        // Every button carries a distinct custom id even at the edges (Discord refuses a message
+        // that repeats one), which is why first/last are their own actions.
         body.push(row(vec![
             button(
-                Button::new(ButtonStyle::Secondary, id(snap, Action::Queue(0)))
+                Button::new(ButtonStyle::Secondary, id(snap, Action::QueueFirst))
                     .emoji(icons.get(Icon::Prev))
                     .disabled(page == 0),
             ),
@@ -407,24 +439,26 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
             button(
                 Button::new(
                     ButtonStyle::Secondary,
-                    id(snap, Action::Queue((page + 1) as u32)),
+                    id(snap, Action::Queue((page + 1).min(last) as u32)),
                 )
                 .label("Next")
                 .disabled(page >= last),
             ),
             button(
-                Button::new(ButtonStyle::Secondary, id(snap, Action::Queue(last as u32)))
+                Button::new(ButtonStyle::Secondary, id(snap, Action::QueueLast))
                     .emoji(icons.get(Icon::Next))
                     .disabled(page >= last),
             ),
         ]));
     }
-    Message::new(vec![container(accent::BRAND, body)]).ephemeral()
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
 /// Recently played, newest first.
 pub fn history(snap: &PlayerSnapshot) -> Message {
-    let mut body = header(&snap.icons.get(Icon::List), "History", Some(&snap.bot_name));
+    let icons = &snap.icons;
+    let web = snap.web_base.as_deref();
+    let mut body = header(&icons.get(Icon::List), "History", Some(&snap.bot_name));
     if snap.history.is_empty() {
         body.push(text(small("Nothing has played yet.")));
     } else {
@@ -436,7 +470,7 @@ pub fn history(snap: &PlayerSnapshot) -> Message {
             .map(|item| {
                 format!(
                     "{} · {} · {}",
-                    title_line(&item.track),
+                    title_line(&item.track, web),
                     fmt::duration(item.track.duration_ms.max(0) as u64),
                     mention(item.requested_by)
                 )
@@ -444,7 +478,7 @@ pub fn history(snap: &PlayerSnapshot) -> Message {
             .collect();
         body.push(text(lines.join("\n")));
     }
-    Message::new(vec![container(accent::BRAND, body)]).ephemeral()
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
 /// Search results with a picker. Option values are `t:<id>` / `al:<id>` / `ar:<id>`, the same
@@ -541,7 +575,7 @@ pub fn search_results(
     body.push(row(vec![button(
         Button::new(ButtonStyle::Secondary, cid(Action::Cancel)).label("Cancel"),
     )]));
-    Message::new(vec![container(accent::BRAND, body)]).ephemeral()
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
 // ---- status & feedback -----------------------------------------------------------------------------
@@ -558,27 +592,34 @@ pub fn notice(icons: &IconSet, title: &str, detail: &str) -> Message {
     Message::new(vec![container(accent::NOTICE, body)]).ephemeral()
 }
 
-/// A short, positive acknowledgement ("Skipped **Title**").
+/// A short, positive acknowledgement ("Skipped **Title**"). With no detail it is the title line
+/// alone: a divider with nothing under it reads as a mistake.
 pub fn ok(icons: &IconSet, title: &str, detail: &str) -> Message {
-    let mut body = header(&icons.get(Icon::Check), title, None);
-    if !detail.is_empty() {
-        body.push(text(detail.to_string()));
-    }
-    Message::new(vec![container(accent::BRAND, body)]).ephemeral()
+    let body = if detail.is_empty() {
+        vec![text(format!(
+            "### {} {title}",
+            icons.get(Icon::Check).markup()
+        ))]
+    } else {
+        let mut b = header(&icons.get(Icon::Check), title, None);
+        b.push(text(detail.to_string()));
+        b
+    };
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
 /// The bot is busy in another channel of this guild; name the siblings that are free.
 pub fn busy(
     icons: &IconSet,
     bot_name: &str,
-    channel_name: &str,
+    channel: serenity::all::ChannelId,
     listeners: usize,
     free: &[String],
 ) -> Message {
     let mut detail = format!(
-        "**{}** is in **#{}** with {}.",
+        "**{}** is in <#{}> with {}.",
         fmt::escape_md(bot_name),
-        fmt::escape_md(channel_name),
+        channel.get(),
         fmt::count(listeners, "listener")
     );
     match free.len() {
@@ -611,7 +652,7 @@ pub fn cancelled() -> Message {
 pub struct BotLine {
     pub name: String,
     pub online: bool,
-    pub playing_in: Option<String>,
+    pub playing_in: Option<serenity::all::ChannelId>,
     pub listeners: usize,
 }
 
@@ -627,10 +668,10 @@ pub fn bots(icons: &IconSet, lines: &[BotLine]) -> Message {
             let state = if !b.online {
                 "offline".to_string()
             } else {
-                match &b.playing_in {
+                match b.playing_in {
                     Some(ch) => format!(
-                        "playing in **#{}** · {}",
-                        fmt::escape_md(ch),
+                        "playing in <#{}> · {}",
+                        ch.get(),
                         fmt::count(b.listeners, "listener")
                     ),
                     None => "free".to_string(),
@@ -640,7 +681,7 @@ pub fn bots(icons: &IconSet, lines: &[BotLine]) -> Message {
         })
         .collect();
     body.push(text(rows.join("\n")));
-    Message::new(vec![container(accent::BRAND, body)]).ephemeral()
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
 #[cfg(test)]
@@ -648,7 +689,7 @@ mod tests {
     use super::*;
     use crate::discord::player::CurrentSnapshot;
     use crate::discord::source::TrackFacts;
-    use serenity::all::GuildId;
+    use serenity::all::{ChannelId, GuildId};
     use std::sync::Arc;
 
     fn track(id: &str, title: &str) -> Arc<TrackRow> {
@@ -703,8 +744,9 @@ mod tests {
             bot_index: 1,
             bot_name: "Chordia 2".into(),
             icons: Arc::new(IconSet::default()),
+            web_base: None,
             guild_id: GuildId::new(777),
-            voice_channel: None,
+            voice_channel: Some(ChannelId::new(555)),
             voice_channel_name: Some("music".into()),
             current: playing.then(|| CurrentSnapshot {
                 item: item("c", "One More Time"),
@@ -774,15 +816,22 @@ mod tests {
             error(&icons, "Couldn't do that", "reason"),
             notice(&icons, "Heads up", "detail"),
             ok(&icons, "Skipped", "**x**"),
-            busy(&icons, "Chordia", "music", 3, &["Chordia 2".into()]),
-            busy(&icons, "Chordia", "music", 3, &[]),
+            ok(&icons, "Left", ""),
+            busy(
+                &icons,
+                "Chordia",
+                ChannelId::new(555),
+                3,
+                &["Chordia 2".into()],
+            ),
+            busy(&icons, "Chordia", ChannelId::new(555), 3, &[]),
             cancelled(),
             bots(
                 &icons,
                 &[BotLine {
                     name: "Chordia".into(),
                     online: true,
-                    playing_in: Some("music".into()),
+                    playing_in: Some(ChannelId::new(555)),
                     listeners: 2,
                 }],
             ),
@@ -832,7 +881,7 @@ mod tests {
         assert_eq!(kids.len(), 8);
         let head = kids[0]["content"].as_str().unwrap();
         assert!(head.starts_with("### ▶ Now playing"), "{head}");
-        assert!(head.contains("in 🎧 music"), "{head}");
+        assert!(head.contains("in 🎧 <#555>"), "{head}");
         assert_eq!(kids[2]["type"], 9);
         assert_eq!(kids[2]["accessory"]["type"], 11);
         assert_eq!(
@@ -844,21 +893,20 @@ mod tests {
         assert!(badges.contains("Opus 96k"));
         let progress = kids[4]["content"].as_str().unwrap();
         assert!(progress.contains("1:05 / 5:20"));
-        assert!(progress.contains('●'));
+        // Without the emoji set the bar is its text fallback: 12 cells, playhead a fifth in.
+        assert!(progress.starts_with("━━●─────────"), "{progress}");
         assert!(progress.contains("3 in queue"));
-        assert_eq!(kids[6]["components"].as_array().unwrap().len(), 5);
-        assert_eq!(kids[7]["components"].as_array().unwrap().len(), 5);
-        // Exactly one Primary in the first row (play/pause).
-        let primaries = kids[6]["components"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|b| b["style"] == 1)
-            .count();
-        assert_eq!(primaries, 1);
-        assert_eq!(kids[6]["components"][1]["custom_id"], "cd:1:1:777:pl");
-        // Without an emoji set the buttons carry Unicode glyphs.
-        assert_eq!(kids[6]["components"][1]["emoji"]["name"], "⏯");
+        let row1 = kids[6]["components"].as_array().unwrap();
+        let row2 = kids[7]["components"].as_array().unwrap();
+        assert_eq!(row1.len(), 5);
+        assert_eq!(row2.len(), 5);
+        // Every button is the neutral style; state lives in icons and labels.
+        assert!(row1.iter().chain(row2.iter()).all(|b| b["style"] == 2));
+        assert_eq!(row1[1]["custom_id"], "cd:1:1:777:pl");
+        // Playing, so the play/pause button offers pause.
+        assert_eq!(row1[1]["emoji"]["name"], "⏸");
+        assert_eq!(row2[0]["label"], "Loop: queue");
+        assert_eq!(row2[4]["label"], "Autoplay: on");
         // The cover rides along as an upload.
         assert_eq!(b["attachments"][0]["filename"], "cover-c.jpg");
         assert!(!m.ephemeral);
@@ -866,11 +914,21 @@ mod tests {
     }
 
     #[test]
+    fn paused_controller_offers_play_and_goes_grey() {
+        let mut s = snap(0, true, false);
+        s.current.as_mut().unwrap().paused = true;
+        let b = now_playing(&s, false).body();
+        assert_eq!(b["components"][0]["accent_color"], accent::PAUSED);
+        let kids = b["components"][0]["components"].as_array().unwrap();
+        assert_eq!(kids[7]["components"][1]["emoji"]["name"], "▶");
+    }
+
+    #[test]
     fn custom_emoji_set_reaches_headers_and_buttons() {
         let mut s = snap(0, true, false);
         let mut set = IconSet::default();
-        for (i, icon) in Icon::ALL.iter().enumerate() {
-            set.insert_for_test(*icon, 1000 + i as u64);
+        for (i, icon) in Icon::all().enumerate() {
+            set.insert_for_test(icon, 1000 + i as u64);
         }
         s.icons = Arc::new(set);
         let b = now_playing(&s, false).body();
@@ -881,10 +939,62 @@ mod tests {
             "{head}"
         );
         // No art here, so the layout is flat and the first button row is the eighth child.
-        let play = &kids[7]["components"][1]["emoji"];
-        assert_eq!(play["name"], "cd_playpause");
-        assert_eq!(play["id"], "1002");
-        assert!(!b.to_string().contains('⏯'));
+        let pause = &kids[7]["components"][1]["emoji"];
+        assert_eq!(pause["name"], "cd_pause");
+        assert_eq!(pause["id"], "1001");
+        assert!(!b.to_string().contains('⏸'));
+        // The bar is emojis too: the left cap, ten middles, the right cap.
+        let progress = kids[5]["content"].as_str().unwrap();
+        assert!(progress.starts_with("<:cd_bar_l2:"), "{progress}");
+        assert_eq!(progress.matches("<:cd_bar_").count(), 12);
+        assert!(progress.contains("<:cd_bar_r0:"), "{progress}");
+    }
+
+    #[test]
+    fn web_links_appear_only_when_a_hub_is_linked() {
+        let mut s = snap(1, true, false);
+        let plain = now_playing(&s, false).body().to_string();
+        assert!(!plain.contains("](http"));
+        s.web_base = Some("https://chordia.dev".into());
+        let linked = now_playing(&s, false).body().to_string();
+        assert!(
+            linked.contains(
+                "[One More Time](https://chordia.dev/app/search?q=One%20More%20Time%20Daft%20Punk)"
+            ),
+            "{linked}"
+        );
+        assert!(linked.contains("[Daft Punk](https://chordia.dev/app/search?q=Daft%20Punk)"));
+        assert!(queue_page(&s, 0)
+            .body()
+            .to_string()
+            .contains("](https://chordia.dev/app/search?q="));
+    }
+
+    #[test]
+    fn containers_take_the_icon_colour() {
+        let mut s = snap(0, true, false);
+        s.icons = Arc::new(IconSet::default().with_accent("#e67451"));
+        let b = now_playing(&s, false).body();
+        assert_eq!(b["components"][0]["accent_color"], 0xE6_74_51);
+        let q = queue_page(&s, 0).body();
+        assert_eq!(q["components"][0]["accent_color"], 0xE6_74_51);
+        // Errors stay red whatever the theme.
+        let e = error(&s.icons, "x", "y").body();
+        assert_eq!(e["components"][0]["accent_color"], accent::ERROR);
+    }
+
+    #[test]
+    fn a_bare_acknowledgement_has_no_dangling_divider() {
+        let icons = IconSet::default();
+        let b = ok(&icons, "Left", "").body();
+        let kids = b["components"][0]["components"].as_array().unwrap();
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0]["type"], 10);
+        let b = ok(&icons, "Skipped", "**x**").body();
+        assert_eq!(
+            b["components"][0]["components"].as_array().unwrap().len(),
+            3
+        );
     }
 
     #[test]
@@ -916,12 +1026,46 @@ mod tests {
         assert_eq!(fresh.attachments.len(), 1);
     }
 
+    fn custom_ids(msg: &Message) -> Vec<String> {
+        fn walk(c: &Component, out: &mut Vec<String>) {
+            match c {
+                Component::Button(b) => out.extend(b.custom_id.clone()),
+                Component::StringSelect { custom_id, .. }
+                | Component::RoleSelect { custom_id, .. } => out.push(custom_id.clone()),
+                Component::ActionRow(items)
+                | Component::Container {
+                    components: items, ..
+                } => items.iter().for_each(|c| walk(c, out)),
+                Component::Section {
+                    components,
+                    accessory,
+                } => {
+                    components.iter().for_each(|c| walk(c, out));
+                    walk(accessory, out);
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        msg.components.iter().for_each(|c| walk(c, &mut out));
+        out
+    }
+
     #[test]
-    fn paused_controller_goes_grey() {
-        let mut s = snap(0, true, false);
-        s.current.as_mut().unwrap().paused = true;
-        let b = now_playing(&s, false).body();
-        assert_eq!(b["components"][0]["accent_color"], accent::PAUSED);
+    fn no_view_repeats_a_custom_id() {
+        let s = snap(25, true, false);
+        for m in [
+            now_playing(&s, false),
+            queue_page(&s, 0),
+            queue_page(&s, 1),
+            queue_page(&s, 2),
+        ] {
+            let ids = custom_ids(&m);
+            let mut dedup = ids.clone();
+            dedup.sort();
+            dedup.dedup();
+            assert_eq!(ids.len(), dedup.len(), "duplicate custom id in {ids:?}");
+        }
     }
 
     #[test]
@@ -931,12 +1075,14 @@ mod tests {
         let rows = first["components"][0]["components"].as_array().unwrap();
         let nav = rows.last().unwrap()["components"].as_array().unwrap();
         assert_eq!(nav[0]["disabled"], true);
+        assert_eq!(nav[0]["custom_id"], "cd:1:1:777:qf");
         assert_eq!(nav[3]["disabled"], false);
         assert_eq!(nav[2]["label"], "1/3");
         let last = queue_page(&s, 2).body();
         let rows = last["components"][0]["components"].as_array().unwrap();
         let nav = rows.last().unwrap()["components"].as_array().unwrap();
         assert_eq!(nav[3]["disabled"], true);
+        assert_eq!(nav[4]["custom_id"], "cd:1:1:777:ql");
         assert_eq!(nav[2]["label"], "3/3");
     }
 
@@ -961,7 +1107,7 @@ mod tests {
             queue_page(&s, 0),
             history(&s),
             left(&s, LeaveReason::Alone),
-            busy(&icons, "A", "b", 1, &["C".into()]),
+            busy(&icons, "A", ChannelId::new(1), 1, &["C".into()]),
             idle(&s),
         ] {
             assert!(!m.body().to_string().contains('—'), "{}", m.body());

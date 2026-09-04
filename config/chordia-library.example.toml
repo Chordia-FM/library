@@ -104,9 +104,12 @@ dedupe_reuploads = true
 # volume, allowed servers, DJ role, the icon colour…) is set at runtime from that dashboard or from
 # Discord, never here.
 #
-# On first connection the bot uploads its own icon set (Phosphor glyphs tinted in the Chordia pink)
-# as application emojis, so its buttons and headers look the same on every server without using
-# anyone's emoji slots. Pick another colour from the dashboard; the set is regenerated in it.
+# On first connection the bot dresses itself: its icon set (Phosphor glyphs and the progress-bar
+# segments, tinted in the Chordia pink) goes up as application emojis, so buttons and headers look
+# the same on every server without using anyone's emoji slots, and its avatar becomes the Chordia
+# mark in the same colour. Pick another colour from the dashboard and everything follows; upload
+# your own avatar there and the mark is left alone from then on. Discord rate-limits both, so a
+# change that cannot go out at once is queued, shown as a warning, and applied when it can.
 #
 # A token is a secret. Like [acoustid] api_key it lives in this file because it is the library's own
 # third-party credential — the Hub never sees it, and it never leaves this process.

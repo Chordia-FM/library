@@ -25,6 +25,10 @@ pub enum Action {
     QueueOpen,
     /// Show a queue page (0-based) in place.
     Queue(u32),
+    /// Jump to the first / last queue page. Separate from `Queue(n)` so the edge buttons never
+    /// share a custom id with their neighbours (Discord refuses duplicates in one message).
+    QueueFirst,
+    QueueLast,
     /// Re-render the now-playing controller.
     Refresh,
     Lyrics,
@@ -53,6 +57,8 @@ impl Action {
             Action::VolumeDown => "vd".into(),
             Action::QueueOpen => "qo".into(),
             Action::Queue(p) => format!("q:{p}"),
+            Action::QueueFirst => "qf".into(),
+            Action::QueueLast => "ql".into(),
             Action::Refresh => "np".into(),
             Action::Lyrics => "ly".into(),
             Action::AutoplayToggle => "ap".into(),
@@ -76,6 +82,8 @@ impl Action {
             ("vd", None) => Action::VolumeDown,
             ("qo", None) => Action::QueueOpen,
             ("q", Some(p)) => Action::Queue(p.parse().ok()?),
+            ("qf", None) => Action::QueueFirst,
+            ("ql", None) => Action::QueueLast,
             ("np", None) => Action::Refresh,
             ("ly", None) => Action::Lyrics,
             ("ap", None) => Action::AutoplayToggle,
@@ -143,6 +151,8 @@ mod tests {
             Action::VolumeDown,
             Action::QueueOpen,
             Action::Queue(3),
+            Action::QueueFirst,
+            Action::QueueLast,
             Action::Refresh,
             Action::Lyrics,
             Action::AutoplayToggle,

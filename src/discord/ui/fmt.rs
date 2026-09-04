@@ -31,11 +31,11 @@ pub mod glyph {
     pub const GEAR: &str = "⚙";
 }
 
-/// Container accent colours. The brand colour is the web app's `--primary`
-/// (`oklch(0.56 0.28 337)`), converted once; the rest are Discord's own semantic palette so a red
-/// error looks like every other bot's red error.
+/// Container accent colours. The brand colour is the one the app's own icons are drawn in
+/// (`--primary` as sRGB, see `frontend/scripts/generate-brand-assets.ts`); the rest are Discord's
+/// own semantic palette so a red error looks like every other bot's red error.
 pub mod accent {
-    pub const BRAND: u32 = 0xCD_00_AE;
+    pub const BRAND: u32 = 0xF2_25_8C;
     pub const PAUSED: u32 = 0x6B_72_80;
     pub const ERROR: u32 = 0xED_42_45;
     pub const NOTICE: u32 = 0xFE_E7_5C;
@@ -52,30 +52,39 @@ pub fn duration(ms: u64) -> String {
     }
 }
 
-/// A slider: the played part in heavy line, a knob, the rest in light line. Box-drawing characters
-/// render at full weight in Discord's font, unlike the block glyphs that show up as hollow boxes.
-pub fn progress_bar(position_ms: u64, duration_ms: u64) -> String {
-    const CELLS: usize = 16;
-    let knob = (position_ms.min(duration_ms) as u128 * (CELLS as u128 - 1))
-        .checked_div(duration_ms as u128)
-        .unwrap_or(0) as usize;
-    (0..CELLS)
-        .map(|i| match i.cmp(&knob) {
-            std::cmp::Ordering::Less => '━',
-            std::cmp::Ordering::Equal => '●',
-            std::cmp::Ordering::Greater => '─',
+/// Which of `cells` segments are filled and where the playhead sits, for a bar of emojis (or their
+/// text fallbacks). Half-cell resolution: the segment under the playhead is either half full with
+/// the dot in its middle or full with the dot at its end.
+pub fn progress_cells(position_ms: u64, duration_ms: u64, cells: usize) -> Vec<Segment> {
+    let cells = cells.max(2);
+    let x = if duration_ms == 0 {
+        0.0
+    } else {
+        (position_ms.min(duration_ms) as f64 / duration_ms as f64) * cells as f64
+    };
+    let k = (x.floor() as usize).min(cells - 1);
+    let frac = x - k as f64;
+    (0..cells)
+        .map(|i| {
+            use std::cmp::Ordering::*;
+            match i.cmp(&k) {
+                Less => Segment::Full,
+                Equal if frac >= 0.5 || (k == cells - 1 && position_ms >= duration_ms) => {
+                    Segment::FullDot
+                }
+                Equal => Segment::HalfDot,
+                Greater => Segment::Empty,
+            }
         })
         .collect()
 }
 
-/// `━━━●──────────── 1:23 / 4:05`.
-pub fn progress_line(position_ms: u64, duration_ms: u64) -> String {
-    format!(
-        "{} {} / {}",
-        progress_bar(position_ms, duration_ms),
-        duration(position_ms.min(duration_ms)),
-        duration(duration_ms)
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Segment {
+    Empty,
+    HalfDot,
+    Full,
+    FullDot,
 }
 
 /// The fixed quality vocabulary: codec, rate/depth, lossless/spatial, the negotiated Opus bitrate,
@@ -169,6 +178,20 @@ pub fn render_template(template: &str, vars: &[(&str, &str)]) -> String {
     out
 }
 
+/// Percent-encode a URL query value; RFC 3986 unreserved characters pass through.
+pub fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 3);
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// `1 track` / `12 tracks`.
 pub fn count(n: usize, singular: &str) -> String {
     if n == 1 {
@@ -204,14 +227,21 @@ mod tests {
     }
 
     #[test]
-    fn progress() {
-        assert_eq!(progress_bar(0, 100), "●───────────────");
-        assert_eq!(progress_bar(50, 100), "━━━━━━━●────────");
-        assert_eq!(progress_bar(100, 100), "━━━━━━━━━━━━━━━●");
-        assert_eq!(progress_bar(500, 100), "━━━━━━━━━━━━━━━●");
-        assert_eq!(progress_bar(5, 0), "●───────────────");
-        assert_eq!(progress_bar(0, 100).chars().count(), 16);
-        assert_eq!(progress_line(1000, 2000), "━━━━━━━●──────── 0:01 / 0:02");
+    fn progress_cells_fill_left_to_right_with_a_playhead() {
+        use Segment::*;
+        assert_eq!(
+            progress_cells(0, 100, 4),
+            vec![HalfDot, Empty, Empty, Empty]
+        );
+        assert_eq!(progress_cells(50, 100, 4), vec![Full, Full, HalfDot, Empty]);
+        assert_eq!(
+            progress_cells(40, 100, 4),
+            vec![Full, FullDot, Empty, Empty]
+        );
+        assert_eq!(progress_cells(100, 100, 4), vec![Full, Full, Full, FullDot]);
+        assert_eq!(progress_cells(500, 100, 4), vec![Full, Full, Full, FullDot]);
+        assert_eq!(progress_cells(5, 0, 4), vec![HalfDot, Empty, Empty, Empty]);
+        assert_eq!(progress_cells(0, 1, 1).len(), 2);
     }
 
     #[test]
@@ -236,6 +266,12 @@ mod tests {
         assert_eq!(badges(&f), vec!["MP3", "48 kHz", "RG +1.0 dB"]);
         f.spatial = true;
         assert!(badges(&f).contains(&"Atmos".to_string()));
+    }
+
+    #[test]
+    fn url_encoding() {
+        assert_eq!(urlencode("One More Time"), "One%20More%20Time");
+        assert_eq!(urlencode("J's & #1 ü"), "J%27s%20%26%20%231%20%C3%BC");
     }
 
     #[test]

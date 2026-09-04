@@ -18,11 +18,7 @@ pub async fn bots(ctx: Context<'_>) -> Result<(), Error> {
         let (playing_in, listeners) = match id.player_arc(guild) {
             Some(p) => {
                 let snap = p.snapshot().await;
-                (
-                    snap.voice_channel
-                        .map(|c| id.channel_name(guild, c).unwrap_or_else(|| "voice".into())),
-                    snap.listeners,
-                )
+                (snap.voice_channel, snap.listeners)
             }
             None => (None, 0),
         };

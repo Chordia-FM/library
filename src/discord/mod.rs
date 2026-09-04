@@ -19,11 +19,14 @@
 //!   ships with every codec enabled. Its one C dependency is libopus (`opus2` → `libopus_sys`),
 //!   found through pkg-config or built from source with cmake. On Windows with more than one Visual
 //!   Studio installed, cmake may need `CMAKE_GENERATOR=Ninja`.
-//! - **resvg** for the now-playing card: an SVG template rendered to PNG with a bundled brand font.
+//! - **resvg** for everything drawn: the application emoji set (Phosphor icons and the progress-bar
+//!   segments in the bot's colour), the avatar (the Chordia mark in that colour), and later the
+//!   now-playing card.
 //!
 //! The whole module is behind the `discord` cargo feature (on by default) so the desktop app, which
 //! embeds this crate, never builds any of it.
 
+pub mod avatar;
 pub mod client;
 pub mod commands;
 pub mod emoji;
@@ -31,8 +34,10 @@ pub mod identity;
 pub mod interactions;
 pub mod player;
 pub mod presence;
+pub mod rest;
 pub mod settings;
 pub mod source;
+pub mod theme;
 pub mod ui;
 
 use std::sync::{Arc, OnceLock};

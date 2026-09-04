@@ -110,6 +110,46 @@ pub async fn component_reply(
     Ok(())
 }
 
+/// Defer a component press with a new, ephemeral message to follow (`DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE`
+/// with the ephemeral flag); the content arrives through [`interaction_edit`].
+pub async fn component_defer_ephemeral(
+    http: &Http,
+    interaction: &ComponentInteraction,
+) -> anyhow::Result<()> {
+    http.create_interaction_response(
+        interaction.id,
+        &interaction.token,
+        &json!({ "type": 5, "data": { "flags": super::v2::FLAG_EPHEMERAL } }),
+        Vec::new(),
+    )
+    .await?;
+    Ok(())
+}
+
+/// Replace the interaction's original response: after a deferred update that is the message the
+/// component sits on; after a deferred ephemeral reply it is that reply. Valid for 15 minutes.
+pub async fn interaction_edit(http: &Http, token: &str, mut msg: Message) -> anyhow::Result<()> {
+    check(&msg);
+    let files = msg.take_attachments();
+    let body = msg.body();
+    http.edit_original_interaction_response(token, &body, files)
+        .await?;
+    Ok(())
+}
+
+/// A separate message after an acknowledgement (an error under a controller press, say).
+pub async fn interaction_followup(
+    http: &Http,
+    token: &str,
+    mut msg: Message,
+) -> anyhow::Result<()> {
+    check(&msg);
+    let files = msg.take_attachments();
+    let body = msg.body();
+    http.create_followup_message(token, &body, files).await?;
+    Ok(())
+}
+
 /// Acknowledge a component press without changing anything (the controller redraws itself).
 pub async fn component_ack(http: &Http, interaction: &ComponentInteraction) -> anyhow::Result<()> {
     http.create_interaction_response(

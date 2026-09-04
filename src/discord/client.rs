@@ -176,6 +176,9 @@ fn spawn_ticker(identity: Arc<Identity>) -> tokio::task::JoinHandle<()> {
             for player in identity.players() {
                 player.tick(idle).await;
             }
+            // Anything the theme job could not do earlier (a rate limit, a dashboard change while
+            // offline) gets its chance here.
+            crate::discord::theme::tick(&identity).await;
         }
     })
 }
@@ -193,18 +196,19 @@ async fn on_ready(
         identity.set_profile(p);
     }
     register_commands(identity, ctx, framework).await;
-    // The icon set: one listing on a normal boot, a batch of uploads on the first one or after a
-    // colour change. Bounded so a slow Discord cannot hold the bot in "connecting".
+    // The look: icon set and avatar in the bot's colour. One listing on a normal boot, a batch of
+    // uploads on the first one or after a colour change. Bounded so a slow Discord cannot hold the
+    // bot in "connecting"; whatever is left over, the ticker finishes.
     if tokio::time::timeout(
         Duration::from_secs(120),
-        crate::discord::emoji::ensure(identity, &ctx.http),
+        crate::discord::theme::tick(identity),
     )
     .await
     .is_err()
     {
         tracing::warn!(
             bot = identity.index,
-            "application emoji setup timed out; using text glyphs"
+            "theme setup timed out; the ticker will finish it"
         );
     }
     identity.set_status(Status::Online);
@@ -290,6 +294,13 @@ async fn on_event(
         } => {
             if let Err(e) = interactions::handle(identity, ctx, ic).await {
                 tracing::warn!(bot = identity.index, custom_id = %ic.data.custom_id, error = %e, "component interaction failed");
+            }
+        }
+        FullEvent::ChannelUpdate { new, .. } => {
+            if let Some(player) = identity.player_arc(new.guild_id) {
+                player
+                    .refresh_bitrate(new.id, new.bitrate.map(|b| b / 1000))
+                    .await;
             }
         }
         FullEvent::Message { new_message } => {

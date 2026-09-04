@@ -28,7 +28,7 @@ pub enum Refusal {
     NotInVoice,
     Busy {
         bot_name: String,
-        channel_name: String,
+        channel: ChannelId,
         listeners: usize,
         free: Vec<String>,
     },
@@ -48,10 +48,10 @@ impl Refusal {
             ),
             Refusal::Busy {
                 bot_name,
-                channel_name,
+                channel,
                 listeners,
                 free,
-            } => views::busy(icons, bot_name, channel_name, *listeners, free),
+            } => views::busy(icons, bot_name, *channel, *listeners, free),
             Refusal::NeedDj { role } => {
                 let who = match role {
                     Some(r) => format!("<@&{}>", r.get()),
@@ -107,9 +107,7 @@ pub async fn listener_for(
             let snap = player.snapshot().await;
             return Err(Refusal::Busy {
                 bot_name: identity.display_name_sync(),
-                channel_name: identity
-                    .channel_name(guild, current)
-                    .unwrap_or_else(|| "voice".into()),
+                channel: current,
                 listeners: snap.listeners,
                 free,
             });
