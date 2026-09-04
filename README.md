@@ -24,7 +24,8 @@ Collection") and share each independently. See the
 - **Responsibilities:** pairing · scan + watch (with full re-index + progress) · metadata +
   fingerprint · catalog API · bit-perfect Range streaming · listener-controlled quality tiers ·
   own-copy match · edition + canonical-artist sync · DJ relay ·
-  offline scrobble buffer/forward · directory heartbeat.
+  offline scrobble buffer/forward · directory heartbeat · Discord music bot (one per token,
+  Components V2 UI, DAVE voice).
 - **Talks to:** the Hub (HTTPS control), clients (HTTPS Range), and peer libraries (relay pulls).
 - **Security:** every request carries a Hub-signed capability token, validated **offline** against
   the Hub JWKS. Clients pin the server's TLS fingerprint advertised in the Hub directory.
@@ -48,6 +49,10 @@ curl localhost:8443/health    # -> ok
 
 TOML file (path via `CHORDIA_LIBRARY_CONFIG`, default `./chordia-library.toml`). See
 [`config/chordia-library.example.toml`](./config/chordia-library.example.toml).
+
+The Discord bot is the `discord` cargo feature (on by default; the desktop app builds without it).
+It links libopus, built from source by `libopus_sys`, so a source build needs **cmake** and a C
+compiler. On Windows with a Visual Studio newer than your cmake, set `CMAKE_GENERATOR=Ninja`.
 
 ## Development
 

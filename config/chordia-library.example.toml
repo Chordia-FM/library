@@ -83,3 +83,21 @@ dedupe_reuploads = true
 # [tls]
 # cert = "/etc/chordia/cert.pem"
 # key  = "/etc/chordia/key.pem"
+
+# Discord music bot. Every token below becomes an independent bot: its own slash commands, queue,
+# voice channel and presence, playing tracks from this library. Give it one token to run one bot, or
+# several so two voice channels on the same server can each have their own — the bots know about each
+# other and point a busy channel at a free sibling.
+#
+# Create the bot at https://discord.com/developers/applications (New Application → Bot → Reset Token).
+# No privileged intents are needed. Invite it with the link shown in the library's Discord dashboard
+# (Library → Settings → Discord), which carries the right permissions, including "Set Voice Channel
+# Status". Everything else about a bot (single-server mode, presence text, default volume, allowed
+# servers, DJ role…) is set at runtime from that dashboard or from Discord, never here.
+#
+# A token is a secret. Like [acoustid] api_key it lives in this file because it is the library's own
+# third-party credential — the Hub never sees it, and it never leaves this process.
+# [discord]
+# token = "MTIz...your-bot-token"
+# tokens = ["MTIz...bot-one", "MTIz...bot-two"]   # or several; `token` and `tokens` are merged
+# command_guilds = []   # dev only: register commands to these server ids (instant) instead of globally

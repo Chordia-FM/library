@@ -27,8 +27,9 @@ jobs:
           path: contracts
       # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
       # rebuild spends its time on here — the compile is incremental, the link never is.
-      - name: Install lld
-        run: sudo apt-get update && sudo apt-get install -y lld
+      # cmake builds libopus for the Discord bot (`opus2` → `libopus_sys`).
+      - name: Install lld + cmake
+        run: sudo apt-get update && sudo apt-get install -y lld cmake
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -41,6 +42,10 @@ jobs:
       - run: cargo fmt --check
         working-directory: library
       - run: cargo clippy --all-targets -- -D warnings
+        working-directory: library
+      # The desktop app embeds this crate with `default-features = false` (no Discord bot, no
+      # libopus), so that configuration has to stay warning-free too.
+      - run: cargo clippy --all-targets --no-default-features -- -D warnings
         working-directory: library
       - run: cargo test --all
         working-directory: library
@@ -126,8 +131,10 @@ jobs:
       # musl-tools rides along in the same step: it supplies musl-gcc for the bundled libsqlite3 in
       # the static build below, and the `apt-get update` index refresh — most of the cost of an apt
       # step — was being paid twice for two small packages.
-      - name: Install lld + musl toolchain
-        run: sudo apt-get update && sudo apt-get install -y lld musl-tools
+      # cmake compiles libopus (the Discord bot's Opus encoder) from source with musl-gcc, so the
+      # static binary carries it too.
+      - name: Install lld + musl toolchain + cmake
+        run: sudo apt-get update && sudo apt-get install -y lld musl-tools cmake
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-unknown-linux-musl
@@ -140,6 +147,9 @@ jobs:
       - name: Build static release binary
         run: cargo build --release --target x86_64-unknown-linux-musl
         working-directory: library
+        env:
+          # cmake-rs hands the C compiler to libopus's build; point it at the musl one.
+          CC_x86_64_unknown_linux_musl: musl-gcc
       - name: Stage binary
         run: install -Dm755 library/target/x86_64-unknown-linux-musl/release/chordia-library chordia-library-linux-x86_64
       - name: Publish GitHub Release

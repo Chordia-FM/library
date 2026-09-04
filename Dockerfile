@@ -1,5 +1,6 @@
 # Multi-stage build for the self-hosted library server.
-# Includes ffmpeg in the runtime image for the (opt-in) transcode tiers.
+# Includes ffmpeg in the runtime image for the (opt-in) transcode tiers and the Discord bot's
+# fallback decoder.
 #
 # POLYREPO: this crate depends on the sibling crate `chordia-contracts` (../contracts) via a path
 # dependency, so build with the WORKSPACE ROOT as the context (the folder that holds library/ and
@@ -7,6 +8,10 @@
 # library/ and builds with `context: .` / `file: library/Dockerfile`.
 
 FROM rust:1-bookworm AS builder
+# cmake: the Discord bot's Opus encoder (libopus, via `libopus_sys`) is built from source.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends cmake \
+    && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY contracts/ ./contracts/
 COPY library/ ./library/
