@@ -63,16 +63,22 @@ const NATIVE_CODECS: &[&str] = &["flac", "mp3", "aac", "alac", "vorbis", "opus",
 /// to their true-peak ceiling, so tracks still land at one level, just a level that suits the room.
 pub const REPLAYGAIN_PREAMP_DB: f64 = 9.0;
 
+/// How far under full scale the true peak is kept, as a linear factor (≈ −1 dB). Sitting exactly
+/// on the ceiling hands the loudest transients to the mixer's soft clipper, which is audible as
+/// the level "breathing"; a decibel of air keeps it out of the way.
+const PEAK_HEADROOM: f64 = 0.89;
+
 /// The volume multiplier that applies a track's ReplayGain: the gain plus
-/// [`REPLAYGAIN_PREAMP_DB`], capped so the true peak never clips, and never more than a doubling
-/// when the peak is unknown. `1.0` when the loudness pass has not reached this track yet.
+/// [`REPLAYGAIN_PREAMP_DB`], capped so the true peak stays a decibel under full scale, and never
+/// more than a doubling when the peak is unknown. `1.0` when the loudness pass has not reached this
+/// track yet.
 pub fn replaygain_multiplier(gain_db: Option<f64>, peak: Option<f64>) -> f32 {
     let Some(gain) = gain_db else {
         return 1.0;
     };
     let mut m = 10f64.powf((gain + REPLAYGAIN_PREAMP_DB) / 20.0);
     if let Some(p) = peak.filter(|p| *p > 0.0) {
-        m = m.min(1.0 / p);
+        m = m.min(PEAK_HEADROOM / p);
     }
     m.clamp(0.0, 2.0) as f32
 }
@@ -134,15 +140,18 @@ mod tests {
     #[test]
     fn replaygain_math() {
         assert_eq!(replaygain_multiplier(None, None), 1.0);
-        // A loud master (−9.2 dB) lands just under unity after the preamp: −0.2 dB ≈ ×0.977.
+        // A loud master (−9.2 dB) would land at ×0.977 after the preamp; the peak cap (×0.89 at a
+        // true peak of 1.0) keeps it a decibel under full scale.
         let m = replaygain_multiplier(Some(-9.2), Some(1.0));
-        assert!((m - 0.977).abs() < 0.01, "{m}");
+        assert!((m - 0.89).abs() < 0.01, "{m}");
+        let m = replaygain_multiplier(Some(-12.0), Some(1.0));
+        assert!((m - 0.708).abs() < 0.01, "{m}");
         // −15 dB + 9 = −6 dB ≈ ×0.501
         let m = replaygain_multiplier(Some(-15.0), None);
         assert!((m - 0.501).abs() < 0.01, "{m}");
-        // +6 dB (+9) would be ×5.6, but a peak of 0.8 caps it at 1.25.
+        // +6 dB (+9) would be ×5.6, but a peak of 0.8 caps it at 0.89/0.8.
         let m = replaygain_multiplier(Some(6.0), Some(0.8));
-        assert!((m - 1.25).abs() < 0.001, "{m}");
+        assert!((m - 1.1125).abs() < 0.001, "{m}");
         // Unknown peak: never more than a doubling.
         assert_eq!(replaygain_multiplier(Some(20.0), None), 2.0);
         // A zero/negative peak is treated as unknown rather than dividing by it.

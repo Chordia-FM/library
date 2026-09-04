@@ -62,20 +62,22 @@ pub enum Icon {
     Artist,
     Listening,
     List,
-    /// Progress-bar segments: left cap, middle, right cap; each empty, half with the position
-    /// dot, full, or full with the dot at its end.
+    /// Progress-bar segments: left cap, middle, right cap, five states each (see [`BarState`]).
     BarL0,
     BarL1,
     BarL2,
     BarL3,
+    BarL4,
     BarM0,
     BarM1,
     BarM2,
     BarM3,
+    BarM4,
     BarR0,
     BarR1,
     BarR2,
     BarR3,
+    BarR4,
 }
 
 macro_rules! phosphor {
@@ -138,13 +140,29 @@ pub enum Cap {
     Right,
 }
 
-/// How much of a segment is filled, and whether the playhead sits on it.
+/// How much of a segment is filled, and where the playhead is. The dot never floats inside a
+/// filled segment: at a boundary it is split across two emojis (`DotRight` on the filled one,
+/// `DotLeft` on the empty one after it), so nothing ever appears filled past the playhead.
+///
+/// Per cap the states are, in id order:
+/// - left: `Empty`, `StartDot`, `HalfDot`, `Full`, `DotRight`
+/// - middle: `Empty`, `DotLeft`, `HalfDot`, `Full`, `DotRight`
+/// - right: `Empty`, `DotLeft`, `HalfDot`, `Full`, `EndDot`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BarState {
     Empty,
+    /// Left cap only: nothing filled, the dot on the rounded start.
+    StartDot,
+    /// Nothing filled, the left half of a dot on the left edge (its other half is the previous
+    /// segment's `DotRight`).
+    DotLeft,
+    /// Filled to the middle, the dot on the middle.
     HalfDot,
     Full,
-    FullDot,
+    /// Fully filled, the right half of a dot on the right edge.
+    DotRight,
+    /// Right cap only: fully filled, the dot on the rounded end.
+    EndDot,
 }
 
 impl Icon {
@@ -153,45 +171,58 @@ impl Icon {
         Icon::BarL1,
         Icon::BarL2,
         Icon::BarL3,
+        Icon::BarL4,
         Icon::BarM0,
         Icon::BarM1,
         Icon::BarM2,
         Icon::BarM3,
+        Icon::BarM4,
         Icon::BarR0,
         Icon::BarR1,
         Icon::BarR2,
         Icon::BarR3,
+        Icon::BarR4,
     ];
+
+    /// The states a cap can show, in id order.
+    fn bar_states(cap: Cap) -> [BarState; 5] {
+        use BarState::*;
+        match cap {
+            Cap::Left => [Empty, StartDot, HalfDot, Full, DotRight],
+            Cap::Middle => [Empty, DotLeft, HalfDot, Full, DotRight],
+            Cap::Right => [Empty, DotLeft, HalfDot, Full, EndDot],
+        }
+    }
 
     /// Every emoji the bot provisions.
     pub fn all() -> impl Iterator<Item = Icon> {
         Self::PHOSPHOR.iter().chain(Self::BARS.iter()).copied()
     }
 
+    /// The segment emoji for a cap in a state. A state the cap cannot show (a start dot on a
+    /// middle segment, say) maps to the nearest one it can.
     pub fn bar(cap: Cap, state: BarState) -> Icon {
-        let i = match cap {
-            Cap::Left => 0,
-            Cap::Middle => 4,
-            Cap::Right => 8,
-        } + match state {
-            BarState::Empty => 0,
-            BarState::HalfDot => 1,
-            BarState::Full => 2,
-            BarState::FullDot => 3,
+        let states = Self::bar_states(cap);
+        let state = match (cap, state) {
+            (Cap::Left, BarState::DotLeft) => BarState::StartDot,
+            (Cap::Middle | Cap::Right, BarState::StartDot) => BarState::DotLeft,
+            (Cap::Left | Cap::Middle, BarState::EndDot) => BarState::DotRight,
+            (Cap::Right, BarState::DotRight) => BarState::EndDot,
+            _ => state,
         };
-        Self::BARS[i]
+        let j = states.iter().position(|s| *s == state).unwrap_or(0);
+        let base = match cap {
+            Cap::Left => 0,
+            Cap::Middle => 5,
+            Cap::Right => 10,
+        };
+        Self::BARS[base + j]
     }
 
     fn bar_parts(self) -> Option<(Cap, BarState)> {
         let i = Self::BARS.iter().position(|b| *b == self)?;
-        let cap = [Cap::Left, Cap::Middle, Cap::Right][i / 4];
-        let state = [
-            BarState::Empty,
-            BarState::HalfDot,
-            BarState::Full,
-            BarState::FullDot,
-        ][i % 4];
-        Some((cap, state))
+        let cap = [Cap::Left, Cap::Middle, Cap::Right][i / 5];
+        Some((cap, Self::bar_states(cap)[i % 5]))
     }
 
     /// The emoji's name on Discord.
@@ -204,14 +235,17 @@ impl Icon {
             Icon::BarL1 => "cd_bar_l1",
             Icon::BarL2 => "cd_bar_l2",
             Icon::BarL3 => "cd_bar_l3",
+            Icon::BarL4 => "cd_bar_l4",
             Icon::BarM0 => "cd_bar_m0",
             Icon::BarM1 => "cd_bar_m1",
             Icon::BarM2 => "cd_bar_m2",
             Icon::BarM3 => "cd_bar_m3",
+            Icon::BarM4 => "cd_bar_m4",
             Icon::BarR0 => "cd_bar_r0",
             Icon::BarR1 => "cd_bar_r1",
             Icon::BarR2 => "cd_bar_r2",
             Icon::BarR3 => "cd_bar_r3",
+            Icon::BarR4 => "cd_bar_r4",
             _ => unreachable!("every icon is either phosphor or a bar"),
         }
     }
@@ -223,9 +257,12 @@ impl Icon {
             return f;
         }
         match self.bar_parts().map(|(_, s)| s) {
-            Some(BarState::Empty) => "─",
+            Some(BarState::Empty) | Some(BarState::DotLeft) => "─",
             Some(BarState::Full) => "━",
-            Some(BarState::HalfDot) | Some(BarState::FullDot) => "●",
+            Some(BarState::StartDot)
+            | Some(BarState::HalfDot)
+            | Some(BarState::DotRight)
+            | Some(BarState::EndDot) => "●",
             None => "?",
         }
     }
@@ -246,7 +283,8 @@ impl Icon {
 
 /// One progress-bar cell: a 128-unit square with a 44-unit-tall bar through the middle, edge to
 /// edge so consecutive emojis read as one bar; caps are rounded. The track is the app's ink at low
-/// opacity, the fill is the accent, the dot is the accent ringed in ink so it shows on both.
+/// opacity, the fill is the accent, the dot is the accent ringed in ink so it shows on both. A dot
+/// on an edge is centred on it, so its two halves land on neighbouring emojis.
 fn bar_svg(cap: Cap, state: BarState, hex: &str) -> String {
     const Y: f32 = 42.0;
     const H: f32 = 44.0;
@@ -266,9 +304,12 @@ fn bar_svg(cap: Cap, state: BarState, hex: &str) -> String {
     };
     let (fill_to, dot_x) = match state {
         BarState::Empty => (None, None),
+        BarState::StartDot => (None, Some(R)),
+        BarState::DotLeft => (None, Some(0.0)),
         BarState::HalfDot => (Some(64.0), Some(64.0)),
         BarState::Full => (Some(128.0), None),
-        BarState::FullDot => (Some(128.0), Some(100.0)),
+        BarState::DotRight => (Some(128.0), Some(128.0)),
+        BarState::EndDot => (Some(128.0), Some(128.0 - R)),
     };
     let mut s = format!(
         r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128"><defs><clipPath id="c"><path d="{shape}"/></clipPath></defs><path d="{shape}" fill="#f0eff5" fill-opacity="0.28"/>"##
@@ -483,7 +524,7 @@ mod tests {
             );
             assert!(names.insert(name), "duplicate emoji name {name}");
         }
-        assert_eq!(names.len(), 38);
+        assert_eq!(names.len(), 41);
     }
 
     #[test]
@@ -520,14 +561,41 @@ mod tests {
         assert_eq!(cap.pixel(1, 43).unwrap().alpha(), 0);
         let mid = render_pixmap(Icon::bar(Cap::Middle, BarState::Empty), "#ff0000").unwrap();
         assert!(mid.pixel(1, 43).unwrap().alpha() > 0);
+
+        // A split dot: the right half of one segment and the left half of the next meet at the
+        // edge, and nothing is filled past it.
+        let right = render_pixmap(Icon::bar(Cap::Middle, BarState::DotRight), "#ff0000").unwrap();
+        let p = right.pixel(126, 64).unwrap();
+        assert_eq!((p.red(), p.green(), p.blue()), (255, 0, 0));
+        assert!(right.pixel(110, 64).unwrap().alpha() == 255);
+        let left = render_pixmap(Icon::bar(Cap::Middle, BarState::DotLeft), "#ff0000").unwrap();
+        let p = left.pixel(1, 64).unwrap();
+        assert_eq!((p.red(), p.green(), p.blue()), (255, 0, 0));
+        let track = left.pixel(100, 64).unwrap();
+        assert!(track.alpha() > 0 && track.alpha() < 128);
+        // The start state puts the dot on the rounded end with nothing filled.
+        let start = render_pixmap(Icon::bar(Cap::Left, BarState::StartDot), "#ff0000").unwrap();
+        let p = start.pixel(22, 64).unwrap();
+        assert_eq!((p.red(), p.green(), p.blue()), (255, 0, 0));
+        let track = start.pixel(100, 64).unwrap();
+        assert!(track.alpha() > 0 && track.alpha() < 128);
+    }
+
+    #[test]
+    fn states_a_cap_cannot_show_map_to_the_nearest() {
+        assert_eq!(Icon::bar(Cap::Left, BarState::DotLeft), Icon::BarL1);
+        assert_eq!(Icon::bar(Cap::Middle, BarState::StartDot), Icon::BarM1);
+        assert_eq!(Icon::bar(Cap::Right, BarState::DotRight), Icon::BarR4);
+        assert_eq!(Icon::bar(Cap::Left, BarState::EndDot), Icon::BarL4);
+        assert_eq!(Icon::bar(Cap::Middle, BarState::Full), Icon::BarM3);
     }
 
     #[test]
     fn bar_fallbacks_spell_the_text_slider() {
         let text: String = [
             Icon::bar(Cap::Left, BarState::Full),
-            Icon::bar(Cap::Middle, BarState::HalfDot),
-            Icon::bar(Cap::Middle, BarState::Empty),
+            Icon::bar(Cap::Middle, BarState::DotRight),
+            Icon::bar(Cap::Middle, BarState::DotLeft),
             Icon::bar(Cap::Right, BarState::Empty),
         ]
         .iter()

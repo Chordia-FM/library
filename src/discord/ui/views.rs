@@ -158,9 +158,12 @@ fn progress_row(icons: &IconSet, position_ms: u64, duration_ms: u64) -> String {
             };
             let state = match seg {
                 fmt::Segment::Empty => BarState::Empty,
+                fmt::Segment::StartDot => BarState::StartDot,
+                fmt::Segment::DotLeft => BarState::DotLeft,
                 fmt::Segment::HalfDot => BarState::HalfDot,
                 fmt::Segment::Full => BarState::Full,
-                fmt::Segment::FullDot => BarState::FullDot,
+                fmt::Segment::DotRight => BarState::DotRight,
+                fmt::Segment::EndDot => BarState::EndDot,
             };
             icons.get(Icon::bar(cap, state)).markup()
         })
@@ -945,7 +948,9 @@ mod tests {
         assert!(!b.to_string().contains('⏸'));
         // The bar is emojis too: the left cap, ten middles, the right cap.
         let progress = kids[5]["content"].as_str().unwrap();
-        assert!(progress.starts_with("<:cd_bar_l2:"), "{progress}");
+        // 65 s of 320 s: the first two segments full, the playhead mid-third.
+        assert!(progress.starts_with("<:cd_bar_l3:"), "{progress}");
+        assert!(progress.contains("<:cd_bar_m2:"), "{progress}");
         assert_eq!(progress.matches("<:cd_bar_").count(), 12);
         assert!(progress.contains("<:cd_bar_r0:"), "{progress}");
     }

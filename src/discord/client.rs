@@ -45,8 +45,10 @@ pub const INTENTS: GatewayIntents = GatewayIntents::GUILDS
 
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
-/// How often each player checks idle timers and refreshes its progress line.
-const TICK: Duration = Duration::from_secs(15);
+/// How often each player checks idle timers and refreshes its progress line. Five seconds keeps a
+/// 12-segment bar moving on a typical track (24 positions over 3–4 minutes) at well under Discord's
+/// edit budget per channel; edits are coalesced by the controller task anyway.
+const TICK: Duration = Duration::from_secs(5);
 
 enum Exit {
     /// The runtime is shutting down.

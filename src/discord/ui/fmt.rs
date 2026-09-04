@@ -53,26 +53,35 @@ pub fn duration(ms: u64) -> String {
 }
 
 /// Which of `cells` segments are filled and where the playhead sits, for a bar of emojis (or their
-/// text fallbacks). Half-cell resolution: the segment under the playhead is either half full with
-/// the dot in its middle or full with the dot at its end.
+/// text fallbacks). Half-cell resolution. The playhead is a dot: on the rounded start before
+/// anything has played, in the middle of a half-filled segment, or split across the edge between
+/// a filled segment and the empty one after it, so nothing ever looks filled past it. At the very
+/// end it sits on the rounded end.
 pub fn progress_cells(position_ms: u64, duration_ms: u64, cells: usize) -> Vec<Segment> {
     let cells = cells.max(2);
+    let last = cells - 1;
+    if duration_ms > 0 && position_ms >= duration_ms {
+        let mut v = vec![Segment::Full; cells];
+        v[last] = Segment::EndDot;
+        return v;
+    }
     let x = if duration_ms == 0 {
         0.0
     } else {
-        (position_ms.min(duration_ms) as f64 / duration_ms as f64) * cells as f64
+        (position_ms as f64 / duration_ms as f64) * cells as f64
     };
-    let k = (x.floor() as usize).min(cells - 1);
+    let k = (x.floor() as usize).min(last);
     let frac = x - k as f64;
     (0..cells)
         .map(|i| {
             use std::cmp::Ordering::*;
             match i.cmp(&k) {
                 Less => Segment::Full,
-                Equal if frac >= 0.5 || (k == cells - 1 && position_ms >= duration_ms) => {
-                    Segment::FullDot
-                }
-                Equal => Segment::HalfDot,
+                Equal if k == 0 && frac < 0.25 => Segment::StartDot,
+                Equal if frac < 0.5 => Segment::HalfDot,
+                Equal if k == last => Segment::EndDot,
+                Equal => Segment::DotRight,
+                Greater if i == k + 1 && frac >= 0.5 => Segment::DotLeft,
                 Greater => Segment::Empty,
             }
         })
@@ -82,9 +91,12 @@ pub fn progress_cells(position_ms: u64, duration_ms: u64, cells: usize) -> Vec<S
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Segment {
     Empty,
+    StartDot,
+    DotLeft,
     HalfDot,
     Full,
-    FullDot,
+    DotRight,
+    EndDot,
 }
 
 /// The fixed quality vocabulary: codec, rate/depth, lossless/spatial, the negotiated Opus bitrate,
@@ -231,16 +243,25 @@ mod tests {
         use Segment::*;
         assert_eq!(
             progress_cells(0, 100, 4),
+            vec![StartDot, Empty, Empty, Empty]
+        );
+        assert_eq!(
+            progress_cells(10, 100, 4),
             vec![HalfDot, Empty, Empty, Empty]
+        );
+        assert_eq!(
+            progress_cells(20, 100, 4),
+            vec![DotRight, DotLeft, Empty, Empty]
         );
         assert_eq!(progress_cells(50, 100, 4), vec![Full, Full, HalfDot, Empty]);
         assert_eq!(
             progress_cells(40, 100, 4),
-            vec![Full, FullDot, Empty, Empty]
+            vec![Full, DotRight, DotLeft, Empty]
         );
-        assert_eq!(progress_cells(100, 100, 4), vec![Full, Full, Full, FullDot]);
-        assert_eq!(progress_cells(500, 100, 4), vec![Full, Full, Full, FullDot]);
-        assert_eq!(progress_cells(5, 0, 4), vec![HalfDot, Empty, Empty, Empty]);
+        assert_eq!(progress_cells(90, 100, 4), vec![Full, Full, Full, EndDot]);
+        assert_eq!(progress_cells(100, 100, 4), vec![Full, Full, Full, EndDot]);
+        assert_eq!(progress_cells(500, 100, 4), vec![Full, Full, Full, EndDot]);
+        assert_eq!(progress_cells(5, 0, 4), vec![StartDot, Empty, Empty, Empty]);
         assert_eq!(progress_cells(0, 1, 1).len(), 2);
     }
 
