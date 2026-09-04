@@ -63,6 +63,13 @@ pub async fn handle(
             {
                 return send::interaction_followup(http, token, r.view(&icons)).await;
             }
+            if matches!(cid.action, Action::AutoplayToggle)
+                && !player.snapshot().await.autoplay
+                && !player.settings().await.can_autoplay
+            {
+                let r = guard::Refusal::NotAllowed("autoplay");
+                return send::interaction_followup(http, token, r.view(&icons)).await;
+            }
             if let Err(e) = controlled_action(&cid.action, &player).await {
                 let err = views::error(&icons, "Couldn't do that", &format!("-# {e}"));
                 send::interaction_followup(http, token, err).await?;
@@ -91,14 +98,14 @@ pub async fn handle(
             if let Err(r) = guard::admin_for(identity, user, ic.member.as_ref()) {
                 return send::interaction_followup(http, token, r.view(&icons)).await;
             }
-            let role = match &ic.data.kind {
+            let roles: Vec<String> = match &ic.data.kind {
                 ComponentInteractionDataKind::RoleSelect { values } => {
-                    values.first().map(|r| r.get().to_string())
+                    values.iter().map(|r| r.get().to_string()).collect()
                 }
-                _ => None,
+                _ => Vec::new(),
             };
             player
-                .update_settings(|s| s.dj_role_id = role.clone())
+                .update_settings(|s| s.dj_role_ids = roles.clone())
                 .await;
             let snap = player.snapshot().await;
             let gs = player.settings().await;
@@ -216,12 +223,22 @@ pub async fn handle(
                 return send::interaction_followup(http, token, r.view(&icons)).await;
             }
             let voice = player.voice_channel().await;
+            let gs = player.settings().await;
+            let blocked = match name.as_str() {
+                "always_on" if !gs.can_always_on => Some("24/7"),
+                "autoplay" if !gs.can_autoplay => Some("autoplay"),
+                _ => None,
+            };
+            if let Some(what) = blocked {
+                let r = guard::Refusal::NotAllowed(what);
+                return send::interaction_followup(http, token, r.view(&icons)).await;
+            }
             player
                 .update_settings(|s| match name.as_str() {
                     "normalize" => s.normalize = !s.normalize,
                     "autoplay" => s.autoplay = !s.autoplay,
                     "announce" => s.announce = !s.announce,
-                    "dj_clear" => s.dj_role_id = None,
+                    "dj_clear" => s.dj_role_ids.clear(),
                     "always_on" => {
                         s.always_on = !s.always_on;
                         s.always_on_channel_id = if s.always_on {

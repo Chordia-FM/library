@@ -201,7 +201,9 @@ pub enum Component {
     RoleSelect {
         custom_id: String,
         placeholder: Option<String>,
-        default_role: Option<u64>,
+        default_roles: Vec<u64>,
+        /// How many may be picked at once (Discord allows up to 25).
+        max_values: u8,
     },
     TextDisplay(String),
     Section {
@@ -319,15 +321,25 @@ impl Component {
             Component::RoleSelect {
                 custom_id,
                 placeholder,
-                default_role,
+                default_roles,
+                max_values,
             } => {
-                let mut v =
-                    json!({ "type": 6, "custom_id": custom_id, "min_values": 0, "max_values": 1 });
+                let mut v = json!({
+                    "type": 6,
+                    "custom_id": custom_id,
+                    "min_values": 0,
+                    "max_values": (*max_values).clamp(1, 25),
+                });
                 if let Some(p) = placeholder {
                     v["placeholder"] = json!(clip(p.clone(), 150));
                 }
-                if let Some(r) = default_role {
-                    v["default_values"] = json!([{ "id": r.to_string(), "type": "role" }]);
+                if !default_roles.is_empty() {
+                    let defaults: Vec<Value> = default_roles
+                        .iter()
+                        .take(25)
+                        .map(|r| json!({ "id": r.to_string(), "type": "role" }))
+                        .collect();
+                    v["default_values"] = Value::Array(defaults);
                 }
                 v
             }

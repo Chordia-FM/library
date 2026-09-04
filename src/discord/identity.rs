@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use serenity::all::{Cache, ChannelId, ChannelType, Context, GuildId, Http, ShardManager, UserId};
 use songbird::driver::Scheduler;
@@ -87,7 +88,36 @@ pub struct Identity {
     /// Held while the theme job (emoji set + avatar) runs, so a ticker beat and a dashboard request
     /// never race each other into Discord's rate limits.
     pub(crate) theme_lock: tokio::sync::Mutex<()>,
+    /// Which multi-server status is showing and since when.
+    status_rotation: Mutex<(usize, Instant)>,
+    /// Library track count for the `{tracks}` status variable.
+    pub(crate) track_count: Mutex<Option<(Instant, u64)>>,
+    /// Users looked up for the dashboard's owner pills, kept for a while so a dashboard poll
+    /// does not become a REST call per pill.
+    user_cache: Mutex<HashMap<u64, (Instant, DiscordUser)>>,
 }
+
+/// The public face of a Discord user, for the dashboard.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DiscordUser {
+    pub id: String,
+    /// Display name (the global name when set, else the username).
+    pub name: String,
+    pub username: String,
+    pub avatar_url: String,
+}
+
+/// A guild role, for the dashboard's DJ-role picker.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RoleInfo {
+    pub id: String,
+    pub name: String,
+    /// `#rrggbb`, absent for the default (colourless) role colour.
+    pub color: Option<String>,
+    pub position: u16,
+}
+
+const USER_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 impl Identity {
     pub fn new(
@@ -119,7 +149,96 @@ impl Identity {
             last_vc_status: Mutex::new(HashMap::new()),
             icons: RwLock::new(Arc::new(IconSet::default())),
             theme_lock: tokio::sync::Mutex::new(()),
+            status_rotation: Mutex::new((0, Instant::now())),
+            track_count: Mutex::new(None),
+            user_cache: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Whether a Discord user owns this bot: on the bot's own owner list, or the owner of the
+    /// library itself (through the Discord account linked to their Chordia account).
+    pub fn is_owner(&self, user: u64) -> bool {
+        if self.settings().is_owner(user) {
+            return true;
+        }
+        crate::discord::runtime().is_some_and(|rt| rt.owner_discord_id() == Some(user))
+    }
+
+    /// The index of the multi-server status to show now, advancing every `rotate_secs`.
+    pub fn status_slot(&self, len: usize, rotate_secs: u32) -> usize {
+        if len == 0 {
+            return 0;
+        }
+        let mut rot = self
+            .status_rotation
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if rot.1.elapsed() >= Duration::from_secs(rotate_secs.max(1) as u64) {
+            rot.0 = (rot.0 + 1) % len;
+            rot.1 = Instant::now();
+        }
+        rot.0 % len
+    }
+
+    /// A user by id, from the cache or from Discord (a bot may look up any user by id).
+    pub async fn lookup_user(&self, id: u64) -> Option<DiscordUser> {
+        {
+            let cache = self.user_cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((at, u)) = cache.get(&id) {
+                if at.elapsed() < USER_CACHE_TTL {
+                    return Some(u.clone());
+                }
+            }
+        }
+        let http = self.http()?;
+        let user = http.get_user(UserId::new(id)).await.ok()?;
+        let info = DiscordUser {
+            id: id.to_string(),
+            name: user
+                .global_name
+                .clone()
+                .unwrap_or_else(|| user.name.clone()),
+            username: user.name.clone(),
+            avatar_url: user.face(),
+        };
+        self.user_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(id, (Instant::now(), info.clone()));
+        Some(info)
+    }
+
+    /// A guild's roles for the DJ-role picker: everything but `@everyone` and roles Discord
+    /// manages for integrations, highest first.
+    pub fn guild_roles(&self, guild: GuildId) -> Vec<RoleInfo> {
+        let Some(cache) = self.cache() else {
+            return Vec::new();
+        };
+        let Some(g) = cache.guild(guild) else {
+            return Vec::new();
+        };
+        let mut roles: Vec<RoleInfo> = g
+            .roles
+            .values()
+            .filter(|r| r.id.get() != guild.get() && !r.managed)
+            .map(|r| RoleInfo {
+                id: r.id.get().to_string(),
+                name: r.name.clone(),
+                color: (r.colour.0 != 0).then(|| format!("#{:06x}", r.colour.0)),
+                position: r.position,
+            })
+            .collect();
+        roles.sort_by(|a, b| {
+            b.position
+                .cmp(&a.position)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        roles
+    }
+
+    pub fn guild_icon_url(&self, guild: GuildId) -> Option<String> {
+        let cache = self.cache()?;
+        cache.guild(guild).and_then(|g| g.icon_url())
     }
 
     pub fn icons(&self) -> Arc<IconSet> {

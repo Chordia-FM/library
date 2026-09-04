@@ -22,7 +22,7 @@ mod imp {
 
     use crate::api::v1::mgmt::require_mgmt_auth;
     use crate::discord::emoji;
-    use crate::discord::identity::Identity;
+    use crate::discord::identity::{DiscordUser, Identity, RoleInfo};
     use crate::discord::settings::{
         self, BotSettings, BotSettingsPatch, GuildSettings, GuildSettingsPatch,
     };
@@ -38,6 +38,18 @@ mod imp {
             .route("/mgmt/discord/bots/{app_id}/emojis", post(set_colour))
             .route("/mgmt/discord/bots/{app_id}/avatar", post(set_avatar))
             .route("/mgmt/discord/bots/{app_id}/restart", post(restart))
+            .route(
+                "/mgmt/discord/bots/{app_id}/users/{user_id}",
+                get(lookup_user),
+            )
+            .route(
+                "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/info",
+                get(guild_info),
+            )
+            .route(
+                "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/roles",
+                get(guild_roles),
+            )
             .route(
                 "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/settings",
                 put(set_guild_settings),
@@ -70,6 +82,7 @@ mod imp {
     struct GuildOverview {
         guild_id: String,
         name: Option<String>,
+        icon_url: Option<String>,
         voice_channel: Option<VoiceChannel>,
         now_playing: Option<NowPlaying>,
         queue_len: usize,
@@ -86,6 +99,7 @@ mod imp {
             out.push(GuildOverview {
                 guild_id: player.guild_id.get().to_string(),
                 name: identity.guild_name(player.guild_id),
+                icon_url: identity.guild_icon_url(player.guild_id),
                 voice_channel: snap.voice_channel.map(|c| VoiceChannel {
                     id: c.get().to_string(),
                     name: identity.channel_name(player.guild_id, c),
@@ -116,6 +130,7 @@ mod imp {
             out.push(GuildOverview {
                 guild_id: guild.get().to_string(),
                 name: identity.guild_name(guild),
+                icon_url: identity.guild_icon_url(guild),
                 voice_channel: None,
                 now_playing: None,
                 queue_len: 0,
@@ -142,18 +157,72 @@ mod imp {
                 .map_err(|_| AppError::BadRequest("guild_id must be a snowflake".into()))?,
         );
         let player = identity.player(guild).await;
-        // 24/7 turned on from the dashboard keeps the channel the bot is in, if any.
-        let voice = player.voice_channel().await;
-        let turning_on = patch.always_on == Some(true);
-        let updated = player
-            .update_settings(|s| {
-                patch.apply(s);
-                if turning_on && s.always_on_channel_id.is_none() {
-                    s.always_on_channel_id = voice.map(|c| c.get().to_string());
-                }
-            })
-            .await;
+        let updated = player.update_settings(|s| patch.apply(s)).await;
         Ok(Json(updated))
+    }
+
+    fn parse_snowflake(s: &str, what: &str) -> AppResult<u64> {
+        s.parse()
+            .map_err(|_| AppError::BadRequest(format!("{what} must be a snowflake")))
+    }
+
+    /// `GET /v1/mgmt/discord/bots/{app_id}/users/{user_id}`: a user's public face, for the
+    /// dashboard's owner pills. The bot's own token does the lookup; nothing about the user is
+    /// stored beyond a short cache.
+    async fn lookup_user(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path((app_id, user_id)): Path<(String, String)>,
+    ) -> AppResult<Json<DiscordUser>> {
+        require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
+        let id = parse_snowflake(&user_id, "user_id")?;
+        identity
+            .lookup_user(id)
+            .await
+            .map(Json)
+            .ok_or(AppError::NotFound)
+    }
+
+    /// One server as the bot knows it. `joined` is false for an id the bot has never seen.
+    #[derive(Serialize)]
+    struct GuildInfo {
+        id: String,
+        name: Option<String>,
+        icon_url: Option<String>,
+        joined: bool,
+    }
+
+    /// `GET /v1/mgmt/discord/bots/{app_id}/guilds/{guild_id}/info`: name and icon for the
+    /// dashboard's server pills.
+    async fn guild_info(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path((app_id, guild_id)): Path<(String, String)>,
+    ) -> AppResult<Json<GuildInfo>> {
+        require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
+        let guild = GuildId::new(parse_snowflake(&guild_id, "guild_id")?);
+        let name = identity.guild_name(guild);
+        Ok(Json(GuildInfo {
+            id: guild_id,
+            joined: name.is_some(),
+            icon_url: identity.guild_icon_url(guild),
+            name,
+        }))
+    }
+
+    /// `GET /v1/mgmt/discord/bots/{app_id}/guilds/{guild_id}/roles`: the roles a DJ role can be
+    /// picked from, highest first.
+    async fn guild_roles(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path((app_id, guild_id)): Path<(String, String)>,
+    ) -> AppResult<Json<Vec<RoleInfo>>> {
+        require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
+        let guild = GuildId::new(parse_snowflake(&guild_id, "guild_id")?);
+        Ok(Json(identity.guild_roles(guild)))
     }
 
     /// `POST /v1/mgmt/discord/bots/{app_id}/guilds/{guild_id}/leave`.
@@ -212,9 +281,18 @@ mod imp {
         guilds: Vec<GuildOverview>,
     }
 
+    /// The library's owner as the Hub reports them; an implicit owner of every bot here.
+    #[derive(Serialize)]
+    struct LibraryOwner {
+        handle: String,
+        display_name: String,
+        discord_id: Option<String>,
+    }
+
     #[derive(Serialize)]
     struct Overview {
         enabled: bool,
+        library_owner: Option<LibraryOwner>,
         bots: Vec<BotOverview>,
     }
 
@@ -247,13 +325,20 @@ mod imp {
     ) -> AppResult<Json<Overview>> {
         require_mgmt_auth(&headers, &state).await?;
         let mut bots = Vec::new();
+        let mut library_owner = None;
         if let Some(rt) = crate::discord::runtime() {
             for i in &rt.identities {
                 bots.push(describe(i).await);
             }
+            library_owner = rt.owner().map(|o| LibraryOwner {
+                handle: o.handle,
+                display_name: o.display_name,
+                discord_id: o.discord_id,
+            });
         }
         Ok(Json(Overview {
             enabled: state.config.discord.enabled(),
+            library_owner,
             bots,
         }))
     }

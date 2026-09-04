@@ -648,18 +648,35 @@ pub fn busy(
 pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
     let icons = &snap.icons;
     let onoff = |b: bool| if b { "on" } else { "off" };
-    let dj = match gs.dj_role_id.as_deref().and_then(|r| r.parse::<u64>().ok()) {
-        Some(id) => format!("<@&{id}>"),
-        None => "none, anyone in the channel".to_string(),
+    let dj_roles = gs.dj_roles();
+    let dj = if dj_roles.is_empty() {
+        "none, anyone in the channel".to_string()
+    } else {
+        dj_roles
+            .iter()
+            .map(|id| format!("<@&{id}>"))
+            .collect::<Vec<_>>()
+            .join(", ")
     };
+    let not_enabled = "not enabled by the library owner";
     let volume = gs
         .volume
         .map(|v| format!("{v}%"))
         .unwrap_or_else(|| format!("{}% (bot default)", snap.volume));
-    let always_on = match (gs.always_on, gs.always_on_channel_id.as_deref()) {
-        (true, Some(ch)) => format!("on, in <#{ch}>"),
-        (true, None) => "on".to_string(),
-        (false, _) => "off".to_string(),
+    let always_on = match (
+        gs.can_always_on,
+        gs.always_on,
+        gs.always_on_channel_id.as_deref(),
+    ) {
+        (false, ..) => not_enabled.to_string(),
+        (true, true, Some(ch)) => format!("on, in <#{ch}>"),
+        (true, true, None) => "on".to_string(),
+        (true, false, _) => "off".to_string(),
+    };
+    let autoplay = if gs.can_autoplay {
+        onoff(gs.autoplay)
+    } else {
+        not_enabled
     };
     let mut body = header(
         &icons.get(Icon::Gear),
@@ -667,16 +684,16 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
         Some(&format!("{} in this server", snap.bot_name)),
     );
     body.push(text(format!(
-        "**DJ role** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {}\n**24/7** · {always_on}\n**Re-post controller when it scrolls away** · {}",
+        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Re-post controller when it scrolls away** · {}",
         onoff(gs.normalize),
-        onoff(gs.autoplay),
         onoff(gs.announce)
     )));
     body.push(separator(false, Spacing::Large));
     body.push(row(vec![Component::RoleSelect {
         custom_id: id(snap, Action::Select("dj".into())),
-        placeholder: Some("DJ role: who may control shared playback".into()),
-        default_role: gs.dj_role_id.as_deref().and_then(|r| r.parse().ok()),
+        placeholder: Some("DJ roles: who may control shared playback".into()),
+        default_roles: dj_roles,
+        max_values: 25,
     }]));
     let setting = |name: &str, icon: Icon, label: String| {
         button(
@@ -709,7 +726,7 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
             Icon::Queue,
             format!("Re-post: {}", onoff(gs.announce)),
         ),
-        setting("dj_clear", Icon::Cross, "Clear DJ role".into()),
+        setting("dj_clear", Icon::Cross, "Clear DJ roles".into()),
     ]));
     Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
@@ -1182,12 +1199,18 @@ mod tests {
         let s = snap(0, true, false);
         let mut gs = GuildSettings::defaults("1", "777");
         settings(&s, &gs).validate().unwrap();
-        gs.dj_role_id = Some("99".into());
+        gs.dj_role_ids = vec!["99".into(), "98".into()];
         gs.always_on = true;
         gs.always_on_channel_id = Some("555".into());
         let b = settings(&s, &gs).body();
         let txt = b.to_string();
-        assert!(txt.contains("<@&99>") && txt.contains("<#555>"), "{txt}");
+        assert!(
+            txt.contains("<@&99>") && txt.contains("<@&98>") && txt.contains("<#555>"),
+            "{txt}"
+        );
+        gs.can_always_on = false;
+        let txt = settings(&s, &gs).body().to_string();
+        assert!(txt.contains("not enabled by the library owner"), "{txt}");
         // header, divider, summary, gap, then the DJ role select row.
         assert_eq!(
             b["components"][0]["components"][4]["components"][0]["type"],

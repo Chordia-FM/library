@@ -181,6 +181,8 @@ fn spawn_ticker(identity: Arc<Identity>) -> tokio::task::JoinHandle<()> {
             // Anything the theme job could not do earlier (a rate limit, a dashboard change while
             // offline) gets its chance here.
             crate::discord::theme::tick(&identity).await;
+            // Rotating statuses and live counts advance here; unchanged text is not resent.
+            presence::update(&identity).await;
         }
     })
 }

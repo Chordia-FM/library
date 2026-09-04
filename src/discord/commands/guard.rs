@@ -6,9 +6,10 @@
 //!   playing to people in another channel of the same guild refuses and names a sibling that is
 //!   free. A bot alone in a channel, or idle, simply moves.
 //! - **Controller**: may the caller change what everyone hears (skip, stop, seek, volume, loop,
-//!   queue edits)? Yes if any holds: they are a configured owner of the bot; they can manage the
-//!   server; the guild has no DJ role; they hold the DJ role; or they are the only listener.
-//!   Otherwise the answer names the DJ role.
+//!   queue edits)? Yes if any holds: they own the bot (its owner list, or the library's owner
+//!   through their linked Discord account); they can manage the server; the guild has no DJ
+//!   roles; they hold one of the DJ roles; or they are the only listener. Otherwise the answer
+//!   names the DJ roles.
 //!
 //! Both are plain functions over ids and members so the slash commands and the button presses
 //! share them.
@@ -33,10 +34,12 @@ pub enum Refusal {
         free: Vec<String>,
     },
     NeedDj {
-        role: Option<RoleId>,
+        roles: Vec<RoleId>,
     },
     /// Server settings: Manage Server, Administrator, or a configured bot owner.
     NeedAdmin,
+    /// The library owner has not enabled this (24/7, autoplay) for the server.
+    NotAllowed(&'static str),
     Offline,
 }
 
@@ -54,10 +57,15 @@ impl Refusal {
                 listeners,
                 free,
             } => views::busy(icons, bot_name, *channel, *listeners, free),
-            Refusal::NeedDj { role } => {
-                let who = match role {
-                    Some(r) => format!("<@&{}>", r.get()),
-                    None => "a DJ".to_string(),
+            Refusal::NeedDj { roles } => {
+                let who = if roles.is_empty() {
+                    "a DJ".to_string()
+                } else {
+                    roles
+                        .iter()
+                        .map(|r| format!("<@&{}>", r.get()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 };
                 views::notice(
                     icons,
@@ -71,6 +79,11 @@ impl Refusal {
                 icons,
                 "That's a server setting",
                 "-# Someone with **Manage Server** (or a bot owner) can change it.",
+            ),
+            Refusal::NotAllowed(what) => views::notice(
+                icons,
+                "Not enabled here",
+                &format!("-# The library owner hasn't enabled {what} for this server."),
             ),
             Refusal::Offline => views::error(
                 icons,
@@ -134,7 +147,7 @@ pub fn admin_for(
     user: UserId,
     member: Option<&Member>,
 ) -> Result<(), Refusal> {
-    if identity.settings().is_owner(user.get()) {
+    if identity.is_owner(user.get()) {
         return Ok(());
     }
     let allowed = member.is_some_and(|m| {
@@ -164,7 +177,7 @@ pub async fn controller_for(
     user: UserId,
     member: Option<&Member>,
 ) -> Result<(), Refusal> {
-    if identity.settings().is_owner(user.get()) {
+    if identity.is_owner(user.get()) {
         return Ok(());
     }
     if let Some(m) = member {
@@ -174,20 +187,21 @@ pub async fn controller_for(
             return Ok(());
         }
     }
-    let dj_role: Option<RoleId> = player
+    let roles: Vec<RoleId> = player
         .settings()
         .await
-        .dj_role_id
-        .and_then(|r| r.parse::<u64>().ok())
-        .map(RoleId::new);
-    let Some(role) = dj_role else {
+        .dj_roles()
+        .into_iter()
+        .map(RoleId::new)
+        .collect();
+    if roles.is_empty() {
         return Ok(());
-    };
-    if member.is_some_and(|m| m.roles.contains(&role)) {
+    }
+    if member.is_some_and(|m| m.roles.iter().any(|r| roles.contains(r))) {
         return Ok(());
     }
     if player.is_alone_with(user).await {
         return Ok(());
     }
-    Err(Refusal::NeedDj { role: Some(role) })
+    Err(Refusal::NeedDj { roles })
 }

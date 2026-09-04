@@ -14,17 +14,26 @@ pub(crate) fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-/// How a bot presents itself across guilds.
+/// How a bot presents itself across guilds. The mode only decides what the presence says (and,
+/// in single-server mode, whether the voice channel's status follows the track); which servers
+/// the bot serves is [`BotSettings::allowed_guilds`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum BotMode {
-    /// Serves any guild; the presence is a static "Listening to /play".
+    /// Serves any guild; the presence rotates through [`BotSettings::multi_statuses`].
     #[default]
     Multi,
     /// One guild is the point. Presence follows that guild's now-playing, rendered through
     /// [`BotSettings::presence_template`].
     Single,
 }
+
+/// The most statuses a multi-server bot rotates through.
+pub const MAX_STATUSES: usize = 20;
+/// Discord caps an activity name at 128 characters.
+pub const STATUS_MAX_CHARS: usize = 128;
+/// Presence updates are rate limited (5 per 20 s per shard); rotating faster is pointless.
+pub const MIN_ROTATE_SECS: u32 = 15;
 
 impl BotMode {
     fn as_str(self) -> &'static str {
@@ -48,7 +57,12 @@ pub struct BotSettings {
     pub app_id: String,
     pub display_name: Option<String>,
     pub mode: BotMode,
+    /// Single-server mode: `{title} {artist} {album} {guild} {channel} {listeners}`.
     pub presence_template: String,
+    /// Multi-server mode: statuses shown in turn, every `status_rotate_secs`. Variables:
+    /// `{servers} {playing} {listeners} {tracks} {bot}`.
+    pub multi_statuses: Vec<String>,
+    pub status_rotate_secs: u32,
     pub default_volume: u8,
     pub idle_timeout_secs: u32,
     /// `None` = any guild the bot is invited to.
@@ -84,6 +98,8 @@ impl BotSettings {
             display_name: None,
             mode: BotMode::Multi,
             presence_template: "{title} · {artist}".to_string(),
+            multi_statuses: vec!["/play".to_string()],
+            status_rotate_secs: 60,
             default_volume: 100,
             idle_timeout_secs: 300,
             allowed_guilds: None,
@@ -125,6 +141,8 @@ pub struct BotSettingsPatch {
     pub display_name: Option<Option<String>>,
     pub mode: Option<BotMode>,
     pub presence_template: Option<String>,
+    pub multi_statuses: Option<Vec<String>>,
+    pub status_rotate_secs: Option<u32>,
     pub default_volume: Option<u8>,
     pub idle_timeout_secs: Option<u32>,
     #[serde(default, deserialize_with = "double_option")]
@@ -155,6 +173,22 @@ impl BotSettingsPatch {
         }
         if let Some(v) = self.presence_template {
             s.presence_template = v;
+        }
+        if let Some(v) = self.multi_statuses {
+            let list: Vec<String> = v
+                .into_iter()
+                .map(|t| t.trim().chars().take(STATUS_MAX_CHARS).collect::<String>())
+                .filter(|t| !t.is_empty())
+                .take(MAX_STATUSES)
+                .collect();
+            s.multi_statuses = if list.is_empty() {
+                vec!["/play".to_string()]
+            } else {
+                list
+            };
+        }
+        if let Some(v) = self.status_rotate_secs {
+            s.status_rotate_secs = v.max(MIN_ROTATE_SECS);
         }
         if let Some(v) = self.default_volume {
             s.default_volume = v.min(150);
@@ -190,6 +224,8 @@ struct BotRow {
     display_name: Option<String>,
     mode: String,
     presence_template: String,
+    multi_statuses: String,
+    status_rotate_secs: i64,
     default_volume: i64,
     idle_timeout_secs: i64,
     allowed_guilds: Option<String>,
@@ -209,7 +245,8 @@ struct BotRow {
 
 pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
     let row = sqlx::query_as::<_, BotRow>(
-        "SELECT app_id, display_name, mode, presence_template, default_volume, \
+        "SELECT app_id, display_name, mode, presence_template, multi_statuses, \
+                status_rotate_secs, default_volume, \
                 idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, emoji_hex, \
                 emoji_hex_applied, avatar_managed, avatar_hex_applied, avatar_custom_path, \
                 avatar_custom_applied, theme_retry_at, theme_warning, theme_backoff, commands_hash \
@@ -225,6 +262,11 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
             display_name: r.display_name,
             mode: BotMode::parse(&r.mode),
             presence_template: r.presence_template,
+            multi_statuses: serde_json::from_str::<Vec<String>>(&r.multi_statuses)
+                .ok()
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| vec!["/play".to_string()]),
+            status_rotate_secs: (r.status_rotate_secs.max(0) as u32).max(MIN_ROTATE_SECS),
             default_volume: r.default_volume.clamp(0, 150) as u8,
             idle_timeout_secs: r.idle_timeout_secs.max(0) as u32,
             allowed_guilds: r.allowed_guilds.and_then(|j| serde_json::from_str(&j).ok()),
@@ -250,16 +292,20 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
         .as_ref()
         .map(|l| serde_json::to_string(l).unwrap_or_else(|_| "[]".into()));
     let owners = serde_json::to_string(&s.owner_discord_ids).unwrap_or_else(|_| "[]".into());
+    let statuses = serde_json::to_string(&s.multi_statuses).unwrap_or_else(|_| "[]".into());
     sqlx::query(
         "INSERT INTO discord_bot_settings (app_id, display_name, mode, presence_template, \
+             multi_statuses, status_rotate_secs, \
              default_volume, idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, \
              emoji_hex, emoji_hex_applied, avatar_managed, avatar_hex_applied, \
              avatar_custom_path, avatar_custom_applied, theme_retry_at, theme_warning, \
              theme_backoff, commands_hash, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id) DO UPDATE SET \
              display_name = excluded.display_name, mode = excluded.mode, \
              presence_template = excluded.presence_template, \
+             multi_statuses = excluded.multi_statuses, \
+             status_rotate_secs = excluded.status_rotate_secs, \
              default_volume = excluded.default_volume, \
              idle_timeout_secs = excluded.idle_timeout_secs, \
              allowed_guilds = excluded.allowed_guilds, \
@@ -277,6 +323,8 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     .bind(&s.display_name)
     .bind(s.mode.as_str())
     .bind(&s.presence_template)
+    .bind(statuses)
+    .bind(s.status_rotate_secs as i64)
     .bind(s.default_volume as i64)
     .bind(s.idle_timeout_secs as i64)
     .bind(allowed)
@@ -303,16 +351,23 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
 pub struct GuildSettings {
     pub app_id: String,
     pub guild_id: String,
-    pub dj_role_id: Option<String>,
+    /// Roles that may control shared playback; empty = anyone in the channel.
+    pub dj_role_ids: Vec<String>,
     pub controller_channel_id: Option<String>,
     pub controller_message_id: Option<String>,
     /// `None` = the bot's default volume.
     pub volume: Option<u8>,
     pub normalize: bool,
+    /// The server's own choices (a command, a button)…
     pub always_on: bool,
     pub always_on_channel_id: Option<String>,
     pub autoplay: bool,
     pub announce: bool,
+    /// …inside what the library owner allows this server.
+    pub can_always_on: bool,
+    pub can_autoplay: bool,
+    /// Messages after the controller before it is re-posted at the bottom; 0 = never.
+    pub announce_after: u32,
 }
 
 impl GuildSettings {
@@ -320,7 +375,7 @@ impl GuildSettings {
         Self {
             app_id: app_id.to_string(),
             guild_id: guild_id.to_string(),
-            dj_role_id: None,
+            dj_role_ids: Vec::new(),
             controller_channel_id: None,
             controller_message_id: None,
             volume: None,
@@ -329,27 +384,46 @@ impl GuildSettings {
             always_on_channel_id: None,
             autoplay: false,
             announce: true,
+            can_always_on: true,
+            can_autoplay: true,
+            announce_after: 20,
         }
+    }
+
+    /// Role ids that parse as snowflakes; the bot never wrote anything else, but a dashboard could.
+    pub fn dj_roles(&self) -> Vec<u64> {
+        self.dj_role_ids
+            .iter()
+            .filter_map(|r| r.parse::<u64>().ok())
+            .collect()
     }
 }
 
 /// A partial update from the dashboard for one guild; absent means unchanged, `null` clears.
+/// 24/7 and autoplay themselves are not here: the dashboard grants or withdraws them, the server
+/// turns them on and off.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct GuildSettingsPatch {
-    #[serde(default, deserialize_with = "double_option")]
-    pub dj_role_id: Option<Option<String>>,
+    pub dj_role_ids: Option<Vec<String>>,
     #[serde(default, deserialize_with = "double_option")]
     pub volume: Option<Option<u8>>,
     pub normalize: Option<bool>,
-    pub always_on: Option<bool>,
-    pub autoplay: Option<bool>,
     pub announce: Option<bool>,
+    pub announce_after: Option<u32>,
+    pub can_always_on: Option<bool>,
+    pub can_autoplay: Option<bool>,
 }
 
 impl GuildSettingsPatch {
     pub fn apply(self, s: &mut GuildSettings) {
-        if let Some(v) = self.dj_role_id {
-            s.dj_role_id = v.filter(|r| !r.trim().is_empty());
+        if let Some(v) = self.dj_role_ids {
+            let mut list: Vec<String> = v
+                .into_iter()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_digit()))
+                .collect();
+            list.dedup();
+            s.dj_role_ids = list;
         }
         if let Some(v) = self.volume {
             s.volume = v.map(|x| x.min(150));
@@ -357,17 +431,25 @@ impl GuildSettingsPatch {
         if let Some(v) = self.normalize {
             s.normalize = v;
         }
-        if let Some(v) = self.always_on {
-            s.always_on = v;
+        if let Some(v) = self.announce {
+            s.announce = v;
+        }
+        if let Some(v) = self.announce_after {
+            s.announce_after = v.min(500);
+        }
+        if let Some(v) = self.can_always_on {
+            s.can_always_on = v;
             if !v {
+                // Withdrawn: the server's 24/7 ends with it.
+                s.always_on = false;
                 s.always_on_channel_id = None;
             }
         }
-        if let Some(v) = self.autoplay {
-            s.autoplay = v;
-        }
-        if let Some(v) = self.announce {
-            s.announce = v;
+        if let Some(v) = self.can_autoplay {
+            s.can_autoplay = v;
+            if !v {
+                s.autoplay = false;
+            }
         }
     }
 }
@@ -376,7 +458,7 @@ impl GuildSettingsPatch {
 struct GuildRow {
     app_id: String,
     guild_id: String,
-    dj_role_id: Option<String>,
+    dj_role_ids: String,
     controller_channel_id: Option<String>,
     controller_message_id: Option<String>,
     volume: Option<i64>,
@@ -385,6 +467,9 @@ struct GuildRow {
     always_on_channel_id: Option<String>,
     autoplay: i64,
     announce: i64,
+    can_always_on: i64,
+    can_autoplay: i64,
+    announce_after: i64,
 }
 
 impl From<GuildRow> for GuildSettings {
@@ -392,7 +477,7 @@ impl From<GuildRow> for GuildSettings {
         GuildSettings {
             app_id: r.app_id,
             guild_id: r.guild_id,
-            dj_role_id: r.dj_role_id,
+            dj_role_ids: serde_json::from_str(&r.dj_role_ids).unwrap_or_default(),
             controller_channel_id: r.controller_channel_id,
             controller_message_id: r.controller_message_id,
             volume: r.volume.map(|v| v.clamp(0, 150) as u8),
@@ -401,12 +486,16 @@ impl From<GuildRow> for GuildSettings {
             always_on_channel_id: r.always_on_channel_id,
             autoplay: r.autoplay != 0,
             announce: r.announce != 0,
+            can_always_on: r.can_always_on != 0,
+            can_autoplay: r.can_autoplay != 0,
+            announce_after: r.announce_after.clamp(0, 500) as u32,
         }
     }
 }
 
-const GUILD_COLS: &str = "app_id, guild_id, dj_role_id, controller_channel_id, \
-     controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce";
+const GUILD_COLS: &str = "app_id, guild_id, dj_role_ids, controller_channel_id, \
+     controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce, \
+     can_always_on, can_autoplay, announce_after";
 
 pub async fn load_guild(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<GuildSettings> {
     let row = sqlx::query_as::<_, GuildRow>(AssertSqlSafe(format!(
@@ -433,22 +522,25 @@ pub async fn load_guilds(db: &SqlitePool, app_id: &str) -> AppResult<Vec<GuildSe
 }
 
 pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
+    let dj = serde_json::to_string(&s.dj_role_ids).unwrap_or_else(|_| "[]".into());
     sqlx::query(
-        "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_id, controller_channel_id, \
+        "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_ids, controller_channel_id, \
              controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, \
-             announce, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             announce, can_always_on, can_autoplay, announce_after, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id, guild_id) DO UPDATE SET \
-             dj_role_id = excluded.dj_role_id, \
+             dj_role_ids = excluded.dj_role_ids, \
              controller_channel_id = excluded.controller_channel_id, \
              controller_message_id = excluded.controller_message_id, volume = excluded.volume, \
              normalize = excluded.normalize, always_on = excluded.always_on, \
              always_on_channel_id = excluded.always_on_channel_id, autoplay = excluded.autoplay, \
-             announce = excluded.announce, updated_at = excluded.updated_at",
+             announce = excluded.announce, can_always_on = excluded.can_always_on, \
+             can_autoplay = excluded.can_autoplay, announce_after = excluded.announce_after, \
+             updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
     .bind(&s.guild_id)
-    .bind(&s.dj_role_id)
+    .bind(dj)
     .bind(&s.controller_channel_id)
     .bind(&s.controller_message_id)
     .bind(s.volume.map(|v| v as i64))
@@ -457,6 +549,9 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(&s.always_on_channel_id)
     .bind(s.autoplay as i64)
     .bind(s.announce as i64)
+    .bind(s.can_always_on as i64)
+    .bind(s.can_autoplay as i64)
+    .bind(s.announce_after as i64)
     .bind(now_ms())
     .execute(db)
     .await?;
@@ -517,6 +612,37 @@ mod tests {
         p.apply(&mut s);
         assert_eq!(s.display_name.as_deref(), Some("Two"));
         assert_eq!(s.default_volume, 150);
+    }
+
+    #[test]
+    fn statuses_are_trimmed_capped_and_never_empty() {
+        let mut s = BotSettings::defaults("1");
+        let p: BotSettingsPatch = serde_json::from_str(
+            r#"{"multi_statuses": ["  ", "/play", "{servers} servers"], "status_rotate_secs": 1}"#,
+        )
+        .unwrap();
+        p.apply(&mut s);
+        assert_eq!(s.multi_statuses, vec!["/play", "{servers} servers"]);
+        assert_eq!(s.status_rotate_secs, MIN_ROTATE_SECS);
+        let p: BotSettingsPatch = serde_json::from_str(r#"{"multi_statuses": []}"#).unwrap();
+        p.apply(&mut s);
+        assert_eq!(s.multi_statuses, vec!["/play"]);
+    }
+
+    #[test]
+    fn withdrawing_a_permission_ends_its_use() {
+        let mut g = GuildSettings::defaults("1", "2");
+        g.always_on = true;
+        g.always_on_channel_id = Some("5".into());
+        g.autoplay = true;
+        let p: GuildSettingsPatch = serde_json::from_str(
+            r#"{"can_always_on": false, "can_autoplay": false, "dj_role_ids": ["1", "x", "1", " 2 "]}"#,
+        )
+        .unwrap();
+        p.apply(&mut g);
+        assert!(!g.always_on && g.always_on_channel_id.is_none() && !g.autoplay);
+        assert_eq!(g.dj_role_ids, vec!["1", "2"]);
+        assert_eq!(g.dj_roles(), vec![1, 2]);
     }
 
     #[test]

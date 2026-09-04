@@ -293,6 +293,10 @@ pub async fn radio(ctx: Context<'_>, #[description = "On or off"] on: bool) -> R
     let Some(player) = controlled(ctx).await? else {
         return Ok(());
     };
+    if on && !player.settings().await.can_autoplay {
+        let r = super::guard::Refusal::NotAllowed("autoplay");
+        return send::respond(ctx, r.view(&super::icons(ctx))).await;
+    }
     let on = player.set_autoplay(on).await;
     send::respond(
         ctx,

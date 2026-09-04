@@ -44,6 +44,7 @@ pub mod ui;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use chordia_contracts::directory::ServerOwner;
 use serenity::all::GuildId;
 use songbird::driver::Scheduler;
 use tokio_util::sync::CancellationToken;
@@ -57,6 +58,59 @@ static RUNTIME: OnceLock<Arc<Runtime>> = OnceLock::new();
 pub struct Runtime {
     pub identities: Vec<Arc<Identity>>,
     cancel: CancellationToken,
+    /// Who owns this library, per the Hub. The owner is an implicit owner of every bot here.
+    /// `None` until the Hub answered (or when there is no Hub).
+    owner: std::sync::RwLock<Option<ServerOwner>>,
+}
+
+impl Runtime {
+    pub fn owner(&self) -> Option<ServerOwner> {
+        self.owner.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn owner_discord_id(&self) -> Option<u64> {
+        self.owner()
+            .and_then(|o| o.discord_id)
+            .and_then(|id| id.parse().ok())
+    }
+
+    pub(crate) fn set_owner(&self, owner: Option<ServerOwner>) {
+        *self.owner.write().unwrap_or_else(|e| e.into_inner()) = owner;
+    }
+}
+
+/// Ask the Hub who owns this library, now and then hourly (the owner may link Discord later).
+/// Unpaired or Hub-less libraries simply have no implicit owner.
+fn spawn_owner_refresh(state: AppState, rt: Arc<Runtime>) {
+    tokio::spawn(async move {
+        let hub =
+            crate::pairing::HubClient::new(state.config.backend_url.clone(), state.http.clone());
+        loop {
+            let key = state
+                .credentials
+                .read()
+                .await
+                .as_ref()
+                .map(|c| c.server_api_key.clone());
+            let wait = match key {
+                None => Duration::from_secs(300),
+                Some(key) => match hub.server_owner(&key).await {
+                    Ok(owner) => {
+                        rt.set_owner(Some(owner));
+                        Duration::from_secs(3600)
+                    }
+                    Err(e) => {
+                        tracing::debug!(error = %e, "asking the Hub who owns this library");
+                        Duration::from_secs(300)
+                    }
+                },
+            };
+            tokio::select! {
+                _ = rt.cancel.cancelled() => return,
+                _ = tokio::time::sleep(wait) => {}
+            }
+        }
+    });
 }
 
 /// The running bots, if any were configured.
@@ -97,7 +151,11 @@ pub fn start(state: AppState) -> Option<Arc<Runtime>> {
             )
         })
         .collect();
-    let runtime = Arc::new(Runtime { identities, cancel });
+    let runtime = Arc::new(Runtime {
+        identities,
+        cancel,
+        owner: std::sync::RwLock::new(None),
+    });
     let runtime = match RUNTIME.set(runtime.clone()) {
         Ok(()) => runtime,
         Err(_) => return RUNTIME.get().cloned(),
@@ -106,6 +164,7 @@ pub fn start(state: AppState) -> Option<Arc<Runtime>> {
     for identity in &runtime.identities {
         client::spawn_supervisor(identity.clone());
     }
+    spawn_owner_refresh(state, runtime.clone());
     Some(runtime)
 }
 

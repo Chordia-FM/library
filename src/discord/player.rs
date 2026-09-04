@@ -34,7 +34,6 @@ const HISTORY_CAP: usize = 50;
 /// costs one edit.
 const CONTROLLER_COALESCE: Duration = Duration::from_millis(1200);
 /// How many newer messages may sit below the controller before it is re-posted at the bottom.
-const CONTROLLER_REPOST_AFTER: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LoopMode {
@@ -326,6 +325,10 @@ impl GuildPlayer {
 
     pub async fn is_playing(&self) -> bool {
         self.inner.lock().await.current.is_some()
+    }
+
+    pub async fn listener_count(&self) -> usize {
+        self.inner.lock().await.listeners.len()
     }
 
     pub async fn has_listeners(&self) -> bool {
@@ -1171,7 +1174,9 @@ impl GuildPlayer {
             (
                 s.text_channel,
                 s.controller,
-                s.messages_since_controller >= CONTROLLER_REPOST_AFTER && s.settings.announce,
+                s.settings.announce
+                    && s.settings.announce_after > 0
+                    && s.messages_since_controller >= s.settings.announce_after,
             )
         };
         let Some(text) = text else { return };

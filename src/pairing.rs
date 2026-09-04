@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, CatalogSyncResponse};
-use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse};
+use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse, ServerOwner};
 use chordia_contracts::identify::{IdentifyRequest, IdentifyResponse};
 use chordia_contracts::scrobble::ScrobbleBatch;
 use serde::{Deserialize, Serialize};
@@ -102,6 +102,22 @@ impl HubClient {
             anyhow::bail!("Hub pair failed {status}: {body}");
         }
         Ok(resp.json().await?)
+    }
+
+    /// `GET /v1/directory/me`: who owns this server, per the Hub. The Discord bots treat the
+    /// owner (through the Discord account linked to their Chordia account) as a bot owner.
+    pub async fn server_owner(&self, server_api_key: &str) -> anyhow::Result<ServerOwner> {
+        let url = format!("{}/v1/directory/me", self.base()?);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("owner lookup failed {}", resp.status());
+        }
+        Ok(resp.json::<ServerOwner>().await?)
     }
 
     /// Call `POST /v1/directory/heartbeat` using the server's own API key.
