@@ -33,5 +33,5 @@ pub async fn bots(ctx: Context<'_>) -> Result<(), Error> {
             listeners,
         });
     }
-    send::respond(ctx, views::bots(&lines)).await
+    send::respond(ctx, views::bots(&super::icons(ctx), &lines)).await
 }

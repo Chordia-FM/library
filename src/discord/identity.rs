@@ -18,6 +18,7 @@ use songbird::Songbird;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
+use crate::discord::emoji::IconSet;
 use crate::discord::player::GuildPlayer;
 use crate::discord::settings::{self, BotSettings};
 use crate::http::AppState;
@@ -80,6 +81,9 @@ pub struct Identity {
     pub(crate) last_activity: Mutex<Option<String>>,
     /// Last voice-channel status sent per channel, same reason.
     pub(crate) last_vc_status: Mutex<HashMap<ChannelId, String>>,
+    /// The bot's application emojis, resolved on connect; empty until then (views fall back to
+    /// Unicode glyphs).
+    icons: RwLock<Arc<IconSet>>,
 }
 
 impl Identity {
@@ -110,7 +114,16 @@ impl Identity {
             restart: Notify::new(),
             last_activity: Mutex::new(None),
             last_vc_status: Mutex::new(HashMap::new()),
+            icons: RwLock::new(Arc::new(IconSet::default())),
         })
+    }
+
+    pub fn icons(&self) -> Arc<IconSet> {
+        self.icons.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set_icons(&self, set: Arc<IconSet>) {
+        *self.icons.write().unwrap_or_else(|e| e.into_inner()) = set;
     }
 
     // ---- profile / status / settings ---------------------------------------------------------------

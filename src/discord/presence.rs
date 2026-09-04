@@ -79,7 +79,7 @@ pub async fn set_voice_status(identity: &Identity, channel: ChannelId, track: Op
     let status = track
         .map(|t| {
             fmt::ellipsize(
-                &format!("{} {} — {}", fmt::glyph::NOTE, t.title, t.artist),
+                &format!("{} {} · {}", fmt::glyph::NOTE, t.title, t.artist),
                 VC_STATUS_MAX,
             )
         })

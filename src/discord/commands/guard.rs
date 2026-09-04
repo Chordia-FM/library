@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serenity::all::{ChannelId, GuildId, Member, Permissions, RoleId, UserId};
 
 use super::Context;
+use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
 use crate::discord::player::GuildPlayer;
 use crate::discord::ui::{views, Message};
@@ -38,24 +39,26 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    pub fn view(&self) -> Message {
+    pub fn view(&self, icons: &IconSet) -> Message {
         match self {
             Refusal::NotInVoice => views::notice(
+                icons,
                 "Join a voice channel first",
-                "-# I play where you are — hop into a voice channel and try again.",
+                "-# I play where you are. Hop into a voice channel and try again.",
             ),
             Refusal::Busy {
                 bot_name,
                 channel_name,
                 listeners,
                 free,
-            } => views::busy(bot_name, channel_name, *listeners, free),
+            } => views::busy(icons, bot_name, channel_name, *listeners, free),
             Refusal::NeedDj { role } => {
                 let who = match role {
                     Some(r) => format!("<@&{}>", r.get()),
                     None => "a DJ".to_string(),
                 };
                 views::notice(
+                    icons,
                     "That's a DJ control",
                     &format!(
                         "Only {who} (or someone who manages the server) can change what everyone hears while others are listening.\n-# Alone in the channel? Then it's all yours."
@@ -63,6 +66,7 @@ impl Refusal {
                 )
             }
             Refusal::Offline => views::error(
+                icons,
                 "Not connected",
                 "-# This bot is reconnecting to Discord. Try again in a moment.",
             ),

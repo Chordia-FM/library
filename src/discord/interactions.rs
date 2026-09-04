@@ -11,7 +11,7 @@ use serenity::all::{ComponentInteraction, ComponentInteractionDataKind, Context,
 use crate::discord::commands::guard;
 use crate::discord::commands::play::resolve;
 use crate::discord::identity::Identity;
-use crate::discord::player::{Position, QueueItem};
+use crate::discord::player::{Cover, Position, QueueItem};
 use crate::discord::ui::custom_id::{Action, CustomId};
 use crate::discord::ui::{send, views};
 use crate::search::HitKind;
@@ -38,7 +38,7 @@ pub async fn handle(
             if let Err(r) =
                 guard::controller_for(identity, &player, guild, user, ic.member.as_ref()).await
             {
-                return send::component_reply(http, ic, r.view()).await;
+                return send::component_reply(http, ic, r.view(&identity.icons())).await;
             }
             let result: Result<(), crate::discord::player::PlayerError> = $body;
             match result {
@@ -47,7 +47,7 @@ pub async fn handle(
                     send::component_reply(
                         http,
                         ic,
-                        views::error("Couldn't do that", &format!("-# {e}")),
+                        views::error(&identity.icons(), "Couldn't do that", &format!("-# {e}")),
                     )
                     .await
                 }
@@ -94,7 +94,7 @@ pub async fn handle(
         }
         Action::Refresh => {
             let snap = player.snapshot().await;
-            send::component_update(http, ic, views::now_playing(&snap).ephemeral()).await
+            send::component_update(http, ic, views::now_playing(&snap, false).ephemeral()).await
         }
         Action::Cancel => send::component_update(http, ic, views::cancelled()).await,
         Action::Select(_) | Action::Play(_) => {
@@ -110,7 +110,7 @@ pub async fn handle(
             };
             let (vc, player) = match guard::listener_for(identity, guild, user).await {
                 Ok(x) => x,
-                Err(r) => return send::component_reply(http, ic, r.view()).await,
+                Err(r) => return send::component_reply(http, ic, r.view(&identity.icons())).await,
             };
             let resolved = resolve(
                 &identity.state.db,
@@ -122,7 +122,11 @@ pub async fn handle(
                 return send::component_update(
                     http,
                     ic,
-                    views::notice("Gone", "-# That track is no longer in the library."),
+                    views::notice(
+                        &identity.icons(),
+                        "Gone",
+                        "-# That track is no longer in the library.",
+                    ),
                 )
                 .await;
             }
@@ -131,7 +135,7 @@ pub async fn handle(
                     return send::component_update(
                         http,
                         ic,
-                        views::error("Couldn't join", &format!("-# {e}")),
+                        views::error(&identity.icons(), "Couldn't join", &format!("-# {e}")),
                     )
                     .await;
                 }
@@ -144,19 +148,26 @@ pub async fn handle(
                     requested_by: user,
                 })
                 .collect();
+            let cover = Cover::load(&identity.state.db, &items[0].track).await;
             match player.enqueue(items.clone(), Position::Last).await {
                 Ok(enq) => {
                     let snap = player.snapshot().await;
                     // The picker was ephemeral; the confirmation replaces it and stays private.
-                    let toast =
-                        views::queued(&snap, &items, &enq, resolved.source.as_deref()).ephemeral();
+                    let toast = views::queued(
+                        &snap,
+                        &items,
+                        &enq,
+                        resolved.source.as_deref(),
+                        cover.as_ref(),
+                    )
+                    .ephemeral();
                     send::component_update(http, ic, toast).await
                 }
                 Err(e) => {
                     send::component_update(
                         http,
                         ic,
-                        views::error("Couldn't queue that", &format!("-# {e}")),
+                        views::error(&identity.icons(), "Couldn't queue that", &format!("-# {e}")),
                     )
                     .await
                 }

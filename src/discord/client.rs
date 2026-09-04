@@ -128,6 +128,9 @@ async fn run_once(identity: &Arc<Identity>) -> anyhow::Result<Exit> {
     // HTTP 401 rather than a gateway close code.
     let app = client.http.get_current_application_info().await?;
     let me = client.http.get_current_user().await?;
+    // The application-emoji routes are addressed by application id; serenity only learns it from
+    // the gateway's Ready, and this runs first.
+    client.http.set_application_id(app.id);
     identity.set_profile(Profile {
         app_id: app.id.get(),
         user_id: me.id,
@@ -190,6 +193,20 @@ async fn on_ready(
         identity.set_profile(p);
     }
     register_commands(identity, ctx, framework).await;
+    // The icon set: one listing on a normal boot, a batch of uploads on the first one or after a
+    // colour change. Bounded so a slow Discord cannot hold the bot in "connecting".
+    if tokio::time::timeout(
+        Duration::from_secs(120),
+        crate::discord::emoji::ensure(identity, &ctx.http),
+    )
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            bot = identity.index,
+            "application emoji setup timed out; using text glyphs"
+        );
+    }
     identity.set_status(Status::Online);
     tracing::info!(
         bot = identity.index,

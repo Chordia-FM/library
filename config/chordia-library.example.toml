@@ -101,7 +101,12 @@ dedupe_reuploads = true
 #
 # Invite it with the link shown in the library's Discord dashboard (Library → Settings → Discord),
 # which carries exactly that. Everything else about a bot (single-server mode, presence text, default
-# volume, allowed servers, DJ role…) is set at runtime from that dashboard or from Discord, never here.
+# volume, allowed servers, DJ role, the icon colour…) is set at runtime from that dashboard or from
+# Discord, never here.
+#
+# On first connection the bot uploads its own icon set (Phosphor glyphs tinted in the Chordia pink)
+# as application emojis, so its buttons and headers look the same on every server without using
+# anyone's emoji slots. Pick another colour from the dashboard; the set is regenerated in it.
 #
 # A token is a secret. Like [acoustid] api_key it lives in this file because it is the library's own
 # third-party credential — the Hub never sees it, and it never leaves this process.

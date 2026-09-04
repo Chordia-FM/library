@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 
 use super::{guard, Context, Error};
 use crate::catalog::{self, TrackRow};
-use crate::discord::player::{Position, QueueItem};
+use crate::discord::player::{Cover, Position, QueueItem};
 use crate::discord::ui::{fmt, send, views};
 use crate::error::AppResult;
 use crate::search::{self, HitKind, SearchHit};
@@ -137,8 +137,8 @@ async fn autocomplete_kinds(
     hits.into_iter()
         .map(|h| {
             let (prefix, label) = match h.kind {
-                HitKind::Track => ("t", format!("{} — {}", h.title, h.subtitle)),
-                HitKind::Album => ("al", format!("💿 {} — {}", h.title, h.subtitle)),
+                HitKind::Track => ("t", format!("{} · {}", h.title, h.subtitle)),
+                HitKind::Album => ("al", format!("💿 {} · {}", h.title, h.subtitle)),
                 HitKind::Artist => ("ar", format!("👤 {} · {}", h.title, h.subtitle)),
             };
             AutocompleteChoice::new(fmt::ellipsize(&label, 100), format!("{prefix}:{}", h.id))
@@ -156,7 +156,7 @@ async fn queue_resolved(
     let identity = ctx.data();
     let (vc, player) = match guard::listener(ctx).await {
         Ok(x) => x,
-        Err(r) => return send::respond(ctx, r.view()).await,
+        Err(r) => return send::respond(ctx, r.view(&super::icons(ctx))).await,
     };
     let resolved = resolve(&identity.state.db, query, kinds).await?;
     if resolved.tracks.is_empty() {
@@ -168,9 +168,10 @@ async fn queue_resolved(
         return send::respond(
             ctx,
             views::notice(
+                &super::icons(ctx),
                 &format!("{what} in the library matches"),
                 &format!(
-                    "-# “{}” — try `/search` for a wider look.",
+                    "-# “{}”. Try `/search` for a wider look.",
                     fmt::escape_md(&fmt::ellipsize(query, 80))
                 ),
             ),
@@ -179,7 +180,11 @@ async fn queue_resolved(
     }
     if player.voice_channel().await != Some(vc) {
         if let Err(e) = player.join(vc, ctx.channel_id()).await {
-            return send::respond(ctx, views::error("Couldn't join", &format!("-# {e}"))).await;
+            return send::respond(
+                ctx,
+                views::error(&super::icons(ctx), "Couldn't join", &format!("-# {e}")),
+            )
+            .await;
         }
     }
     let items: Vec<QueueItem> = resolved
@@ -190,11 +195,18 @@ async fn queue_resolved(
             requested_by: ctx.author().id,
         })
         .collect();
+    let cover = Cover::load(&identity.state.db, &items[0].track).await;
     let enq = player.enqueue(items.clone(), position).await?;
     let snap = player.snapshot().await;
     send::respond(
         ctx,
-        views::queued(&snap, &items, &enq, resolved.source.as_deref()),
+        views::queued(
+            &snap,
+            &items,
+            &enq,
+            resolved.source.as_deref(),
+            cover.as_ref(),
+        ),
     )
     .await
 }
@@ -268,7 +280,13 @@ pub async fn search(
     .await?;
     send::respond(
         ctx,
-        views::search_results(identity.index, guild.get(), &query, &hits),
+        views::search_results(
+            &identity.icons(),
+            identity.index,
+            guild.get(),
+            &query,
+            &hits,
+        ),
     )
     .await
 }

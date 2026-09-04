@@ -26,6 +26,7 @@
 
 pub mod client;
 pub mod commands;
+pub mod emoji;
 pub mod identity;
 pub mod interactions;
 pub mod player;

@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use serenity::all::GuildId;
 
+use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
 use crate::discord::ui::{send, views};
 
@@ -50,6 +51,11 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
     ]
 }
 
+/// The bot's icon set, for views that have no player snapshot to take it from.
+pub fn icons(ctx: Context<'_>) -> Arc<IconSet> {
+    ctx.data().icons()
+}
+
 /// The guild a command ran in. Every command is `guild_only`, so this only fails for a DM that
 /// slipped through.
 pub fn guild_of(ctx: Context<'_>) -> anyhow::Result<GuildId> {
@@ -63,14 +69,22 @@ pub async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
     match error {
         poise::FrameworkError::Command { error, ctx, .. } => {
             tracing::warn!(command = %ctx.command().qualified_name, error = %error, "command failed");
-            let msg = views::error("Couldn't do that", &format!("-# {error}"));
+            let msg = views::error(
+                &ctx.data().icons(),
+                "Couldn't do that",
+                &format!("-# {error}"),
+            );
             if let Err(e) = send::respond(ctx, msg).await {
                 tracing::debug!(error = %e, "reporting a command error");
             }
         }
         poise::FrameworkError::CommandPanic { payload, ctx, .. } => {
             tracing::error!(command = %ctx.command().qualified_name, payload = ?payload, "command panicked");
-            let msg = views::error("Something broke", "-# The library logged it.");
+            let msg = views::error(
+                &ctx.data().icons(),
+                "Something broke",
+                "-# The library logged it.",
+            );
             let _ = send::respond(ctx, msg).await;
         }
         other => {

@@ -21,6 +21,7 @@ use songbird::tracks::{PlayMode, TrackHandle};
 use tokio::sync::{Mutex, Notify};
 
 use crate::catalog::TrackRow;
+use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
 use crate::discord::presence;
 use crate::discord::settings::{self, GuildSettings};
@@ -105,11 +106,54 @@ pub enum PlayerError {
 
 pub type PlayerResult<T> = Result<T, PlayerError>;
 
+/// A track's cover art as Discord sees it: a file named per track, uploaded with the first message
+/// that shows it and then kept by attachment id on every edit of that message.
+#[derive(Debug, Clone)]
+pub struct Cover {
+    pub filename: String,
+    pub bytes: Arc<Vec<u8>>,
+    /// Set once the controller has uploaded it, so edits can keep it instead of re-sending it.
+    pub attachment_id: Option<u64>,
+}
+
+/// Art bigger than this is left out rather than uploaded on every track change.
+const COVER_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+impl Cover {
+    pub async fn load(db: &sqlx::SqlitePool, track: &TrackRow) -> Option<Cover> {
+        let (mime, bytes) = crate::catalog::get_track_cover(db, &track.id)
+            .await
+            .ok()
+            .flatten()?;
+        if bytes.is_empty() || bytes.len() > COVER_MAX_BYTES {
+            return None;
+        }
+        let ext = match mime.as_str() {
+            "image/png" => "png",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            _ => "jpg",
+        };
+        let short: String = track
+            .id
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(8)
+            .collect();
+        Some(Cover {
+            filename: format!("cover-{short}.{ext}"),
+            bytes: Arc::new(bytes),
+            attachment_id: None,
+        })
+    }
+}
+
 /// The playing track and its live handle.
 struct Playing {
     item: QueueItem,
     handle: TrackHandle,
     facts: TrackFacts,
+    cover: Option<Cover>,
     paused: bool,
     /// Row id in `discord_plays`, finalised with `ms_played` when the track ends.
     play_id: Option<i64>,
@@ -164,14 +208,17 @@ pub struct CurrentSnapshot {
     pub facts: TrackFacts,
     pub position_ms: u64,
     pub paused: bool,
+    pub cover: Option<Cover>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PlayerSnapshot {
     pub bot_index: u8,
     pub bot_name: String,
+    pub icons: Arc<IconSet>,
     pub guild_id: GuildId,
     pub voice_channel: Option<ChannelId>,
+    pub voice_channel_name: Option<String>,
     pub current: Option<CurrentSnapshot>,
     pub queue: Vec<QueueItem>,
     pub history: Vec<QueueItem>,
@@ -333,6 +380,7 @@ impl GuildPlayer {
             let mut s = self.inner.lock().await;
             s.stopping = true;
             s.queue.clear();
+            s.history.clear();
             s.next_override = None;
             if let Some(cur) = &s.current {
                 let _ = cur.handle.stop();
@@ -518,6 +566,8 @@ impl GuildPlayer {
         let handle = {
             let mut s = self.inner.lock().await;
             s.queue.clear();
+            // A stop ends the session: what played before it is not somewhere `/back` should go.
+            s.history.clear();
             s.next_override = None;
             let handle = s
                 .current
@@ -701,16 +751,24 @@ impl GuildPlayer {
                 None => (0, "Chordia".to_string()),
             };
             let handle = s.current.as_ref().map(|c| c.handle.clone());
+            let icons = identity.as_ref().map(|i| i.icons()).unwrap_or_default();
+            let voice_channel_name = match (&identity, s.voice_channel) {
+                (Some(i), Some(vc)) => i.channel_name(self.guild_id, vc),
+                _ => None,
+            };
             let snap = PlayerSnapshot {
                 bot_index,
                 bot_name,
+                icons,
                 guild_id: self.guild_id,
                 voice_channel: s.voice_channel,
+                voice_channel_name,
                 current: s.current.as_ref().map(|c| CurrentSnapshot {
                     item: c.item.clone(),
                     facts: c.facts.clone(),
                     position_ms: 0,
                     paused: c.paused,
+                    cover: c.cover.clone(),
                 }),
                 queue: s.queue.iter().cloned().collect(),
                 history: s.history.iter().cloned().collect(),
@@ -833,6 +891,7 @@ impl GuildPlayer {
             .await
             .map_err(|e| PlayerError::Source(e.to_string()))?;
         let seekable = !matches!(input, songbird::input::Input::Live(..));
+        let cover = Cover::load(&identity.state.db, &item.track).await;
         let handle = {
             let mut call = call.lock().await;
             call.play_only_input(input)
@@ -867,6 +926,7 @@ impl GuildPlayer {
                 item: item.clone(),
                 handle,
                 facts,
+                cover,
                 paused: false,
                 play_id: None,
                 epoch: s.epoch,
@@ -1007,9 +1067,10 @@ impl GuildPlayer {
             return;
         };
         let msg = views::error(
+            &identity.icons(),
             "Couldn't play a track",
             &format!(
-                "**{}** — {}\n-# {err}",
+                "**{}** · {}\n-# {err}",
                 ui::fmt::escape_md(&item.track.title),
                 ui::fmt::escape_md(&item.track.artist)
             ),
@@ -1071,20 +1132,35 @@ impl GuildPlayer {
         };
         let Some(text) = text else { return };
         let snap = self.snapshot().await;
+        let reuse = controller.is_some() && !repost;
         let msg = match &snap.current {
-            Some(_) => views::now_playing(&snap),
+            Some(_) => views::now_playing(&snap, reuse),
             None => views::idle(&snap),
         };
 
-        let edited = match controller {
-            Some((ch, id)) if !repost => ui::send::edit(&http, ch, id, msg.clone()).await.is_ok(),
+        let mut sent: Option<serenity::all::Message> = None;
+        match controller {
+            Some((ch, id)) if !repost => match ui::send::edit(&http, ch, id, msg.clone()).await {
+                Ok(m) => sent = Some(m),
+                Err(e) => {
+                    tracing::debug!(guild = %self.guild_id, error = %e, "editing controller; re-posting");
+                    // Whatever went wrong with the edit, one controller per guild: drop the old
+                    // message before a new one goes up.
+                    let _ = ui::send::delete(&http, ch, id).await;
+                }
+            },
             Some((ch, id)) => {
                 let _ = ui::send::delete(&http, ch, id).await;
-                false
             }
-            None => false,
-        };
-        if !edited {
+            None => {}
+        }
+        if sent.is_none() {
+            // A failed edit may have been the kept-attachment path against a message that lost
+            // it; a fresh post always uploads.
+            let msg = match &snap.current {
+                Some(_) if reuse => views::now_playing(&snap, false),
+                _ => msg,
+            };
             match ui::send::post(&http, text, msg).await {
                 Ok(posted) => {
                     let mut s = self.inner.lock().await;
@@ -1095,10 +1171,29 @@ impl GuildPlayer {
                     let settings = s.settings.clone();
                     drop(s);
                     self.persist(settings).await;
+                    sent = Some(posted);
                 }
                 Err(e) => {
                     tracing::warn!(guild = %self.guild_id, error = %e, "posting controller");
                 }
+            }
+        }
+        if let Some(m) = sent {
+            self.remember_cover_attachment(&m).await;
+        }
+    }
+
+    /// After the controller has been sent, note the id Discord gave the cover upload so the next
+    /// edit keeps it rather than uploading it again.
+    async fn remember_cover_attachment(&self, sent: &serenity::all::Message) {
+        let mut s = self.inner.lock().await;
+        if let Some(cover) = s.current.as_mut().and_then(|c| c.cover.as_mut()) {
+            if let Some(a) = sent
+                .attachments
+                .iter()
+                .find(|a| a.filename == cover.filename)
+            {
+                cover.attachment_id = Some(a.id.get());
             }
         }
     }
@@ -1189,13 +1284,16 @@ mod tests {
         let snap = PlayerSnapshot {
             bot_index: 0,
             bot_name: "Chordia".into(),
+            icons: Arc::new(IconSet::default()),
             guild_id: GuildId::new(1),
             voice_channel: None,
+            voice_channel_name: None,
             current: Some(CurrentSnapshot {
                 item: item("c", 100_000),
                 facts: TrackFacts::from_row(&row("c", 100_000)),
                 position_ms: 40_000,
                 paused: false,
+                cover: None,
             }),
             queue: vec![item("a", 10_000), item("b", 20_000)],
             history: vec![],
@@ -1213,7 +1311,8 @@ mod tests {
     #[test]
     fn effective_volume_applies_replaygain_only_when_normalizing() {
         let mut facts = TrackFacts::from_row(&row("x", 1));
-        facts.gain_db = Some(-6.0);
+        // −6 dB after the preamp.
+        facts.gain_db = Some((-6.0 - source::REPLAYGAIN_PREAMP_DB) as f32);
         let mk = |volume: u8, normalize: bool| PlayerState {
             voice_channel: None,
             text_channel: None,

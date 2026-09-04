@@ -27,6 +27,44 @@ pub const MAX_TEXT_DISPLAY_CHARS: usize = 4000;
 pub const MAX_SELECT_OPTIONS: usize = 25;
 pub const MAX_BUTTONS_PER_ROW: usize = 5;
 
+/// An emoji as Discord addresses it: a Unicode glyph, or a custom one by id (for the bot, one of
+/// its own application emojis).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Emoji {
+    Unicode(String),
+    Custom { name: String, id: u64 },
+}
+
+impl Emoji {
+    /// How the emoji is written inside message text.
+    pub fn markup(&self) -> String {
+        match self {
+            Emoji::Unicode(s) => s.clone(),
+            Emoji::Custom { name, id } => format!("<:{name}:{id}>"),
+        }
+    }
+
+    /// The `emoji` object on a button or select option.
+    pub fn to_json(&self) -> Value {
+        match self {
+            Emoji::Unicode(s) => json!({ "name": s }),
+            Emoji::Custom { name, id } => json!({ "id": id.to_string(), "name": name }),
+        }
+    }
+}
+
+impl From<&str> for Emoji {
+    fn from(s: &str) -> Self {
+        Emoji::Unicode(s.to_string())
+    }
+}
+
+impl From<String> for Emoji {
+    fn from(s: String) -> Self {
+        Emoji::Unicode(s)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonStyle {
     Primary = 1,
@@ -40,8 +78,9 @@ pub enum ButtonStyle {
 pub struct Button {
     pub style: ButtonStyle,
     pub label: Option<String>,
-    /// A Unicode emoji (never a custom one: those are per-guild and the bot serves many).
-    pub emoji: Option<String>,
+    /// A Unicode glyph, or one of the bot's own application emojis (never a guild's emoji: the
+    /// bot serves many guilds and those do not travel).
+    pub emoji: Option<Emoji>,
     pub custom_id: Option<String>,
     pub url: Option<String>,
     pub disabled: bool,
@@ -75,7 +114,7 @@ impl Button {
         self
     }
 
-    pub fn emoji(mut self, emoji: impl Into<String>) -> Self {
+    pub fn emoji(mut self, emoji: impl Into<Emoji>) -> Self {
         self.emoji = Some(emoji.into());
         self
     }
@@ -91,7 +130,7 @@ pub struct SelectOption {
     pub label: String,
     pub value: String,
     pub description: Option<String>,
-    pub emoji: Option<String>,
+    pub emoji: Option<Emoji>,
     pub default: bool,
 }
 
@@ -111,7 +150,7 @@ impl SelectOption {
         self
     }
 
-    pub fn emoji(mut self, e: impl Into<String>) -> Self {
+    pub fn emoji(mut self, e: impl Into<Emoji>) -> Self {
         self.emoji = Some(e.into());
         self
     }
@@ -237,7 +276,7 @@ impl Component {
                     v["label"] = json!(clip(l.clone(), 80));
                 }
                 if let Some(e) = &b.emoji {
-                    v["emoji"] = json!({ "name": e });
+                    v["emoji"] = e.to_json();
                 }
                 if let Some(id) = &b.custom_id {
                     v["custom_id"] = json!(id);
@@ -267,7 +306,7 @@ impl Component {
                             ov["description"] = json!(d);
                         }
                         if let Some(e) = &o.emoji {
-                            ov["emoji"] = json!({ "name": e });
+                            ov["emoji"] = e.to_json();
                         }
                         ov
                     }).collect::<Vec<_>>(),

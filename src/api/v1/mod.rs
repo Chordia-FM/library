@@ -1,6 +1,7 @@
 //! Version 1 of the library HTTP API.
 
 mod catalog;
+mod discord;
 mod health;
 mod matcher;
 pub(crate) mod mgmt;
@@ -23,4 +24,5 @@ pub fn router() -> Router<AppState> {
         .merge(health::router())
         .merge(mgmt::router())
         .merge(scrobbles::router())
+        .merge(discord::router())
 }

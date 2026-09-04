@@ -55,6 +55,11 @@ pub struct BotSettings {
     pub allowed_guilds: Option<Vec<String>>,
     pub owner_discord_ids: Vec<String>,
     pub vc_status: bool,
+    /// Icon colour for the application emoji set, `#rrggbb`. `None` = the default pink.
+    pub emoji_hex: Option<String>,
+    /// The colour the set on Discord was last generated in; differs from `emoji_hex` until the
+    /// next (re)generation.
+    pub emoji_hex_applied: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commands_hash: Option<String>,
 }
@@ -65,12 +70,14 @@ impl BotSettings {
             app_id: app_id.to_string(),
             display_name: None,
             mode: BotMode::Multi,
-            presence_template: "{title} — {artist}".to_string(),
+            presence_template: "{title} · {artist}".to_string(),
             default_volume: 100,
             idle_timeout_secs: 300,
             allowed_guilds: None,
             owner_discord_ids: Vec::new(),
             vc_status: true,
+            emoji_hex: None,
+            emoji_hex_applied: None,
             commands_hash: None,
         }
     }
@@ -104,6 +111,8 @@ pub struct BotSettingsPatch {
     pub allowed_guilds: Option<Option<Vec<String>>>,
     pub owner_discord_ids: Option<Vec<String>>,
     pub vc_status: Option<bool>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub emoji_hex: Option<Option<String>>,
 }
 
 /// `null` clears, absent leaves alone: the standard serde trick for a nullable patch field.
@@ -141,6 +150,9 @@ impl BotSettingsPatch {
         if let Some(v) = self.vc_status {
             s.vc_status = v;
         }
+        if let Some(v) = self.emoji_hex {
+            s.emoji_hex = v.and_then(|h| crate::discord::emoji::normalize_hex(&h));
+        }
     }
 }
 
@@ -155,13 +167,16 @@ struct BotRow {
     allowed_guilds: Option<String>,
     owner_discord_ids: String,
     vc_status: i64,
+    emoji_hex: Option<String>,
+    emoji_hex_applied: Option<String>,
     commands_hash: Option<String>,
 }
 
 pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
     let row = sqlx::query_as::<_, BotRow>(
         "SELECT app_id, display_name, mode, presence_template, default_volume, \
-                idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, commands_hash \
+                idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, emoji_hex, \
+                emoji_hex_applied, commands_hash \
          FROM discord_bot_settings WHERE app_id = ?",
     )
     .bind(app_id)
@@ -179,6 +194,8 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
             allowed_guilds: r.allowed_guilds.and_then(|j| serde_json::from_str(&j).ok()),
             owner_discord_ids: serde_json::from_str(&r.owner_discord_ids).unwrap_or_default(),
             vc_status: r.vc_status != 0,
+            emoji_hex: r.emoji_hex,
+            emoji_hex_applied: r.emoji_hex_applied,
             commands_hash: r.commands_hash,
         },
     })
@@ -193,8 +210,8 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO discord_bot_settings (app_id, display_name, mode, presence_template, \
              default_volume, idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, \
-             commands_hash, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             emoji_hex, emoji_hex_applied, commands_hash, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id) DO UPDATE SET \
              display_name = excluded.display_name, mode = excluded.mode, \
              presence_template = excluded.presence_template, \
@@ -202,6 +219,7 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
              idle_timeout_secs = excluded.idle_timeout_secs, \
              allowed_guilds = excluded.allowed_guilds, \
              owner_discord_ids = excluded.owner_discord_ids, vc_status = excluded.vc_status, \
+             emoji_hex = excluded.emoji_hex, emoji_hex_applied = excluded.emoji_hex_applied, \
              commands_hash = excluded.commands_hash, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
@@ -213,6 +231,8 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     .bind(allowed)
     .bind(owners)
     .bind(s.vc_status as i64)
+    .bind(&s.emoji_hex)
+    .bind(&s.emoji_hex_applied)
     .bind(&s.commands_hash)
     .bind(now_ms())
     .execute(db)

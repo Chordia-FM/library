@@ -52,30 +52,30 @@ pub fn duration(ms: u64) -> String {
     }
 }
 
-/// Ten cells of `▰`/`▱`.
+/// A slider: the played part in heavy line, a knob, the rest in light line. Box-drawing characters
+/// render at full weight in Discord's font, unlike the block glyphs that show up as hollow boxes.
 pub fn progress_bar(position_ms: u64, duration_ms: u64) -> String {
-    const CELLS: u64 = 10;
-    let filled = (position_ms.min(duration_ms) * CELLS)
-        .checked_div(duration_ms)
-        .unwrap_or(0)
-        .min(CELLS);
-    let mut s = String::with_capacity(CELLS as usize * 3);
-    for i in 0..CELLS {
-        s.push(if i < filled { '▰' } else { '▱' });
-    }
-    s
+    const CELLS: usize = 16;
+    let knob = (position_ms.min(duration_ms) as u128 * (CELLS as u128 - 1))
+        .checked_div(duration_ms as u128)
+        .unwrap_or(0) as usize;
+    (0..CELLS)
+        .map(|i| match i.cmp(&knob) {
+            std::cmp::Ordering::Less => '━',
+            std::cmp::Ordering::Equal => '●',
+            std::cmp::Ordering::Greater => '─',
+        })
+        .collect()
 }
 
-/// `▰▰▰▱▱▱▱▱▱▱ 1:23 / 4:05`, with a pause glyph in front when paused.
-pub fn progress_line(position_ms: u64, duration_ms: u64, paused: bool) -> String {
-    let bar = progress_bar(position_ms, duration_ms);
-    let pos = duration(position_ms.min(duration_ms));
-    let dur = duration(duration_ms);
-    if paused {
-        format!("{} {bar} {pos} / {dur}", glyph::PAUSE)
-    } else {
-        format!("{bar} {pos} / {dur}")
-    }
+/// `━━━●──────────── 1:23 / 4:05`.
+pub fn progress_line(position_ms: u64, duration_ms: u64) -> String {
+    format!(
+        "{} {} / {}",
+        progress_bar(position_ms, duration_ms),
+        duration(position_ms.min(duration_ms)),
+        duration(duration_ms)
+    )
 }
 
 /// The fixed quality vocabulary: codec, rate/depth, lossless/spatial, the negotiated Opus bitrate,
@@ -205,13 +205,13 @@ mod tests {
 
     #[test]
     fn progress() {
-        assert_eq!(progress_bar(0, 100), "▱▱▱▱▱▱▱▱▱▱");
-        assert_eq!(progress_bar(50, 100), "▰▰▰▰▰▱▱▱▱▱");
-        assert_eq!(progress_bar(100, 100), "▰▰▰▰▰▰▰▰▰▰");
-        assert_eq!(progress_bar(500, 100), "▰▰▰▰▰▰▰▰▰▰");
-        assert_eq!(progress_bar(5, 0), "▱▱▱▱▱▱▱▱▱▱");
-        assert!(progress_line(1000, 2000, true).starts_with(glyph::PAUSE));
-        assert_eq!(progress_line(1000, 2000, false), "▰▰▰▰▰▱▱▱▱▱ 0:01 / 0:02");
+        assert_eq!(progress_bar(0, 100), "●───────────────");
+        assert_eq!(progress_bar(50, 100), "━━━━━━━●────────");
+        assert_eq!(progress_bar(100, 100), "━━━━━━━━━━━━━━━●");
+        assert_eq!(progress_bar(500, 100), "━━━━━━━━━━━━━━━●");
+        assert_eq!(progress_bar(5, 0), "●───────────────");
+        assert_eq!(progress_bar(0, 100).chars().count(), 16);
+        assert_eq!(progress_line(1000, 2000), "━━━━━━━●──────── 0:01 / 0:02");
     }
 
     #[test]
@@ -247,10 +247,10 @@ mod tests {
     fn template_substitution() {
         assert_eq!(
             render_template(
-                "{title} — {artist} ({nope})",
+                "{title} · {artist} ({nope})",
                 &[("title", "A"), ("artist", "B")]
             ),
-            "A — B ({nope})"
+            "A · B ({nope})"
         );
     }
 }

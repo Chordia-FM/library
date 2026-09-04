@@ -15,13 +15,17 @@ async fn controlled(ctx: Context<'_>) -> Result<Option<Arc<GuildPlayer>>, Error>
     let Some(player) = identity.player_arc(guild) else {
         send::respond(
             ctx,
-            views::notice("Nothing is playing", "-# `/play` something first."),
+            views::notice(
+                &super::icons(ctx),
+                "Nothing is playing",
+                "-# `/play` something first.",
+            ),
         )
         .await?;
         return Ok(None);
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        send::respond(ctx, r.view()).await?;
+        send::respond(ctx, r.view(&super::icons(ctx))).await?;
         return Ok(None);
     }
     Ok(Some(player))
@@ -29,14 +33,18 @@ async fn controlled(ctx: Context<'_>) -> Result<Option<Arc<GuildPlayer>>, Error>
 
 fn track_line(item: &crate::discord::player::QueueItem) -> String {
     format!(
-        "**{}** — {}",
+        "**{}** · {}",
         fmt::escape_md(&item.track.title),
         fmt::escape_md(&item.track.artist)
     )
 }
 
 async fn player_error(ctx: Context<'_>, title: &str, e: PlayerError) -> Result<(), Error> {
-    send::respond(ctx, views::error(title, &format!("-# {e}"))).await
+    send::respond(
+        ctx,
+        views::error(&super::icons(ctx), title, &format!("-# {e}")),
+    )
+    .await
 }
 
 /// Skip the current track
@@ -47,7 +55,13 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     match player.skip().await {
-        Ok(item) => send::respond(ctx, views::ok("Skipped", &track_line(&item))).await,
+        Ok(item) => {
+            send::respond(
+                ctx,
+                views::ok(&super::icons(ctx), "Skipped", &track_line(&item)),
+            )
+            .await
+        }
         Err(e) => player_error(ctx, "Couldn't skip", e).await,
     }
 }
@@ -60,7 +74,13 @@ pub async fn back(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     match player.previous().await {
-        Ok(item) => send::respond(ctx, views::ok("Going back to", &track_line(&item))).await,
+        Ok(item) => {
+            send::respond(
+                ctx,
+                views::ok(&super::icons(ctx), "Going back to", &track_line(&item)),
+            )
+            .await
+        }
         Err(e) => player_error(ctx, "Couldn't go back", e).await,
     }
 }
@@ -73,7 +93,7 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     match player.pause().await {
-        Ok(()) => send::respond(ctx, views::ok("Paused", "")).await,
+        Ok(()) => send::respond(ctx, views::ok(&super::icons(ctx), "Paused", "")).await,
         Err(e) => player_error(ctx, "Couldn't pause", e).await,
     }
 }
@@ -86,7 +106,7 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     match player.resume().await {
-        Ok(()) => send::respond(ctx, views::ok("Resumed", "")).await,
+        Ok(()) => send::respond(ctx, views::ok(&super::icons(ctx), "Resumed", "")).await,
         Err(e) => player_error(ctx, "Couldn't resume", e).await,
     }
 }
@@ -103,6 +123,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
             send::respond(
                 ctx,
                 views::ok(
+                    &super::icons(ctx),
                     "Stopped",
                     "-# Queue cleared. I'll stay in the channel for a bit.",
                 ),
@@ -148,7 +169,11 @@ pub async fn seek(
     let Some(target) = parse_seek(&position, current) else {
         return send::respond(
             ctx,
-            views::error("That's not a time", "-# Try `1:23`, `90`, `+30` or `-30`."),
+            views::error(
+                &super::icons(ctx),
+                "That's not a time",
+                "-# Try `1:23`, `90`, `+30` or `-30`.",
+            ),
         )
         .await;
     };
@@ -157,6 +182,7 @@ pub async fn seek(
             send::respond(
                 ctx,
                 views::ok(
+                    &super::icons(ctx),
                     "Seeked",
                     &format!("-# now at {}", fmt::duration(got.as_millis() as u64)),
                 ),
@@ -184,7 +210,11 @@ pub async fn volume(
         Ok(v) => {
             send::respond(
                 ctx,
-                views::ok("Volume", &format!("{} {v}%", fmt::glyph::VOLUME)),
+                views::ok(
+                    &super::icons(ctx),
+                    "Volume",
+                    &format!("{} {v}%", fmt::glyph::VOLUME),
+                ),
             )
             .await
         }
@@ -218,7 +248,11 @@ pub async fn loop_mode(
         LoopChoice::Queue => LoopMode::Queue,
     };
     let set = player.set_loop(mode).await;
-    send::respond(ctx, views::ok("Loop", &format!("-# {}", set.label()))).await
+    send::respond(
+        ctx,
+        views::ok(&super::icons(ctx), "Loop", &format!("-# {}", set.label())),
+    )
+    .await
 }
 
 /// Bring the bot into your voice channel
@@ -227,10 +261,16 @@ pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     let (vc, player) = match guard::listener(ctx).await {
         Ok(x) => x,
-        Err(r) => return send::respond(ctx, r.view()).await,
+        Err(r) => return send::respond(ctx, r.view(&super::icons(ctx))).await,
     };
     match player.join(vc, ctx.channel_id()).await {
-        Ok(()) => send::respond(ctx, views::ok("Joined", &format!("-# <#{}>", vc.get()))).await,
+        Ok(()) => {
+            send::respond(
+                ctx,
+                views::ok(&super::icons(ctx), "Joined", &format!("-# <#{}>", vc.get())),
+            )
+            .await
+        }
         Err(e) => player_error(ctx, "Couldn't join", e).await,
     }
 }
@@ -243,7 +283,7 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     player.leave(LeaveReason::Command).await;
-    send::respond(ctx, views::ok("Left", "")).await
+    send::respond(ctx, views::ok(&super::icons(ctx), "Left", "")).await
 }
 
 /// Keep the music going with similar tracks when the queue runs out
@@ -257,11 +297,12 @@ pub async fn radio(ctx: Context<'_>, #[description = "On or off"] on: bool) -> R
     send::respond(
         ctx,
         views::ok(
+            &super::icons(ctx),
             "Autoplay",
             &format!(
                 "-# {}",
                 if on {
-                    "on — similar tracks follow the queue"
+                    "on. Similar tracks follow the queue"
                 } else {
                     "off"
                 }

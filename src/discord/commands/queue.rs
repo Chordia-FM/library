@@ -13,7 +13,11 @@ async fn player_or_notice(
         None => {
             send::respond(
                 ctx,
-                views::notice("Nothing here yet", "-# `/play` something first."),
+                views::notice(
+                    &super::icons(ctx),
+                    "Nothing here yet",
+                    "-# `/play` something first.",
+                ),
             )
             .await?;
             Ok(None)
@@ -46,7 +50,7 @@ pub async fn nowplaying(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     let snap = player.snapshot().await;
-    send::respond(ctx, views::now_playing(&snap).ephemeral()).await
+    send::respond(ctx, views::now_playing(&snap, false).ephemeral()).await
 }
 
 /// Recently played tracks
@@ -73,16 +77,17 @@ pub async fn remove(
         return Ok(());
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        return send::respond(ctx, r.view()).await;
+        return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
     match player.remove(index as usize).await {
         Ok(item) => {
             send::respond(
                 ctx,
                 views::ok(
+                    &super::icons(ctx),
                     "Removed",
                     &format!(
-                        "**{}** — {}",
+                        "**{}** · {}",
                         fmt::escape_md(&item.track.title),
                         fmt::escape_md(&item.track.artist)
                     ),
@@ -93,7 +98,11 @@ pub async fn remove(
         Err(e) => {
             send::respond(
                 ctx,
-                views::error("Couldn't remove that", &format!("-# {e}")),
+                views::error(
+                    &super::icons(ctx),
+                    "Couldn't remove that",
+                    &format!("-# {e}"),
+                ),
             )
             .await
         }
@@ -116,20 +125,27 @@ pub async fn move_track(
         return Ok(());
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        return send::respond(ctx, r.view()).await;
+        return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
     match player.move_item(from as usize, to as usize).await {
         Ok(item) => {
             send::respond(
                 ctx,
                 views::ok(
+                    &super::icons(ctx),
                     "Moved",
                     &format!("**{}** is now #{to}", fmt::escape_md(&item.track.title)),
                 ),
             )
             .await
         }
-        Err(e) => send::respond(ctx, views::error("Couldn't move that", &format!("-# {e}"))).await,
+        Err(e) => {
+            send::respond(
+                ctx,
+                views::error(&super::icons(ctx), "Couldn't move that", &format!("-# {e}")),
+            )
+            .await
+        }
     }
 }
 
@@ -146,16 +162,17 @@ pub async fn jump(
         return Ok(());
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        return send::respond(ctx, r.view()).await;
+        return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
     match player.jump(index as usize).await {
         Ok(item) => {
             send::respond(
                 ctx,
                 views::ok(
+                    &super::icons(ctx),
                     "Jumping to",
                     &format!(
-                        "**{}** — {}",
+                        "**{}** · {}",
                         fmt::escape_md(&item.track.title),
                         fmt::escape_md(&item.track.artist)
                     ),
@@ -163,7 +180,17 @@ pub async fn jump(
             )
             .await
         }
-        Err(e) => send::respond(ctx, views::error("Couldn't jump there", &format!("-# {e}"))).await,
+        Err(e) => {
+            send::respond(
+                ctx,
+                views::error(
+                    &super::icons(ctx),
+                    "Couldn't jump there",
+                    &format!("-# {e}"),
+                ),
+            )
+            .await
+        }
     }
 }
 
@@ -175,12 +202,13 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        return send::respond(ctx, r.view()).await;
+        return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
     let n = player.clear().await;
     send::respond(
         ctx,
         views::ok(
+            &super::icons(ctx),
             "Queue cleared",
             &format!("-# {} dropped", fmt::count(n, "track")),
         ),
@@ -196,12 +224,13 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        return send::respond(ctx, r.view()).await;
+        return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
     let n = player.shuffle().await;
     send::respond(
         ctx,
         views::ok(
+            &super::icons(ctx),
             "Shuffled",
             &format!("-# {} reordered", fmt::count(n, "track")),
         ),
