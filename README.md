@@ -51,6 +51,9 @@ TOML file (path via `CHORDIA_LIBRARY_CONFIG`, default `./chordia-library.toml`).
 [`config/chordia-library.example.toml`](./config/chordia-library.example.toml).
 
 The Discord bot is the `discord` cargo feature (on by default; the desktop app builds without it).
+It needs no privileged intents: `GUILDS`, `GUILD_VOICE_STATES` and `GUILD_MESSAGES` (without message
+content), the `bot` + `applications.commands` scopes, and the permissions in the dashboard's invite
+link — see `src/discord/client.rs` (`INTENTS`) and `identity.rs` (`INVITE_PERMISSIONS`).
 It links libopus, built from source by `libopus_sys`, so a source build needs **cmake** and a C
 compiler. On Windows with a Visual Studio newer than your cmake, set `CMAKE_GENERATOR=Ninja`.
 

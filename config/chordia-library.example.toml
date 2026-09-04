@@ -90,10 +90,18 @@ dedupe_reuploads = true
 # other and point a busy channel at a free sibling.
 #
 # Create the bot at https://discord.com/developers/applications (New Application → Bot → Reset Token).
-# No privileged intents are needed. Invite it with the link shown in the library's Discord dashboard
-# (Library → Settings → Discord), which carries the right permissions, including "Set Voice Channel
-# Status". Everything else about a bot (single-server mode, presence text, default volume, allowed
-# servers, DJ role…) is set at runtime from that dashboard or from Discord, never here.
+#
+# What it asks Discord for — nothing privileged, so nothing to toggle in the portal:
+#   Gateway intents: GUILDS (channel names + voice bitrate, guild joins), GUILD_VOICE_STATES (join
+#   the channel; know who is listening), GUILD_MESSAGES (count messages under the now-playing
+#   message so it can re-post itself; message content is never requested).
+#   Scopes: bot, applications.commands.
+#   Permissions: View Channel, Send Messages, Read Message History, Embed Links, Attach Files,
+#   Connect, Speak, Set Voice Channel Status.
+#
+# Invite it with the link shown in the library's Discord dashboard (Library → Settings → Discord),
+# which carries exactly that. Everything else about a bot (single-server mode, presence text, default
+# volume, allowed servers, DJ role…) is set at runtime from that dashboard or from Discord, never here.
 #
 # A token is a secret. Like [acoustid] api_key it lives in this file because it is the library's own
 # third-party credential — the Hub never sees it, and it never leaves this process.

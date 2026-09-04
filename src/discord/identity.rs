@@ -370,7 +370,16 @@ impl Identity {
         self.cache().map(|c| c.guilds()).unwrap_or_default()
     }
 
-    /// The `SET_VOICE_CHANNEL_STATUS` bit and the rest of what an invite must grant.
+    /// What the invite must grant, and what each bit is for:
+    ///
+    /// - `VIEW_CHANNEL`, `SEND_MESSAGES`, `READ_MESSAGE_HISTORY` — post and later edit/delete the
+    ///   now-playing controller in the text channel `/play` was used in.
+    /// - `EMBED_LINKS`, `ATTACH_FILES` — the Components V2 messages and the now-playing card PNG.
+    /// - `CONNECT`, `SPEAK` — join the voice channel and play into it.
+    /// - `SET_VOICE_CHANNEL_STATUS` — put the playing track in the voice channel's status line.
+    ///   Optional in practice: without it the status call fails quietly and everything else works.
+    ///
+    /// The gateway intents are a separate list; see [`crate::discord::client::INTENTS`].
     pub const INVITE_PERMISSIONS: u64 = (1 << 10) // VIEW_CHANNEL
         | (1 << 11) // SEND_MESSAGES
         | (1 << 14) // EMBED_LINKS

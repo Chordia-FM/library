@@ -17,6 +17,32 @@ use crate::discord::commands::{self, Data, Error};
 use crate::discord::identity::{Identity, Profile, Status};
 use crate::discord::{interactions, presence};
 
+/// Everything the bot asks the gateway for. All three are ordinary intents: nothing here needs a
+/// toggle in the Developer Portal, and nothing here is privileged.
+///
+/// - `GUILDS` — the guild, channel and role events that fill the cache. That is how the bot knows
+///   a channel's name and configured bitrate (the Opus bitrate it encodes at), which channels are
+///   voice channels, and when it has been added to a guild (the allow-list check on join).
+/// - `GUILD_VOICE_STATES` — `VOICE_STATE_UPDATE`. songbird needs the bot's own voice state to
+///   complete a join, and every guard needs everyone else's: which channel the caller is in, who
+///   is listening (the alone-in-channel DJ rule), and when the channel empties (idle leave).
+/// - `GUILD_MESSAGES` — `MESSAGE_CREATE`, used for exactly one thing: counting how many messages
+///   have landed under the now-playing controller, so it can re-post itself at the bottom once it
+///   has scrolled away. Message *content* is never requested, so the events arrive without text,
+///   which is all the counter needs.
+///
+/// Deliberately absent: `MESSAGE_CONTENT` (privileged; slash commands and buttons carry their data
+/// in the interaction), `GUILD_MEMBERS` (privileged; interaction payloads already include the
+/// caller's roles and permissions, and voice-state events carry the member), `GUILD_PRESENCES`
+/// (privileged; nothing here cares what anyone else is doing). Interactions and
+/// `VOICE_SERVER_UPDATE` are not gated by any intent.
+///
+/// The invite must also grant the permissions in [`Identity::INVITE_PERMISSIONS`] and the
+/// `bot` + `applications.commands` scopes; [`Identity::invite_url`] builds that link.
+pub const INTENTS: GatewayIntents = GatewayIntents::GUILDS
+    .union(GatewayIntents::GUILD_VOICE_STATES)
+    .union(GatewayIntents::GUILD_MESSAGES);
+
 const BACKOFF_MIN: Duration = Duration::from_secs(5);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// How often each player checks idle timers and refreshes its progress line.
@@ -71,10 +97,7 @@ pub fn spawn_supervisor(identity: Arc<Identity>) {
 }
 
 async fn run_once(identity: &Arc<Identity>) -> anyhow::Result<Exit> {
-    let intents = GatewayIntents::GUILDS
-        | GatewayIntents::GUILD_VOICE_STATES
-        // Only to count messages under the controller, so it can re-post when it scrolls away.
-        | GatewayIntents::GUILD_MESSAGES;
+    let intents = INTENTS;
 
     let data: Data = identity.clone();
     let setup_data = data.clone();
@@ -274,4 +297,18 @@ async fn on_event(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The portal toggles stay off: none of the privileged intents may ever creep into this set.
+    #[test]
+    fn no_privileged_intents() {
+        assert!(!INTENTS.contains(GatewayIntents::MESSAGE_CONTENT));
+        assert!(!INTENTS.contains(GatewayIntents::GUILD_MEMBERS));
+        assert!(!INTENTS.contains(GatewayIntents::GUILD_PRESENCES));
+        assert!(INTENTS.contains(GatewayIntents::GUILD_VOICE_STATES));
+    }
 }
