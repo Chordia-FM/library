@@ -10,9 +10,10 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chordia_contracts::discord::{
-    ArtistArt, ArtistArtRequest, ResolveListenersRequest, ResolveTracksRequest, ResolvedListener,
-    ResolvedTrack,
+    ArtistArt, ArtistArtRequest, ListenersNowPlaying, ResolveListenersRequest,
+    ResolveTracksRequest, ResolvedListener, ResolvedTrack,
 };
+use chordia_contracts::social::NowPlayingReport;
 use uuid::Uuid;
 
 use crate::catalog::TrackRow;
@@ -127,6 +128,19 @@ pub fn cached_listeners(ids: &[u64]) -> Vec<ResolvedListener> {
         .collect();
     out.sort_by(|a, b| a.handle.cmp(&b.handle));
     out
+}
+
+/// Tell the Hub what these listeners are hearing right now, or (with no report) that it stopped,
+/// so their profiles show it. Best effort: a Hub that is away simply shows nothing.
+pub async fn now_playing(state: &AppState, user_ids: Vec<Uuid>, report: Option<NowPlayingReport>) {
+    if user_ids.is_empty() {
+        return;
+    }
+    let Some(key) = key(state).await else { return };
+    let body = ListenersNowPlaying { user_ids, report };
+    if let Err(e) = hub(state).listeners_now_playing(&key, &body).await {
+        tracing::debug!(error = %e, "reporting listeners' now playing");
+    }
 }
 
 /// The Hub's id for one of the library's own libraries.

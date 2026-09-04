@@ -11,8 +11,8 @@ use std::path::Path;
 use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, CatalogSyncResponse};
 use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse, ServerOwner};
 use chordia_contracts::discord::{
-    ArtistArtRequest, ArtistArtResponse, AttributedScrobbleBatch, ResolveListenersRequest,
-    ResolveListenersResponse, ResolveTracksRequest, ResolveTracksResponse,
+    ArtistArtRequest, ArtistArtResponse, AttributedScrobbleBatch, ListenersNowPlaying,
+    ResolveListenersRequest, ResolveListenersResponse, ResolveTracksRequest, ResolveTracksResponse,
 };
 use chordia_contracts::identify::{IdentifyRequest, IdentifyResponse};
 use chordia_contracts::scrobble::ScrobbleBatch;
@@ -145,6 +145,27 @@ impl HubClient {
             anyhow::bail!("{path} failed {}", resp.status());
         }
         Ok(resp.json::<Res>().await?)
+    }
+
+    /// `POST /v1/directory/now-playing`: what the bot is playing to these listeners, or that it
+    /// stopped. No body comes back.
+    pub async fn listeners_now_playing(
+        &self,
+        server_api_key: &str,
+        body: &ListenersNowPlaying,
+    ) -> anyhow::Result<()> {
+        let url = format!("{}/v1/directory/now-playing", self.base()?);
+        let resp = self
+            .http
+            .post(&url)
+            .header("Authorization", format!("Library {server_api_key}"))
+            .json(body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("now-playing report failed {}", resp.status());
+        }
+        Ok(())
     }
 
     /// `POST /v1/directory/listeners:resolve`: which of these Discord users this server may

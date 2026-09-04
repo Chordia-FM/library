@@ -22,6 +22,7 @@ use tokio::sync::{Mutex, Notify};
 
 use chordia_contracts::discord::ResolvedTrack;
 use chordia_contracts::scrobble::{ClientType, ListeningEvent, PlaybackSource};
+use chordia_contracts::social::NowPlayingReport;
 use uuid::Uuid;
 
 use crate::catalog::TrackRow;
@@ -34,6 +35,9 @@ use crate::discord::ui::{self, views};
 use crate::discord::{autoplay, hub};
 
 /// How many finished tracks `/back` and `/history` can reach.
+/// How often a long track re-tells the Hub who is hearing it (its live entry expires in twelve).
+const NOW_PLAYING_REFRESH: Duration = Duration::from_secs(5 * 60);
+
 const HISTORY_CAP: usize = 50;
 /// How long the controller waits after a change before re-rendering, so a burst of button presses
 /// costs one edit.
@@ -260,6 +264,9 @@ struct PlayerState {
     /// `/stop` and leave: the End event must not start the next track.
     stopping: bool,
     settings: GuildSettings,
+    /// The Chordia users last told they are "listening now", to tell them it stopped.
+    now_playing_for: Vec<Uuid>,
+    now_playing_at: Option<Instant>,
 }
 
 /// Everything a view needs, cloned out from under the lock.
@@ -362,6 +369,8 @@ impl GuildPlayer {
                 alone_since: None,
                 controller: None,
                 messages_since_controller: 0,
+                now_playing_for: Vec::new(),
+                now_playing_at: None,
                 bitrate_kbps: None,
                 epoch: 0,
                 next_override: None,
@@ -474,6 +483,7 @@ impl GuildPlayer {
                 s.alone_since = None;
                 s.listeners.clear();
             }
+            self.push_now_playing().await;
             presence::update(&identity).await;
             if had_channel.is_some() {
                 let snap = self.snapshot().await;
@@ -913,7 +923,8 @@ impl GuildPlayer {
             }
             s.listeners.iter().map(|u| u.get()).collect()
         };
-        // Who among them is a Chordia user: asked once, remembered, shown on the controller.
+        // Who among them is a Chordia user: asked once, remembered, shown on the controller, and
+        // told what they are hearing.
         let me = self
             .identity
             .upgrade()
@@ -926,6 +937,7 @@ impl GuildPlayer {
                 if after != before {
                     me.controller_wake.notify_one();
                 }
+                me.push_now_playing().await;
             });
         }
     }
@@ -933,12 +945,16 @@ impl GuildPlayer {
     /// Periodic housekeeping: leave when idle or alone for longer than the identity allows, and
     /// keep the controller's progress line moving.
     pub async fn tick(self: &Arc<Self>, idle_timeout: Duration) {
-        let (reason, playing) = {
+        let (reason, playing, refresh_now_playing) = {
             let s = self.inner.lock().await;
             if s.voice_channel.is_none() {
                 return;
             }
             let playing = s.current.is_some();
+            // The Hub's live entry expires; keep it fresh through a long track.
+            let refresh_now_playing = playing
+                && s.now_playing_at
+                    .is_none_or(|t| t.elapsed() >= NOW_PLAYING_REFRESH);
             let reason = if s.settings.always_on {
                 None
             } else if !playing && s.idle_since.is_some_and(|t| t.elapsed() >= idle_timeout) {
@@ -948,12 +964,74 @@ impl GuildPlayer {
             } else {
                 None
             };
-            (reason, playing)
+            (reason, playing, refresh_now_playing)
         };
         match reason {
             Some(r) => self.leave(r).await,
-            None if playing => self.controller_wake.notify_one(),
+            None if playing => {
+                self.controller_wake.notify_one();
+                if refresh_now_playing {
+                    let p = self.clone();
+                    tokio::spawn(async move { p.push_now_playing().await });
+                }
+            }
             None => {}
+        }
+    }
+
+    /// Tell the Hub what the listeners who are Chordia users are hearing, so their profiles show
+    /// it; or, when nothing plays any more, that they stopped. Listeners the cache does not know
+    /// yet are asked for here, which is why this runs off the hot path.
+    pub async fn push_now_playing(&self) {
+        let Ok(identity) = self.identity() else {
+            return;
+        };
+        let (report, ids, previous) = {
+            let s = self.inner.lock().await;
+            let report = s.current.as_ref().map(|c| {
+                let channel = s
+                    .voice_channel
+                    .and_then(|vc| identity.channel_name(self.guild_id, vc))
+                    .unwrap_or_default();
+                NowPlayingReport {
+                    track_id: c.links.as_ref().map(|l| l.track_id),
+                    title: c.item.track.title.clone(),
+                    artist: c.item.track.artist.clone(),
+                    album: c.item.track.album.clone(),
+                    image_url: None,
+                    device_id: Some(format!(
+                        "discord:{}:{}",
+                        identity.app_id_sync().unwrap_or(0),
+                        self.guild_id.get()
+                    )),
+                    device_label: Some(format!("Discord · #{channel}")),
+                }
+            });
+            let ids: Vec<u64> = s.listeners.iter().map(|u| u.get()).collect();
+            (report, ids, s.now_playing_for.clone())
+        };
+        let users: Vec<Uuid> = match &report {
+            Some(_) => hub::resolve_listeners(&identity.state, &ids)
+                .await
+                .into_values()
+                .map(|l| l.user_id)
+                .collect(),
+            None => Vec::new(),
+        };
+        // Whoever was told last time and is not in this report has stopped hearing it.
+        let gone: Vec<Uuid> = previous
+            .iter()
+            .copied()
+            .filter(|u| !users.contains(u))
+            .collect();
+        {
+            let mut s = self.inner.lock().await;
+            s.now_playing_for = users.clone();
+            s.now_playing_at = Some(Instant::now());
+        }
+        hub::now_playing(&identity.state, gone, None).await;
+        if let Some(report) = report {
+            hub::now_playing(&identity.state, users, Some(report)).await;
         }
     }
 
@@ -1130,6 +1208,10 @@ impl GuildPlayer {
                 }
             });
         }
+        if let Some(p) = &self_arc {
+            let p = p.clone();
+            tokio::spawn(async move { p.push_now_playing().await });
+        }
         self.controller_wake.notify_one();
         presence::update(&identity).await;
         if let Some(vc) = self.inner.lock().await.voice_channel {
@@ -1277,6 +1359,8 @@ impl GuildPlayer {
             s.voice_channel
         };
         self.controller_wake.notify_one();
+        // Nothing plays: the listeners' profiles say so.
+        self.push_now_playing().await;
         if let Ok(identity) = self.identity() {
             presence::update(&identity).await;
             if let Some(vc) = vc {
@@ -1570,6 +1654,8 @@ mod tests {
             alone_since: None,
             controller: None,
             messages_since_controller: 0,
+            now_playing_for: Vec::new(),
+            now_playing_at: None,
             bitrate_kbps: None,
             epoch: 0,
             next_override: None,
