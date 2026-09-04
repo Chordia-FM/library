@@ -220,6 +220,56 @@ async fn on_ready(
         "Discord bot online"
     );
     presence::update(identity).await;
+    rejoin_always_on(identity).await;
+}
+
+/// 24/7 guilds get their bot back after a restart, in the channel it was keeping, announcing in
+/// the controller's channel (or the voice channel's own chat when none is known).
+async fn rejoin_always_on(identity: &Arc<Identity>) {
+    let Some(app_id) = identity.app_id_sync() else {
+        return;
+    };
+    let guilds = match crate::discord::settings::load_guilds(
+        &identity.state.db,
+        &app_id.to_string(),
+    )
+    .await
+    {
+        Ok(g) => g,
+        Err(e) => {
+            tracing::warn!(error = %e, "loading guild settings for 24/7 rejoin");
+            return;
+        }
+    };
+    for gs in guilds.into_iter().filter(|g| g.always_on) {
+        let (Some(guild), Some(voice)) = (
+            gs.guild_id.parse::<u64>().ok(),
+            gs.always_on_channel_id
+                .as_deref()
+                .and_then(|c| c.parse::<u64>().ok()),
+        ) else {
+            continue;
+        };
+        let guild = GuildId::new(guild);
+        let voice = serenity::all::ChannelId::new(voice);
+        let text = gs
+            .controller_channel_id
+            .as_deref()
+            .and_then(|c| c.parse::<u64>().ok())
+            .map(serenity::all::ChannelId::new)
+            .unwrap_or(voice);
+        let player = identity.player(guild).await;
+        match player.join(voice, text).await {
+            Ok(()) => tracing::info!(
+                bot = identity.index,
+                guild = guild.get(),
+                "rejoined 24/7 channel"
+            ),
+            Err(e) => {
+                tracing::warn!(bot = identity.index, guild = guild.get(), error = %e, "24/7 rejoin failed")
+            }
+        }
+    }
 }
 
 /// Register slash commands — globally, once, only when the command set changed since the last

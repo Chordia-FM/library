@@ -37,6 +37,7 @@ use super::v2::{
 use crate::catalog::TrackRow;
 use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
 use crate::discord::player::{Cover, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem};
+use crate::discord::settings::GuildSettings;
 use crate::search::{HitKind, SearchHit};
 
 pub const QUEUE_PAGE_SIZE: usize = 10;
@@ -642,6 +643,126 @@ pub fn busy(
     notice(icons, "Already playing elsewhere", &detail)
 }
 
+/// This server's settings for the bot: a summary, a DJ-role picker and toggle buttons. Every
+/// control edits the message in place, so it doubles as the settings panel.
+pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
+    let icons = &snap.icons;
+    let onoff = |b: bool| if b { "on" } else { "off" };
+    let dj = match gs.dj_role_id.as_deref().and_then(|r| r.parse::<u64>().ok()) {
+        Some(id) => format!("<@&{id}>"),
+        None => "none, anyone in the channel".to_string(),
+    };
+    let volume = gs
+        .volume
+        .map(|v| format!("{v}%"))
+        .unwrap_or_else(|| format!("{}% (bot default)", snap.volume));
+    let always_on = match (gs.always_on, gs.always_on_channel_id.as_deref()) {
+        (true, Some(ch)) => format!("on, in <#{ch}>"),
+        (true, None) => "on".to_string(),
+        (false, _) => "off".to_string(),
+    };
+    let mut body = header(
+        &icons.get(Icon::Gear),
+        "Settings",
+        Some(&format!("{} in this server", snap.bot_name)),
+    );
+    body.push(text(format!(
+        "**DJ role** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {}\n**24/7** · {always_on}\n**Re-post controller when it scrolls away** · {}",
+        onoff(gs.normalize),
+        onoff(gs.autoplay),
+        onoff(gs.announce)
+    )));
+    body.push(separator(false, Spacing::Large));
+    body.push(row(vec![Component::RoleSelect {
+        custom_id: id(snap, Action::Select("dj".into())),
+        placeholder: Some("DJ role: who may control shared playback".into()),
+        default_role: gs.dj_role_id.as_deref().and_then(|r| r.parse().ok()),
+    }]));
+    let setting = |name: &str, icon: Icon, label: String| {
+        button(
+            Button::new(
+                ButtonStyle::Secondary,
+                id(snap, Action::Setting(name.into())),
+            )
+            .emoji(icons.get(icon))
+            .label(label),
+        )
+    };
+    body.push(row(vec![
+        setting(
+            "normalize",
+            Icon::Volume,
+            format!("Normalize: {}", onoff(gs.normalize)),
+        ),
+        setting(
+            "autoplay",
+            Icon::Radio,
+            format!("Autoplay: {}", onoff(gs.autoplay)),
+        ),
+        setting(
+            "always_on",
+            Icon::Listening,
+            format!("24/7: {}", onoff(gs.always_on)),
+        ),
+        setting(
+            "announce",
+            Icon::Queue,
+            format!("Re-post: {}", onoff(gs.announce)),
+        ),
+        setting("dj_clear", Icon::Cross, "Clear DJ role".into()),
+    ]));
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
+}
+
+/// One page of lyrics, with paging when there is more than one.
+pub fn lyrics(
+    snap: &PlayerSnapshot,
+    title: &str,
+    artist: &str,
+    pages: &[String],
+    page: usize,
+) -> Message {
+    let icons = &snap.icons;
+    let last = pages.len().saturating_sub(1);
+    let page = page.min(last);
+    let mut body = header(
+        &icons.get(Icon::Lyrics),
+        &fmt::escape_md(title),
+        Some(&fmt::escape_md(artist)),
+    );
+    match pages.get(page) {
+        Some(p) => body.push(text(fmt::escape_md(p))),
+        None => body.push(text(small("No lyrics in this file's tags."))),
+    }
+    if pages.len() > 1 {
+        body.push(separator(false, Spacing::Large));
+        body.push(row(vec![
+            button(
+                Button::new(
+                    ButtonStyle::Secondary,
+                    id(snap, Action::LyricsPage(page.saturating_sub(1) as u32)),
+                )
+                .label("Back")
+                .disabled(page == 0),
+            ),
+            button(
+                Button::new(ButtonStyle::Secondary, id(snap, Action::Refresh))
+                    .label(format!("{}/{}", page + 1, pages.len()))
+                    .disabled(true),
+            ),
+            button(
+                Button::new(
+                    ButtonStyle::Secondary,
+                    id(snap, Action::LyricsPage((page + 1).min(last) as u32)),
+                )
+                .label("Next")
+                .disabled(page >= last),
+            ),
+        ]));
+    }
+    Message::new(vec![container(icons.accent(), body)]).ephemeral()
+}
+
 /// A minimal replacement for a picker that was dismissed.
 pub fn cancelled() -> Message {
     Message::new(vec![container(
@@ -1057,13 +1178,39 @@ mod tests {
     }
 
     #[test]
+    fn settings_and_lyrics_validate() {
+        let s = snap(0, true, false);
+        let mut gs = GuildSettings::defaults("1", "777");
+        settings(&s, &gs).validate().unwrap();
+        gs.dj_role_id = Some("99".into());
+        gs.always_on = true;
+        gs.always_on_channel_id = Some("555".into());
+        let b = settings(&s, &gs).body();
+        let txt = b.to_string();
+        assert!(txt.contains("<@&99>") && txt.contains("<#555>"), "{txt}");
+        // header, divider, summary, gap, then the DJ role select row.
+        assert_eq!(
+            b["components"][0]["components"][4]["components"][0]["type"],
+            6
+        );
+        let pages: Vec<String> = vec!["la la".into(), "da da".into()];
+        lyrics(&s, "Song", "Band", &pages, 0).validate().unwrap();
+        lyrics(&s, "Song", "Band", &pages, 9).validate().unwrap();
+        lyrics(&s, "Song", "Band", &[], 0).validate().unwrap();
+    }
+
+    #[test]
     fn no_view_repeats_a_custom_id() {
         let s = snap(25, true, false);
+        let pages: Vec<String> = (0..3).map(|i| format!("page {i}")).collect();
         for m in [
             now_playing(&s, false),
             queue_page(&s, 0),
             queue_page(&s, 1),
             queue_page(&s, 2),
+            settings(&s, &GuildSettings::defaults("1", "777")),
+            lyrics(&s, "t", "a", &pages, 0),
+            lyrics(&s, "t", "a", &pages, 2),
         ] {
             let ids = custom_ids(&m);
             let mut dedup = ids.clone();

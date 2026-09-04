@@ -32,6 +32,7 @@ pub mod commands;
 pub mod emoji;
 pub mod identity;
 pub mod interactions;
+pub mod lyrics;
 pub mod player;
 pub mod presence;
 pub mod rest;

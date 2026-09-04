@@ -31,7 +31,10 @@ pub enum Action {
     QueueLast,
     /// Re-render the now-playing controller.
     Refresh,
+    /// Open the current track's lyrics as a private message.
     Lyrics,
+    /// Show a lyrics page (0-based) in place.
+    LyricsPage(u32),
     AutoplayToggle,
     /// A select menu; the arg names which picker it belongs to (`search`, `album`, `artist`, …).
     Select(String),
@@ -61,6 +64,7 @@ impl Action {
             Action::QueueLast => "ql".into(),
             Action::Refresh => "np".into(),
             Action::Lyrics => "ly".into(),
+            Action::LyricsPage(p) => format!("lyp:{p}"),
             Action::AutoplayToggle => "ap".into(),
             Action::Select(ctx) => format!("sel:{ctx}"),
             Action::Confirm(n) => format!("cf:{n}"),
@@ -86,6 +90,7 @@ impl Action {
             ("ql", None) => Action::QueueLast,
             ("np", None) => Action::Refresh,
             ("ly", None) => Action::Lyrics,
+            ("lyp", Some(p)) => Action::LyricsPage(p.parse().ok()?),
             ("ap", None) => Action::AutoplayToggle,
             ("sel", Some(c)) => Action::Select(c.to_string()),
             ("cf", Some(n)) => Action::Confirm(n.to_string()),
@@ -155,6 +160,7 @@ mod tests {
             Action::QueueLast,
             Action::Refresh,
             Action::Lyrics,
+            Action::LyricsPage(2),
             Action::AutoplayToggle,
             Action::Select("search".into()),
             Action::Confirm("ab12".into()),

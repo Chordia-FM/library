@@ -9,6 +9,7 @@ pub mod guard;
 pub mod info;
 pub mod play;
 pub mod queue;
+pub mod settings;
 
 use std::sync::Arc;
 
@@ -48,6 +49,10 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         control::leave(),
         control::radio(),
         info::bots(),
+        info::lyrics(),
+        settings::settings(),
+        settings::dj(),
+        settings::always_on(),
     ]
 }
 

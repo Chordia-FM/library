@@ -35,6 +35,8 @@ pub enum Refusal {
     NeedDj {
         role: Option<RoleId>,
     },
+    /// Server settings: Manage Server, Administrator, or a configured bot owner.
+    NeedAdmin,
     Offline,
 }
 
@@ -65,6 +67,11 @@ impl Refusal {
                     ),
                 )
             }
+            Refusal::NeedAdmin => views::notice(
+                icons,
+                "That's a server setting",
+                "-# Someone with **Manage Server** (or a bot owner) can change it.",
+            ),
             Refusal::Offline => views::error(
                 icons,
                 "Not connected",
@@ -114,6 +121,32 @@ pub async fn listener_for(
         }
     }
     Ok((vc, player))
+}
+
+/// The caller must be allowed to change the bot's settings for this server.
+pub async fn admin(ctx: Context<'_>) -> Result<(), Refusal> {
+    let member = ctx.author_member().await;
+    admin_for(ctx.data(), ctx.author().id, member.as_deref())
+}
+
+pub fn admin_for(
+    identity: &Identity,
+    user: UserId,
+    member: Option<&Member>,
+) -> Result<(), Refusal> {
+    if identity.settings().is_owner(user.get()) {
+        return Ok(());
+    }
+    let allowed = member.is_some_and(|m| {
+        m.permissions.is_some_and(|p| {
+            p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
+        })
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(Refusal::NeedAdmin)
+    }
 }
 
 /// The caller must be allowed to change shared playback.

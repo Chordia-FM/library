@@ -43,7 +43,7 @@ pub async fn handle(
 
     // Acknowledge before anything that can take time.
     match cid.action {
-        Action::QueueOpen => send::component_defer_ephemeral(http, ic).await?,
+        Action::QueueOpen | Action::Lyrics => send::component_defer_ephemeral(http, ic).await?,
         _ => send::component_ack(http, ic).await?,
     }
     let player = identity.player(guild).await;
@@ -87,6 +87,23 @@ pub async fn handle(
             send::interaction_edit(http, token, views::now_playing(&snap, false).ephemeral()).await
         }
         Action::Cancel => send::interaction_edit(http, token, views::cancelled()).await,
+        Action::Select(ref ctx_name) if ctx_name == "dj" => {
+            if let Err(r) = guard::admin_for(identity, user, ic.member.as_ref()) {
+                return send::interaction_followup(http, token, r.view(&icons)).await;
+            }
+            let role = match &ic.data.kind {
+                ComponentInteractionDataKind::RoleSelect { values } => {
+                    values.first().map(|r| r.get().to_string())
+                }
+                _ => None,
+            };
+            player
+                .update_settings(|s| s.dj_role_id = role.clone())
+                .await;
+            let snap = player.snapshot().await;
+            let gs = player.settings().await;
+            send::interaction_edit(http, token, views::settings(&snap, &gs)).await
+        }
         Action::Select(_) | Action::Play(_) => {
             let value = match (&cid.action, &ic.data.kind) {
                 (Action::Play(id), _) => format!("t:{id}"),
@@ -159,8 +176,69 @@ pub async fn handle(
                 }
             }
         }
-        // Later phases: confirmations and settings toggles.
-        Action::Lyrics | Action::Confirm(_) | Action::Setting(_) => Ok(()),
+        Action::Lyrics | Action::LyricsPage(_) => {
+            let page = match cid.action {
+                Action::LyricsPage(p) => p as usize,
+                _ => 0,
+            };
+            let snap = player.snapshot().await;
+            let Some(cur) = &snap.current else {
+                return send::interaction_edit(
+                    http,
+                    token,
+                    views::notice(
+                        &icons,
+                        "Nothing playing",
+                        "-# Lyrics follow the current track.",
+                    ),
+                )
+                .await;
+            };
+            let track = &cur.item.track;
+            let raw = crate::catalog::get_track_lyrics(&identity.state.db, &track.id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let pages = crate::discord::lyrics::pages(
+                &crate::discord::lyrics::lines(&raw),
+                crate::discord::lyrics::PAGE_CHARS,
+            );
+            send::interaction_edit(
+                http,
+                token,
+                views::lyrics(&snap, &track.title, &track.artist, &pages, page),
+            )
+            .await
+        }
+        Action::Setting(name) => {
+            if let Err(r) = guard::admin_for(identity, user, ic.member.as_ref()) {
+                return send::interaction_followup(http, token, r.view(&icons)).await;
+            }
+            let voice = player.voice_channel().await;
+            player
+                .update_settings(|s| match name.as_str() {
+                    "normalize" => s.normalize = !s.normalize,
+                    "autoplay" => s.autoplay = !s.autoplay,
+                    "announce" => s.announce = !s.announce,
+                    "dj_clear" => s.dj_role_id = None,
+                    "always_on" => {
+                        s.always_on = !s.always_on;
+                        s.always_on_channel_id = if s.always_on {
+                            voice.map(|c| c.get().to_string())
+                        } else {
+                            None
+                        };
+                    }
+                    _ => {}
+                })
+                .await;
+            let snap = player.snapshot().await;
+            let gs = player.settings().await;
+            send::interaction_edit(http, token, views::settings(&snap, &gs)).await
+        }
+        // Confirmations arrive with the destructive queue actions.
+        Action::Confirm(_) => Ok(()),
     }
 }
 

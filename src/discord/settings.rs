@@ -333,6 +333,45 @@ impl GuildSettings {
     }
 }
 
+/// A partial update from the dashboard for one guild; absent means unchanged, `null` clears.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct GuildSettingsPatch {
+    #[serde(default, deserialize_with = "double_option")]
+    pub dj_role_id: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    pub volume: Option<Option<u8>>,
+    pub normalize: Option<bool>,
+    pub always_on: Option<bool>,
+    pub autoplay: Option<bool>,
+    pub announce: Option<bool>,
+}
+
+impl GuildSettingsPatch {
+    pub fn apply(self, s: &mut GuildSettings) {
+        if let Some(v) = self.dj_role_id {
+            s.dj_role_id = v.filter(|r| !r.trim().is_empty());
+        }
+        if let Some(v) = self.volume {
+            s.volume = v.map(|x| x.min(150));
+        }
+        if let Some(v) = self.normalize {
+            s.normalize = v;
+        }
+        if let Some(v) = self.always_on {
+            s.always_on = v;
+            if !v {
+                s.always_on_channel_id = None;
+            }
+        }
+        if let Some(v) = self.autoplay {
+            s.autoplay = v;
+        }
+        if let Some(v) = self.announce {
+            s.announce = v;
+        }
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct GuildRow {
     app_id: String,

@@ -1,8 +1,50 @@
-//! `/bots` — which identities exist and what each is doing here.
+//! `/bots` and `/lyrics`.
 
 use super::{Context, Error};
 use crate::discord::identity::Status;
+use crate::discord::lyrics;
 use crate::discord::ui::{send, views};
+
+/// Lyrics for the track that is playing, from the file's own tags
+#[poise::command(slash_command, guild_only)]
+pub async fn lyrics(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    let guild = super::guild_of(ctx)?;
+    let identity = ctx.data();
+    let Some(player) = identity.player_arc(guild) else {
+        return send::respond(
+            ctx,
+            views::notice(
+                &super::icons(ctx),
+                "Nothing playing",
+                "-# Lyrics follow the current track.",
+            ),
+        )
+        .await;
+    };
+    let snap = player.snapshot().await;
+    let Some(cur) = &snap.current else {
+        return send::respond(
+            ctx,
+            views::notice(
+                &super::icons(ctx),
+                "Nothing playing",
+                "-# Lyrics follow the current track.",
+            ),
+        )
+        .await;
+    };
+    let track = &cur.item.track;
+    let raw = crate::catalog::get_track_lyrics(&identity.state.db, &track.id)
+        .await?
+        .unwrap_or_default();
+    let pages = lyrics::pages(&lyrics::lines(&raw), lyrics::PAGE_CHARS);
+    send::respond(
+        ctx,
+        views::lyrics(&snap, &track.title, &track.artist, &pages, 0),
+    )
+    .await
+}
 
 /// See every bot identity and which are free
 #[poise::command(slash_command, guild_only)]
