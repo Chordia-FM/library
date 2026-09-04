@@ -38,6 +38,7 @@ use crate::catalog::TrackRow;
 use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
 use crate::discord::player::{Cover, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem};
 use crate::discord::settings::GuildSettings;
+use crate::discord::settings::PlayEntry;
 use crate::search::{HitKind, SearchHit};
 use chordia_contracts::discord::ResolvedTrack;
 
@@ -271,14 +272,15 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
     if snap.volume != 100 {
         meta.push(format!("vol {}%", snap.volume));
     }
-    // Transparency: whose Chordia history this play lands in.
-    if !snap.counting.is_empty() {
-        let names: Vec<String> = snap
-            .counting
-            .iter()
-            .map(|h| format!("@{}", fmt::escape_md(h)))
-            .collect();
-        meta.push(format!("counting for {}", names.join(", ")));
+    // The stateful buttons say it in colour; this line says it in words, for anyone reading.
+    if snap.loop_mode != LoopMode::Off {
+        meta.push(format!("loop: {}", snap.loop_mode.label()));
+    }
+    if snap.shuffle {
+        meta.push("shuffle".to_string());
+    }
+    if snap.autoplay {
+        meta.push("autoplay".to_string());
     }
     let mut body = header(&icons.get(icon), title, Some(&where_line(snap)));
     body.extend(with_art(
@@ -302,30 +304,35 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
         btn(snap, Action::PlayPause, play_icon),
         btn(snap, Action::Skip, Icon::Next),
         btn(snap, Action::Stop, Icon::Stop),
-        btn(snap, Action::Shuffle, Icon::Shuffle),
+        btn(
+            snap,
+            Action::Shuffle,
+            if snap.shuffle {
+                Icon::Shuffle
+            } else {
+                Icon::ShuffleOff
+            },
+        ),
     ]));
+    // Stateful buttons carry their state in the icon's colour: white off, accent on, and the
+    // loop's "1" for one track. No labels; the icons are their own explanation.
     let loop_icon = match snap.loop_mode {
+        LoopMode::Off => Icon::LoopOff,
         LoopMode::Track => Icon::LoopTrack,
-        _ => Icon::LoopQueue,
+        LoopMode::Queue => Icon::LoopQueue,
     };
     body.push(row(vec![
-        btn_labeled(
-            snap,
-            Action::LoopCycle,
-            loop_icon,
-            &format!("Loop: {}", snap.loop_mode.label()),
-        ),
+        btn(snap, Action::LoopCycle, loop_icon),
         btn(snap, Action::VolumeDown, Icon::VolumeDown),
         btn(snap, Action::VolumeUp, Icon::Volume),
-        btn_labeled(snap, Action::QueueOpen, Icon::Queue, "Queue"),
-        btn_labeled(
+        btn(snap, Action::QueueOpen, Icon::Queue),
+        btn(
             snap,
             Action::AutoplayToggle,
-            Icon::Radio,
             if snap.autoplay {
-                "Autoplay: on"
+                Icon::Radio
             } else {
-                "Autoplay: off"
+                Icon::RadioOff
             },
         ),
     ]));
@@ -546,25 +553,46 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
 }
 
 /// Recently played, newest first.
-pub fn history(snap: &PlayerSnapshot) -> Message {
-    let icons = &snap.icons;
-    let web = snap.web_base.as_deref();
-    let mut body = header(&icons.get(Icon::List), "History", Some(&snap.bot_name));
-    if snap.history.is_empty() {
+/// What this server heard, newest first, from the play log: when, who asked, how much of it, and
+/// whether it counted for anyone's history.
+pub fn history(icons: &IconSet, bot_name: &str, web: Option<&str>, plays: &[PlayEntry]) -> Message {
+    let mut body = header(&icons.get(Icon::List), "History", Some(bot_name));
+    if plays.is_empty() {
         body.push(text(small("Nothing has played yet.")));
     } else {
-        let lines: Vec<String> = snap
-            .history
+        let lines: Vec<String> = plays
             .iter()
-            .rev()
             .take(QUEUE_PAGE_SIZE)
-            .map(|item| {
-                format!(
-                    "{} · {} · {}",
-                    title_line(&item.track, web),
-                    fmt::duration(item.track.duration_ms.max(0) as u64),
-                    mention(item.requested_by)
-                )
+            .map(|p| {
+                let mut line = format!(
+                    "**{}**",
+                    linked(&p.title, web, &format!("{} {}", p.title, p.artist))
+                );
+                if !p.artist.is_empty() {
+                    line.push_str(" · ");
+                    line.push_str(&linked(&p.artist, web, &p.artist));
+                }
+                let mut meta = vec![format!("<t:{}:R>", p.started_at / 1000)];
+                if p.ms_played > 0 {
+                    meta.push(fmt::duration(p.ms_played as u64));
+                }
+                if let Some(by) = p
+                    .requested_by
+                    .as_deref()
+                    .and_then(|u| u.parse::<u64>().ok())
+                {
+                    meta.push(mention(UserId::new(by)));
+                }
+                meta.push(if p.scrobbled_for > 0 {
+                    format!(
+                        "{} counted for {}",
+                        icons.get(Icon::Check).markup(),
+                        fmt::count(p.scrobbled_for as usize, "listener")
+                    )
+                } else {
+                    "not counted".to_string()
+                });
+                format!("{line}\n{}", small(meta.join(" · ")))
             })
             .collect();
         body.push(text(lines.join("\n")));
@@ -994,7 +1022,7 @@ mod tests {
             volume: 80,
             normalize: true,
             listeners: 3,
-            counting: vec![],
+            shuffle: false,
         }
     }
 
@@ -1046,7 +1074,7 @@ mod tests {
             queue_page(&s, 0),
             queue_page(&s, 99),
             queue_page(&snap(0, false, false), 0),
-            history(&s),
+            history(&s.icons, &s.bot_name, None, &[]),
             error(&icons, "Couldn't do that", "reason"),
             notice(&icons, "Heads up", "detail"),
             ok(&icons, "Skipped", "**x**"),
@@ -1134,13 +1162,16 @@ mod tests {
         let row2 = kids[7]["components"].as_array().unwrap();
         assert_eq!(row1.len(), 5);
         assert_eq!(row2.len(), 5);
-        // Every button is the neutral style; state lives in icons and labels.
+        // Every button is the neutral style; state lives in the icons, never in a label.
         assert!(row1.iter().chain(row2.iter()).all(|b| b["style"] == 2));
+        assert!(row1.iter().chain(row2.iter()).all(|b| b["label"].is_null()));
         assert_eq!(row1[1]["custom_id"], "cd:1:1:777:pl");
         // Playing, so the play/pause button offers pause.
         assert_eq!(row1[1]["emoji"]["name"], "⏸");
-        assert_eq!(row2[0]["label"], "Loop: queue");
-        assert_eq!(row2[4]["label"], "Autoplay: on");
+        // Without the emoji set the state icons fall back to glyphs; the meta line says it in words.
+        assert_eq!(row2[0]["emoji"]["name"], "🔁");
+        assert_eq!(row2[4]["emoji"]["name"], "📻");
+        assert!(progress.contains("loop: queue") && progress.contains("autoplay"));
         // The cover rides along as an upload.
         assert_eq!(b["attachments"][0]["filename"], "cover-c.jpg");
         assert!(!m.ephemeral);
@@ -1374,7 +1405,7 @@ mod tests {
         assert!(body.contains("F\\\\*\\\\*K \\\\# 1"));
         for m in [
             queue_page(&s, 0),
-            history(&s),
+            history(&s.icons, &s.bot_name, None, &[]),
             left(&s, LeaveReason::Alone),
             busy(&icons, "A", ChannelId::new(1), 1, &["C".into()]),
             idle(&s),

@@ -272,7 +272,7 @@ async fn controlled_action(action: &Action, player: &Arc<GuildPlayer>) -> Result
         Action::Previous => player.previous().await.map(|_| ()),
         Action::Stop => player.stop().await,
         Action::Shuffle => {
-            player.shuffle().await;
+            player.toggle_shuffle().await;
             Ok(())
         }
         Action::LoopCycle => {

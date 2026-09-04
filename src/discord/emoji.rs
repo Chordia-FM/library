@@ -35,7 +35,11 @@ const SIZE: u32 = 128;
 const NAME_PREFIX: &str = "cd_";
 /// Bumped whenever an existing emoji name changes meaning (a redrawn segment, say). It is part of
 /// the applied stamp, so a set made by an older build is regenerated rather than reused by name.
-pub const SET_VERSION: u32 = 2;
+pub const SET_VERSION: u32 = 3;
+
+/// The colour of a stateful button's icon while it is off: white, so the accent colour reads as
+/// "on" without a word of label.
+pub const OFF_HEX: &str = "#ffffff";
 
 /// What `emoji_hex_applied` records: the colour and the set version it was made with.
 pub fn applied_stamp(hex: &str) -> String {
@@ -56,6 +60,10 @@ pub enum Icon {
     Volume,
     VolumeDown,
     Radio,
+    /// The same glyphs in white: a stateful button (shuffle, loop, autoplay) that is off.
+    ShuffleOff,
+    LoopOff,
+    RadioOff,
     Note,
     Queue,
     Search,
@@ -124,6 +132,9 @@ phosphor! {
     Volume => "volume", "speaker-high", glyph::VOLUME;
     VolumeDown => "volumedown", "speaker-low", glyph::VOLUME_DOWN;
     Radio => "radio", "radio", glyph::RADIO;
+    ShuffleOff => "shuffleoff", "shuffle", glyph::SHUFFLE;
+    LoopOff => "loopoff", "repeat", glyph::LOOP_QUEUE;
+    RadioOff => "radiooff", "radio", glyph::RADIO;
     Note => "note", "music-note", glyph::NOTE;
     Queue => "queue", "queue", glyph::QUEUE;
     Search => "search", "magnifying-glass", glyph::SEARCH;
@@ -275,8 +286,14 @@ impl Icon {
         }
     }
 
+    /// An icon that is drawn in white rather than the accent: the "off" state of a button.
+    pub fn is_off(self) -> bool {
+        matches!(self, Icon::ShuffleOff | Icon::LoopOff | Icon::RadioOff)
+    }
+
     /// The SVG for this icon in `hex`.
     fn svg(self, hex: &str) -> String {
+        let hex = if self.is_off() { OFF_HEX } else { hex };
         if let Some(src) = self.phosphor_svg() {
             return if src.contains("fill=\"currentColor\"") {
                 src.replace("fill=\"currentColor\"", &format!("fill=\"{hex}\""))
@@ -532,7 +549,7 @@ mod tests {
             );
             assert!(names.insert(name), "duplicate emoji name {name}");
         }
-        assert_eq!(names.len(), 41);
+        assert_eq!(names.len(), 44);
     }
 
     #[test]

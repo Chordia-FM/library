@@ -92,7 +92,7 @@ pub async fn stats(
             } else {
                 "This server's plays"
             },
-            "-# Last 30 days, through this bot",
+            "Last 30 days, through this bot",
             &sections,
         ),
     )

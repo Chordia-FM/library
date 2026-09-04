@@ -60,8 +60,31 @@ pub async fn history(ctx: Context<'_>) -> Result<(), Error> {
     let Some(player) = player_or_notice(ctx).await? else {
         return Ok(());
     };
-    let snap = player.snapshot().await;
-    send::respond(ctx, views::history(&snap)).await
+    let identity = ctx.data();
+    let guild = super::guild_of(ctx)?;
+    let icons = super::icons(ctx);
+    let Some(app_id) = identity.app_id_sync() else {
+        return send::respond(ctx, guard::Refusal::Offline.view(&icons)).await;
+    };
+    let plays = crate::discord::settings::recent_plays(
+        &identity.state.db,
+        &app_id.to_string(),
+        &guild.get().to_string(),
+        10,
+    )
+    .await?;
+    let web = identity.web_base().await;
+    drop(player);
+    send::respond(
+        ctx,
+        views::history(
+            &icons,
+            &identity.display_name_sync(),
+            web.as_deref(),
+            &plays,
+        ),
+    )
+    .await
 }
 
 /// Remove a track from the queue
@@ -216,7 +239,7 @@ pub async fn clear(ctx: Context<'_>) -> Result<(), Error> {
     .await
 }
 
-/// Shuffle the queue
+/// Play the queue in random order, or back in order
 #[poise::command(slash_command, guild_only)]
 pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
@@ -226,13 +249,17 @@ pub async fn shuffle(ctx: Context<'_>) -> Result<(), Error> {
     if let Err(r) = guard::controller(ctx, &player).await {
         return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
-    let n = player.shuffle().await;
+    let on = player.toggle_shuffle().await;
     send::respond(
         ctx,
         views::ok(
             &super::icons(ctx),
-            "Shuffled",
-            &format!("-# {} reordered", fmt::count(n, "track")),
+            "Shuffle",
+            if on {
+                "-# on: the queue plays in random order."
+            } else {
+                "-# off: the queue plays in order."
+            },
         ),
     )
     .await

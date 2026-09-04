@@ -245,6 +245,8 @@ struct PlayerState {
     current: Option<Playing>,
     loop_mode: LoopMode,
     autoplay: bool,
+    /// Play the queue in random order: each advance takes a random item rather than the head.
+    shuffle: bool,
     volume: u8,
     normalize: bool,
     /// Non-bot users in the bot's voice channel.
@@ -296,11 +298,10 @@ pub struct PlayerSnapshot {
     pub history: Vec<QueueItem>,
     pub loop_mode: LoopMode,
     pub autoplay: bool,
+    pub shuffle: bool,
     pub volume: u8,
     pub normalize: bool,
     pub listeners: usize,
-    /// Handles of the listeners whose history this play counts in, as far as the bot knows.
-    pub counting: Vec<String>,
 }
 
 impl PlayerSnapshot {
@@ -362,6 +363,7 @@ impl GuildPlayer {
                 current: None,
                 loop_mode: LoopMode::Off,
                 autoplay: settings.autoplay,
+                shuffle: false,
                 volume: settings.volume.unwrap_or(default_volume),
                 normalize: settings.normalize,
                 listeners: HashSet::new(),
@@ -748,17 +750,15 @@ impl GuildPlayer {
         on
     }
 
-    pub async fn shuffle(&self) -> usize {
-        use rand::seq::SliceRandom;
-        let n = {
+    /// Toggle random order; returns `true` when now on.
+    pub async fn toggle_shuffle(&self) -> bool {
+        let on = {
             let mut s = self.inner.lock().await;
-            let mut v: Vec<QueueItem> = s.queue.drain(..).collect();
-            v.shuffle(&mut rand::thread_rng());
-            s.queue.extend(v);
-            s.queue.len()
+            s.shuffle = !s.shuffle;
+            s.shuffle
         };
         self.after_change().await;
-        n
+        on
     }
 
     /// Remove the item at `index` (1-based, as shown in `/queue`).
@@ -861,16 +861,10 @@ impl GuildPlayer {
                 history: s.history.iter().cloned().collect(),
                 loop_mode: s.loop_mode,
                 autoplay: s.autoplay,
+                shuffle: s.shuffle,
                 volume: s.volume,
                 normalize: s.normalize,
                 listeners: s.listeners.len(),
-                counting: {
-                    let ids: Vec<u64> = s.listeners.iter().map(|u| u.get()).collect();
-                    hub::cached_listeners(&ids)
-                        .into_iter()
-                        .map(|l| l.handle)
-                        .collect()
-                },
             };
             (handle, snap)
         };
@@ -932,11 +926,7 @@ impl GuildPlayer {
         if let (Ok(identity), Some(me)) = (self.identity(), me) {
             let state = identity.state.clone();
             tokio::spawn(async move {
-                let before = hub::cached_listeners(&ids).len();
-                let after = hub::resolve_listeners(&state, &ids).await.len();
-                if after != before {
-                    me.controller_wake.notify_one();
-                }
+                hub::resolve_listeners(&state, &ids).await;
                 me.push_now_playing().await;
             });
         }
@@ -1072,6 +1062,17 @@ impl GuildPlayer {
 
     // ---- playback internals --------------------------------------------------------------------
 
+    /// The next queued item: the head, or any item when shuffle is on.
+    fn take_next(s: &mut PlayerState) -> Option<QueueItem> {
+        if s.shuffle && s.queue.len() > 1 {
+            use rand::Rng;
+            let i = rand::thread_rng().gen_range(0..s.queue.len());
+            s.queue.remove(i)
+        } else {
+            s.queue.pop_front()
+        }
+    }
+
     /// Start the next thing: an override, the looping track, the queue head, or nothing.
     async fn advance(self: &Arc<Self>) {
         let next = {
@@ -1079,7 +1080,7 @@ impl GuildPlayer {
             if let Some(o) = s.next_override.take() {
                 Some(o)
             } else {
-                s.queue.pop_front()
+                Self::take_next(&mut s)
             }
         };
         match next {
@@ -1267,6 +1268,7 @@ impl GuildPlayer {
         if heard.is_empty() {
             return;
         }
+        let counted = heard.len();
         let library_id = hub::hub_library_id(&identity.state, &c.track.library_id).await;
         let fingerprint = (*c.track).clone().into_contract().fingerprint;
         for (user, ms) in heard {
@@ -1287,6 +1289,9 @@ impl GuildPlayer {
             if let Err(e) = crate::scrobble::enqueue_attributed(db, &event, user.get()).await {
                 tracing::warn!(error = %e, guild = %self.guild_id, "queueing a listener's play");
             }
+        }
+        if let Some(id) = c.play_id {
+            let _ = settings::mark_scrobbled(db, id, counted).await;
         }
     }
 
@@ -1332,7 +1337,7 @@ impl GuildPlayer {
                     if s.loop_mode == LoopMode::Queue {
                         s.queue.push_back(ended.item.clone());
                     }
-                    s.queue.pop_front()
+                    Self::take_next(&mut s)
                 }
             }
         };
@@ -1627,7 +1632,7 @@ mod tests {
             volume: 100,
             normalize: true,
             listeners: 0,
-            counting: Vec::new(),
+            shuffle: false,
         };
         assert_eq!(snap.queue_duration_ms(), 30_000);
         assert_eq!(snap.eta_ms(0), 60_000);
@@ -1647,6 +1652,7 @@ mod tests {
             current: None,
             loop_mode: LoopMode::Off,
             autoplay: false,
+            shuffle: false,
             volume,
             normalize,
             listeners: HashSet::new(),

@@ -662,6 +662,51 @@ pub async fn guild_stats(
     })
 }
 
+/// Note how many listeners a play was queued to count for.
+pub async fn mark_scrobbled(db: &SqlitePool, play_id: i64, listeners: usize) -> AppResult<()> {
+    sqlx::query("UPDATE discord_plays SET scrobbled_for = ? WHERE id = ?")
+        .bind(listeners as i64)
+        .bind(play_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+/// One line of `/history`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PlayEntry {
+    pub title: String,
+    pub artist: String,
+    pub requested_by: Option<String>,
+    pub started_at: i64,
+    pub ms_played: i64,
+    pub scrobbled_for: i64,
+}
+
+/// The last `limit` plays in a guild, newest first, from the persistent log rather than the
+/// player's in-memory history: a stop or a loop does not erase what was heard.
+pub async fn recent_plays(
+    db: &SqlitePool,
+    app_id: &str,
+    guild_id: &str,
+    limit: i64,
+) -> AppResult<Vec<PlayEntry>> {
+    Ok(sqlx::query_as::<_, PlayEntry>(
+        "SELECT COALESCE(t.title, '?') AS title, COALESCE(ar.name, '') AS artist, \
+                p.requested_by, p.started_at, p.ms_played, p.scrobbled_for \
+         FROM discord_plays p \
+         LEFT JOIN tracks t ON t.id = p.track_id \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         WHERE p.app_id = ? AND p.guild_id = ? \
+         ORDER BY p.started_at DESC LIMIT ?",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
 pub async fn finish_play(db: &SqlitePool, play_id: i64, ms_played: u64) -> AppResult<()> {
     sqlx::query("UPDATE discord_plays SET ms_played = ? WHERE id = ?")
         .bind(ms_played as i64)
