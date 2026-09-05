@@ -29,6 +29,10 @@ pub enum Action {
     /// share a custom id with their neighbours (Discord refuses duplicates in one message).
     QueueFirst,
     QueueLast,
+    /// `/history` pages, the same way.
+    History(u32),
+    HistoryFirst,
+    HistoryLast,
     /// Re-render the now-playing controller.
     Refresh,
     /// Open the current track's lyrics as a private message.
@@ -62,6 +66,9 @@ impl Action {
             Action::Queue(p) => format!("q:{p}"),
             Action::QueueFirst => "qf".into(),
             Action::QueueLast => "ql".into(),
+            Action::History(p) => format!("h:{p}"),
+            Action::HistoryFirst => "hf".into(),
+            Action::HistoryLast => "hl".into(),
             Action::Refresh => "np".into(),
             Action::Lyrics => "ly".into(),
             Action::LyricsPage(p) => format!("lyp:{p}"),
@@ -88,6 +95,9 @@ impl Action {
             ("q", Some(p)) => Action::Queue(p.parse().ok()?),
             ("qf", None) => Action::QueueFirst,
             ("ql", None) => Action::QueueLast,
+            ("h", Some(p)) => Action::History(p.parse().ok()?),
+            ("hf", None) => Action::HistoryFirst,
+            ("hl", None) => Action::HistoryLast,
             ("np", None) => Action::Refresh,
             ("ly", None) => Action::Lyrics,
             ("lyp", Some(p)) => Action::LyricsPage(p.parse().ok()?),
@@ -158,6 +168,9 @@ mod tests {
             Action::Queue(3),
             Action::QueueFirst,
             Action::QueueLast,
+            Action::History(1),
+            Action::HistoryFirst,
+            Action::HistoryLast,
             Action::Refresh,
             Action::Lyrics,
             Action::LyricsPage(2),

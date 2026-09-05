@@ -70,21 +70,11 @@ pub async fn history(ctx: Context<'_>) -> Result<(), Error> {
         &identity.state.db,
         &app_id.to_string(),
         &guild.get().to_string(),
-        10,
+        views::HISTORY_LIMIT,
     )
     .await?;
-    let web = identity.web_base().await;
-    drop(player);
-    send::respond(
-        ctx,
-        views::history(
-            &icons,
-            &identity.display_name_sync(),
-            web.as_deref(),
-            &plays,
-        ),
-    )
-    .await
+    let snap = player.snapshot().await;
+    send::respond(ctx, views::history(&snap, &plays, 0)).await
 }
 
 /// Remove a track, or a run of tracks, from the queue

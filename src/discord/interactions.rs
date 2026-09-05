@@ -89,6 +89,25 @@ pub async fn handle(
             // The view clamps to the last page.
             send::interaction_edit(http, token, views::queue_page(&snap, usize::MAX)).await
         }
+        Action::History(_) | Action::HistoryFirst | Action::HistoryLast => {
+            let page = match cid.action {
+                Action::History(p) => p as usize,
+                Action::HistoryLast => usize::MAX,
+                _ => 0,
+            };
+            let Some(app_id) = identity.app_id_sync() else {
+                return Ok(());
+            };
+            let plays = crate::discord::settings::recent_plays(
+                &identity.state.db,
+                &app_id.to_string(),
+                &guild.get().to_string(),
+                views::HISTORY_LIMIT,
+            )
+            .await?;
+            let snap = player.snapshot().await;
+            send::interaction_edit(http, token, views::history(&snap, &plays, page)).await
+        }
         Action::Refresh => {
             let snap = player.snapshot().await;
             send::interaction_edit(http, token, views::now_playing(&snap, false).ephemeral()).await
@@ -160,8 +179,8 @@ pub async fn handle(
                     autoplay: false,
                 })
                 .collect();
-            let cover = match art {
-                Some(art) => Some(art),
+            let cover = match &art {
+                Some(art) => Some(art.clone()),
                 None => Cover::load(&identity.state.db, &items[0].track).await,
             };
             match player.enqueue(items.clone(), Position::Last).await {
@@ -174,6 +193,7 @@ pub async fn handle(
                         &enq,
                         resolved.source.as_deref(),
                         cover.as_ref(),
+                        art.as_ref(),
                     )
                     .ephemeral();
                     send::interaction_edit(http, token, toast).await

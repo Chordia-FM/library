@@ -8,6 +8,7 @@
 pub mod custom_id;
 pub mod fmt;
 pub mod send;
+pub mod template;
 pub mod v2;
 pub mod views;
 

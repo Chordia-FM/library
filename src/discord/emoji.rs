@@ -218,6 +218,18 @@ impl Icon {
         Self::PHOSPHOR.iter().chain(Self::BARS.iter()).copied()
     }
 
+    /// The icons a template may name with `{emoji:name}`: the glyphs, by their short name
+    /// (`listening`, `play`, …), not the bar segments.
+    pub fn named() -> impl Iterator<Item = (&'static str, Icon)> {
+        Self::PHOSPHOR
+            .iter()
+            .filter_map(|i| i.phosphor_name().map(|n| (&n["cd_".len()..], *i)))
+    }
+
+    pub fn by_name(name: &str) -> Option<Icon> {
+        Self::named().find(|(n, _)| *n == name).map(|(_, i)| i)
+    }
+
     /// The segment emoji for a cap in a state. A state the cap cannot show (a start dot on a
     /// middle segment, say) maps to the nearest one it can.
     pub fn bar(cap: Cap, state: BarState) -> Icon {

@@ -22,12 +22,13 @@ mod imp {
 
     use crate::api::v1::mgmt::require_mgmt_auth;
     use crate::discord::emoji;
-    use crate::discord::identity::{DiscordUser, Identity, RoleInfo};
+    use crate::discord::identity::{ChannelInfo, DiscordUser, Identity, RoleInfo};
     use crate::discord::preview;
     use crate::discord::settings::{
         self, BotSettings, BotSettingsPatch, GuildSettings, GuildSettingsPatch,
     };
     use crate::discord::theme::{self, ThemeStatus};
+    use crate::discord::ui::template;
     use crate::error::{AppError, AppResult};
     use crate::http::AppState;
     use chordia_contracts::discord_layout::{BotLayouts, LayoutView, ViewLayout};
@@ -37,6 +38,7 @@ mod imp {
         Router::new()
             .route("/mgmt/discord", get(overview))
             .route("/mgmt/discord/layouts/defaults", get(layout_defaults))
+            .route("/mgmt/discord/layouts/schema", get(layout_schema))
             .route(
                 "/mgmt/discord/bots/{app_id}/layouts/preview",
                 post(layout_preview),
@@ -56,6 +58,14 @@ mod imp {
             .route(
                 "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/roles",
                 get(guild_roles),
+            )
+            .route(
+                "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/channels",
+                get(guild_channels),
+            )
+            .route(
+                "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/members",
+                get(guild_members),
             )
             .route(
                 "/mgmt/discord/bots/{app_id}/guilds/{guild_id}/settings",
@@ -163,6 +173,9 @@ mod imp {
                 .parse()
                 .map_err(|_| AppError::BadRequest("guild_id must be a snowflake".into()))?,
         );
+        if let Some(overrides) = &patch.layout_overrides {
+            overrides.validate().map_err(AppError::BadRequest)?;
+        }
         let player = identity.player(guild).await;
         let updated = player.update_settings(|s| patch.apply(s)).await;
         Ok(Json(updated))
@@ -230,6 +243,43 @@ mod imp {
         let identity = find(&app_id)?;
         let guild = GuildId::new(parse_snowflake(&guild_id, "guild_id")?);
         Ok(Json(identity.guild_roles(guild)))
+    }
+
+    /// `GET /v1/mgmt/discord/bots/{app_id}/guilds/{guild_id}/channels`: what a `#` in a
+    /// server's own message can mention.
+    async fn guild_channels(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path((app_id, guild_id)): Path<(String, String)>,
+    ) -> AppResult<Json<Vec<ChannelInfo>>> {
+        require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
+        let guild = GuildId::new(parse_snowflake(&guild_id, "guild_id")?);
+        Ok(Json(identity.guild_channels(guild)))
+    }
+
+    #[derive(Deserialize)]
+    struct MemberQuery {
+        #[serde(default)]
+        q: String,
+    }
+
+    /// `GET /v1/mgmt/discord/bots/{app_id}/guilds/{guild_id}/members?q=`: members by name
+    /// prefix, for an `@` in a server's own message.
+    async fn guild_members(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path((app_id, guild_id)): Path<(String, String)>,
+        axum::extract::Query(query): axum::extract::Query<MemberQuery>,
+    ) -> AppResult<Json<Vec<DiscordUser>>> {
+        require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
+        let guild = GuildId::new(parse_snowflake(&guild_id, "guild_id")?);
+        let q = query.q.trim();
+        if q.is_empty() {
+            return Ok(Json(Vec::new()));
+        }
+        Ok(Json(identity.search_members(guild, q).await))
     }
 
     /// `POST /v1/mgmt/discord/bots/{app_id}/guilds/{guild_id}/leave`.
@@ -455,10 +505,34 @@ mod imp {
         Ok(Json(BotLayouts::default()))
     }
 
+    /// What a template may say: the variables, the emoji names and the controls.
+    #[derive(Serialize)]
+    struct LayoutSchema {
+        variables: Vec<template::VariableInfo>,
+        emojis: Vec<template::EmojiInfo>,
+        controls: Vec<chordia_contracts::discord_layout::ControlButton>,
+    }
+
+    /// `GET /v1/mgmt/discord/layouts/schema`: for the editor's autocomplete.
+    async fn layout_schema(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+    ) -> AppResult<Json<LayoutSchema>> {
+        require_mgmt_auth(&headers, &state).await?;
+        Ok(Json(LayoutSchema {
+            variables: template::variables(),
+            emojis: template::emojis(),
+            controls: chordia_contracts::discord_layout::ControlButton::ALL.to_vec(),
+        }))
+    }
+
     #[derive(Deserialize)]
     struct PreviewRequest {
         view: LayoutView,
         layout: ViewLayout,
+        /// Preview as this server would see it: its channels are real, so a mention resolves.
+        #[serde(default)]
+        guild_id: Option<String>,
     }
 
     /// `POST /v1/mgmt/discord/bots/{app_id}/layouts/preview`: one view rendered with a layout that
@@ -474,7 +548,11 @@ mod imp {
         body.layout
             .validate(body.view)
             .map_err(AppError::BadRequest)?;
-        preview::render(&identity, body.view, &body.layout)
+        let guild = match body.guild_id.as_deref() {
+            Some(g) => Some(GuildId::new(parse_snowflake(g, "guild_id")?)),
+            None => None,
+        };
+        preview::render(&identity, body.view, &body.layout, guild)
             .await
             .map(Json)
             .map_err(AppError::Internal)

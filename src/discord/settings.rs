@@ -2,7 +2,7 @@
 //! (migration 0022). The token is the only thing about a bot that lives in the TOML file;
 //! everything here is meant to be changed while the bot runs, from the dashboard or from Discord.
 
-use chordia_contracts::discord_layout::BotLayouts;
+use chordia_contracts::discord_layout::{BotLayouts, LayoutOverrides};
 use serde::{Deserialize, Serialize};
 use sqlx::{AssertSqlSafe, SqlitePool};
 
@@ -403,6 +403,8 @@ pub struct GuildSettings {
     pub can_autoplay: bool,
     /// Messages after the controller before it is re-posted at the bottom; 0 = never.
     pub announce_after: u32,
+    /// This server's own versions of some of the bot's messages, over the bot's layouts.
+    pub layout_overrides: LayoutOverrides,
 }
 
 impl GuildSettings {
@@ -422,7 +424,13 @@ impl GuildSettings {
             can_always_on: true,
             can_autoplay: true,
             announce_after: 20,
+            layout_overrides: LayoutOverrides::default(),
         }
+    }
+
+    /// The layouts this server's messages render with: the bot's, with its own laid over.
+    pub fn layouts(&self, bot: &BotLayouts) -> BotLayouts {
+        bot.with_overrides(&self.layout_overrides)
     }
 
     /// Role ids that parse as snowflakes; the bot never wrote anything else, but a dashboard could.
@@ -447,6 +455,8 @@ pub struct GuildSettingsPatch {
     pub announce_after: Option<u32>,
     pub can_always_on: Option<bool>,
     pub can_autoplay: Option<bool>,
+    /// Checked against the layout rules by the API before it gets here.
+    pub layout_overrides: Option<LayoutOverrides>,
 }
 
 impl GuildSettingsPatch {
@@ -486,6 +496,9 @@ impl GuildSettingsPatch {
                 s.autoplay = false;
             }
         }
+        if let Some(v) = self.layout_overrides {
+            s.layout_overrides = v;
+        }
     }
 }
 
@@ -505,6 +518,7 @@ struct GuildRow {
     can_always_on: i64,
     can_autoplay: i64,
     announce_after: i64,
+    layout_overrides: Option<String>,
 }
 
 impl From<GuildRow> for GuildSettings {
@@ -524,13 +538,18 @@ impl From<GuildRow> for GuildSettings {
             can_always_on: r.can_always_on != 0,
             can_autoplay: r.can_autoplay != 0,
             announce_after: r.announce_after.clamp(0, 500) as u32,
+            layout_overrides: r
+                .layout_overrides
+                .as_deref()
+                .and_then(|j| serde_json::from_str(j).ok())
+                .unwrap_or_default(),
         }
     }
 }
 
 const GUILD_COLS: &str = "app_id, guild_id, dj_role_ids, controller_channel_id, \
      controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce, \
-     can_always_on, can_autoplay, announce_after";
+     can_always_on, can_autoplay, announce_after, layout_overrides";
 
 pub async fn load_guild(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<GuildSettings> {
     let row = sqlx::query_as::<_, GuildRow>(AssertSqlSafe(format!(
@@ -558,11 +577,14 @@ pub async fn load_guilds(db: &SqlitePool, app_id: &str) -> AppResult<Vec<GuildSe
 
 pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     let dj = serde_json::to_string(&s.dj_role_ids).unwrap_or_else(|_| "[]".into());
+    let overrides = (!s.layout_overrides.is_empty())
+        .then(|| serde_json::to_string(&s.layout_overrides).ok())
+        .flatten();
     sqlx::query(
         "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_ids, controller_channel_id, \
              controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, \
-             announce, can_always_on, can_autoplay, announce_after, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             announce, can_always_on, can_autoplay, announce_after, layout_overrides, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id, guild_id) DO UPDATE SET \
              dj_role_ids = excluded.dj_role_ids, \
              controller_channel_id = excluded.controller_channel_id, \
@@ -571,7 +593,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
              always_on_channel_id = excluded.always_on_channel_id, autoplay = excluded.autoplay, \
              announce = excluded.announce, can_always_on = excluded.can_always_on, \
              can_autoplay = excluded.can_autoplay, announce_after = excluded.announce_after, \
-             updated_at = excluded.updated_at",
+             layout_overrides = excluded.layout_overrides, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
     .bind(&s.guild_id)
@@ -587,6 +609,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(s.can_always_on as i64)
     .bind(s.can_autoplay as i64)
     .bind(s.announce_after as i64)
+    .bind(overrides)
     .bind(now_ms())
     .execute(db)
     .await?;

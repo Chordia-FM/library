@@ -185,6 +185,8 @@ struct Playing {
     handle: TrackHandle,
     facts: TrackFacts,
     cover: Option<Cover>,
+    /// The artist's picture from the Hub, fetched only when a layout shows it.
+    artist_art: Option<Cover>,
     paused: bool,
     /// Row id in `discord_plays`, finalised with `ms_played` when the track ends.
     play_id: Option<i64>,
@@ -300,6 +302,8 @@ pub struct CurrentSnapshot {
     pub position_ms: u64,
     pub paused: bool,
     pub cover: Option<Cover>,
+    /// The artist's picture, when a layout asked for it and the Hub had one.
+    pub artist_art: Option<Cover>,
     /// The Hub's ids for the track, for deep links; absent until looked up, or without a Hub.
     pub links: Option<ResolvedTrack>,
 }
@@ -308,6 +312,8 @@ pub struct CurrentSnapshot {
 pub struct PlayerSnapshot {
     pub bot_index: u8,
     pub bot_name: String,
+    /// The bot's avatar on Discord's CDN, for layouts that show it.
+    pub bot_avatar: Option<String>,
     pub icons: Arc<IconSet>,
     /// The web client's origin when the library is paired to a Hub; views link into it.
     pub web_base: Option<String>,
@@ -323,7 +329,7 @@ pub struct PlayerSnapshot {
     pub volume: u8,
     pub normalize: bool,
     pub listeners: usize,
-    /// How this bot lays out its messages.
+    /// How this guild's messages are laid out: the bot's layouts with the guild's own laid over.
     pub layouts: Arc<BotLayouts>,
 }
 
@@ -875,6 +881,16 @@ impl GuildPlayer {
             };
             let handle = s.current.as_ref().map(|c| c.handle.clone());
             let icons = identity.as_ref().map(|i| i.icons()).unwrap_or_default();
+            let bot_avatar = identity
+                .as_ref()
+                .and_then(|i| i.profile())
+                .and_then(|p| p.avatar_url);
+            let layouts = s.settings.layouts(
+                &identity
+                    .as_ref()
+                    .map(|i| i.settings().layouts)
+                    .unwrap_or_default(),
+            );
             let voice_channel_name = match (&identity, s.voice_channel) {
                 (Some(i), Some(vc)) => i.channel_name(self.guild_id, vc),
                 _ => None,
@@ -882,6 +898,7 @@ impl GuildPlayer {
             let snap = PlayerSnapshot {
                 bot_index,
                 bot_name,
+                bot_avatar,
                 icons,
                 web_base,
                 guild_id: self.guild_id,
@@ -893,6 +910,7 @@ impl GuildPlayer {
                     position_ms: 0,
                     paused: c.paused,
                     cover: c.cover.clone(),
+                    artist_art: c.artist_art.clone(),
                     links: c.links.clone(),
                 }),
                 queue: s.queue.iter().cloned().collect(),
@@ -903,12 +921,7 @@ impl GuildPlayer {
                 volume: s.volume,
                 normalize: s.normalize,
                 listeners: s.listeners.len(),
-                layouts: Arc::new(
-                    identity
-                        .as_ref()
-                        .map(|i| i.settings().layouts)
-                        .unwrap_or_default(),
-                ),
+                layouts: Arc::new(layouts),
             };
             (handle, snap)
         };
@@ -1194,6 +1207,7 @@ impl GuildPlayer {
                 handle,
                 facts,
                 cover,
+                artist_art: None,
                 paused: false,
                 play_id: None,
                 epoch: s.epoch,
@@ -1248,6 +1262,33 @@ impl GuildPlayer {
                 let mut s = p.inner.lock().await;
                 if let Some(cur) = s.current.as_mut().filter(|c| c.epoch == epoch) {
                     cur.links = Some(links);
+                    drop(s);
+                    p.controller_wake.notify_one();
+                }
+            });
+        }
+        // The artist's picture, only when a layout shows it: a Hub round trip per track otherwise
+        // buys nothing.
+        let wants_art = {
+            let s = self.inner.lock().await;
+            views::uses_artist_art(&s.settings.layouts(&identity.settings().layouts))
+        };
+        if let (Some(p), true) = (&self_arc, wants_art) {
+            let p = p.clone();
+            let state = identity.state.clone();
+            let track = item.track.clone();
+            tokio::spawn(async move {
+                let Some(art) = hub::artist_art(&state, &track.artist_norm, None).await else {
+                    return;
+                };
+                let Some(rel) = art.image_url else { return };
+                let Some((mime, bytes)) = hub::image(&state, &rel).await else {
+                    return;
+                };
+                let cover = Cover::named(&format!("artist-{}", art.artist_id), &mime, bytes);
+                let mut s = p.inner.lock().await;
+                if let Some(cur) = s.current.as_mut().filter(|c| c.epoch == epoch) {
+                    cur.artist_art = Some(cover);
                     drop(s);
                     p.controller_wake.notify_one();
                 }
@@ -1554,11 +1595,17 @@ impl GuildPlayer {
         }
     }
 
-    /// After the controller has been sent, note the id Discord gave the cover upload so the next
-    /// edit keeps it rather than uploading it again.
+    /// After the controller has been sent, note the ids Discord gave the uploads (the cover, the
+    /// artist's picture) so the next edit keeps them rather than uploading them again.
     async fn remember_cover_attachment(&self, sent: &serenity::all::Message) {
         let mut s = self.inner.lock().await;
-        if let Some(cover) = s.current.as_mut().and_then(|c| c.cover.as_mut()) {
+        let Some(cur) = s.current.as_mut() else {
+            return;
+        };
+        for cover in [cur.cover.as_mut(), cur.artist_art.as_mut()]
+            .into_iter()
+            .flatten()
+        {
             if let Some(a) = sent
                 .attachments
                 .iter()
@@ -1657,6 +1704,7 @@ mod tests {
             bot_index: 0,
             bot_name: "Chordia".into(),
             icons: Arc::new(IconSet::default()),
+            bot_avatar: None,
             web_base: None,
             guild_id: GuildId::new(1),
             voice_channel: None,
@@ -1667,6 +1715,7 @@ mod tests {
                 position_ms: 40_000,
                 paused: false,
                 cover: None,
+                artist_art: None,
                 links: None,
             }),
             queue: vec![item("a", 10_000), item("b", 20_000)],

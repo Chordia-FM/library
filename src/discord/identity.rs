@@ -117,6 +117,18 @@ pub struct RoleInfo {
     pub position: u16,
 }
 
+/// A guild channel, for the dashboard's `#` autocomplete.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ChannelInfo {
+    pub id: String,
+    pub name: String,
+    /// `text`, `voice`, `stage`, `news`, `forum` or `category`.
+    pub kind: &'static str,
+    pub position: u16,
+    /// The category it sits under, when it does.
+    pub parent_id: Option<String>,
+}
+
 const USER_CACHE_TTL: Duration = Duration::from_secs(3600);
 
 impl Identity {
@@ -239,6 +251,67 @@ impl Identity {
     pub fn guild_icon_url(&self, guild: GuildId) -> Option<String> {
         let cache = self.cache()?;
         cache.guild(guild).and_then(|g| g.icon_url())
+    }
+
+    /// A guild's channels a message could mention, categories first then by position.
+    pub fn guild_channels(&self, guild: GuildId) -> Vec<ChannelInfo> {
+        use serenity::all::ChannelType;
+        let Some(cache) = self.cache() else {
+            return Vec::new();
+        };
+        let Some(g) = cache.guild(guild) else {
+            return Vec::new();
+        };
+        let mut out: Vec<ChannelInfo> = g
+            .channels
+            .values()
+            .filter_map(|c| {
+                let kind = match c.kind {
+                    ChannelType::Text => "text",
+                    ChannelType::Voice => "voice",
+                    ChannelType::Stage => "stage",
+                    ChannelType::News => "news",
+                    ChannelType::Forum => "forum",
+                    ChannelType::Category => "category",
+                    _ => return None,
+                };
+                Some(ChannelInfo {
+                    id: c.id.get().to_string(),
+                    name: c.name.clone(),
+                    kind,
+                    position: c.position,
+                    parent_id: c.parent_id.map(|p| p.get().to_string()),
+                })
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            (a.kind != "category")
+                .cmp(&(b.kind != "category"))
+                .then(a.position.cmp(&b.position))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        out
+    }
+
+    /// Members whose name starts with `query`, for the dashboard's `@` autocomplete. A gateway
+    /// search, so it needs no privileged intent.
+    pub async fn search_members(&self, guild: GuildId, query: &str) -> Vec<DiscordUser> {
+        let Some(http) = self.http() else {
+            return Vec::new();
+        };
+        let members = guild
+            .search_members(&http, query, Some(10))
+            .await
+            .unwrap_or_default();
+        members
+            .into_iter()
+            .map(|m| DiscordUser {
+                id: m.user.id.get().to_string(),
+                name: m.display_name().to_string(),
+                username: m.user.name.clone(),
+                avatar_url: m.face(),
+            })
+            .collect()
     }
 
     pub fn icons(&self) -> Arc<IconSet> {

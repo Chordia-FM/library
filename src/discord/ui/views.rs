@@ -18,10 +18,20 @@
 //! - **Art**: when a track has cover art it sits beside the title as a section thumbnail, on the
 //!   controller and on the queued toast alike.
 //! - **Buttons** are all the neutral grey style: Discord's blue and red fight the accent colour.
-//!   State lives in the icon and the label (play shows a pause icon while playing; the loop and
-//!   autoplay buttons say what they are set to). At most five per row.
+//!   State lives in the icon (white off, accent on; the loop's "1" for one track). No labels. At
+//!   most five per row.
 //! - **Ephemeral** for anything only the asker cares about (errors, notices, search results, the
 //!   queue). Public for the controller, the queued toast and the goodbye.
+//!
+//! ## Layouts
+//!
+//! The six messages an owner can restyle (now playing, idle, queued, left, queue, history) are
+//! not written here but **interpreted** from a [`ViewLayout`]: Discord's own parts (text, a
+//! section with a picture or button beside it, a gallery, a separator, a row of buttons, and on
+//! the list messages the line each entry is written with), every text a template in the language
+//! of [`template`]. The bot's layouts come from its settings and a server may lay its own over
+//! them; the shipped defaults reproduce the design above exactly. The other messages (errors,
+//! pickers, settings, lyrics) are fixed.
 //!
 //! Every custom id is built from the identity index and guild id in the snapshot, so a view is
 //! self-describing about who owns its buttons.
@@ -30,6 +40,7 @@ use serenity::all::UserId;
 
 use super::custom_id::{Action, CustomId};
 use super::fmt::{self, accent};
+use super::template;
 use super::v2::{
     button, container, gallery, row, section, separator, text, thumbnail, Button, ButtonStyle,
     Component, Emoji, Media, Message, SelectOption, Spacing,
@@ -39,16 +50,16 @@ use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
 use crate::discord::player::{
     Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem,
 };
-use crate::discord::settings::GuildSettings;
-use crate::discord::settings::PlayEntry;
+use crate::discord::settings::{GuildSettings, PlayEntry};
 use crate::search::{HitKind, SearchHit};
 use chordia_contracts::discord::ResolvedTrack;
 use chordia_contracts::discord_layout::{
-    ArtPlacement, ControlButton, HeaderSubtitle, LayoutBlock, MetaLine, SeparatorSpacing,
-    ViewLayout,
+    Accessory, BotLayouts, ButtonSpec, ControlButton, ImageSource, LayoutBlock, LayoutView,
+    SeparatorSpacing, ViewLayout, MAX_LABEL_CHARS, MAX_PAGE, MIN_PAGE,
 };
 
-pub const QUEUE_PAGE_SIZE: usize = 10;
+/// How far back `/history` pages: enough for a long evening, not the whole log.
+pub const HISTORY_LIMIT: i64 = 100;
 
 /// Discord renders `-#` lines small; this is how a track's "who and where" line is written.
 fn small(s: impl AsRef<str>) -> String {
@@ -64,16 +75,23 @@ fn header(icon: &Emoji, title: &str, subtitle: Option<&str>) -> Vec<Component> {
     vec![text(line), separator(true, Spacing::Small)]
 }
 
+/// Where `query` (or the page the Hub named) lives on the web client, when there is one.
+fn link_for(web: Option<&str>, page: Option<String>, query: &str) -> Option<String> {
+    let base = web?;
+    Some(match page {
+        Some(path) => format!("{base}{path}"),
+        None if query.trim().is_empty() => return None,
+        None => format!("{base}/app/search?q={}", fmt::urlencode(query)),
+    })
+}
+
 /// Escaped text, linked to a page on the web client when the Hub told us where it is, else to a
 /// search for `query` when there is a web client at all.
 fn linked_to(text: &str, web: Option<&str>, page: Option<String>, query: &str) -> String {
     let shown = fmt::escape_md(text);
-    match (web, page) {
-        (Some(base), Some(path)) => format!("[{shown}]({base}{path})"),
-        (Some(base), None) if !query.trim().is_empty() => {
-            format!("[{shown}]({base}/app/search?q={})", fmt::urlencode(query))
-        }
-        _ => shown,
+    match link_for(web, page, query) {
+        Some(url) => format!("[{shown}]({url})"),
+        None => shown,
     }
 }
 
@@ -94,20 +112,15 @@ fn artist_page(links: Option<&ResolvedTrack>) -> Option<String> {
         .map(|id| format!("/app/artists/{id}"))
 }
 
-/// `**Title** · Artist`, one line.
-fn title_line(t: &TrackRow, web: Option<&str>) -> String {
-    title_line_with(t, web, None)
+fn title_query(t: &TrackRow) -> String {
+    format!("{} {}", t.title, t.artist)
 }
 
-fn title_line_with(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> String {
+/// `**Title** · Artist`, one line.
+fn title_line(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> String {
     let mut s = format!(
         "**{}**",
-        linked_to(
-            &t.title,
-            web,
-            album_page(links),
-            &format!("{} {}", t.title, t.artist)
-        )
+        linked_to(&t.title, web, album_page(links), &title_query(t))
     );
     if !t.artist.is_empty() {
         s.push_str(" · ");
@@ -117,19 +130,10 @@ fn title_line_with(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack
 }
 
 /// `**Title**` over `Artist · *Album*`.
-fn track_block(t: &TrackRow, web: Option<&str>) -> String {
-    track_block_with(t, web, None)
-}
-
-fn track_block_with(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> String {
+fn track_block(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> String {
     let mut s = format!(
         "**{}**\n{}",
-        linked_to(
-            &t.title,
-            web,
-            album_page(links),
-            &format!("{} {}", t.title, t.artist)
-        ),
+        linked_to(&t.title, web, album_page(links), &title_query(t)),
         linked_to(&t.artist, web, artist_page(links), &t.artist)
     );
     if let Some(album) = t.album.as_deref().filter(|a| !a.is_empty()) {
@@ -150,6 +154,19 @@ fn mention(u: UserId) -> String {
     format!("<@{}>", u.get())
 }
 
+/// Who asked for an item: a mention, or the radio.
+fn requester(item: &QueueItem) -> String {
+    if item.autoplay {
+        "Autoplay".to_string()
+    } else {
+        mention(item.requested_by)
+    }
+}
+
+fn onoff(b: bool) -> String {
+    (if b { "on" } else { "off" }).to_string()
+}
+
 fn id(snap: &PlayerSnapshot, action: Action) -> String {
     CustomId::new(snap.bot_index, snap.guild_id.get(), action).to_string()
 }
@@ -158,53 +175,11 @@ fn btn(snap: &PlayerSnapshot, action: Action, icon: Icon) -> Component {
     button(Button::new(ButtonStyle::Secondary, id(snap, action)).emoji(snap.icons.get(icon)))
 }
 
-fn btn_labeled(snap: &PlayerSnapshot, action: Action, icon: Icon, label: &str) -> Component {
-    button(
-        Button::new(ButtonStyle::Secondary, id(snap, action))
-            .emoji(snap.icons.get(icon))
-            .label(label),
-    )
-}
-
-/// Text beside a cover thumbnail when there is one, plain text otherwise.
-fn with_art(lines: Vec<Component>, cover: Option<&Cover>) -> Vec<Component> {
-    match cover {
-        Some(c) => vec![section(
-            lines,
-            thumbnail(Media::attachment(&c.filename), None),
-        )],
-        None => lines,
-    }
-}
-
-/// Attach the cover to the message: either upload the bytes, or (`reuse`, on an edit of the same
-/// message that already carries it) keep the existing attachment by id.
-fn carry_cover(msg: Message, cover: Option<&Cover>, reuse: bool) -> Message {
-    match cover {
-        Some(c) => match (reuse, c.attachment_id) {
-            (true, Some(id)) => msg.keep_attachment(id),
-            _ => msg.attach(&c.filename, c.bytes.as_ref().clone()),
-        },
-        None => msg,
-    }
-}
-
-/// How many segments the progress bar has. Twelve emojis at Discord's inline size is about the
-/// width of the title line; more and the row wraps on a phone.
-pub const PROGRESS_CELLS: usize = 12;
-
-/// The progress bar as a row of bar-segment emojis (or their text fallbacks), then the times
-/// when `times` is on.
-fn progress_row(
-    icons: &IconSet,
-    position_ms: u64,
-    duration_ms: u64,
-    cells: usize,
-    times: bool,
-) -> String {
-    let cells = fmt::progress_cells(position_ms, duration_ms, cells.max(2));
+/// A bar of `cells` segment emojis (or their text fallbacks) filled to `position` of `total`.
+fn bar(icons: &IconSet, position: u64, total: u64, cells: usize) -> String {
+    let cells = fmt::progress_cells(position, total, cells.max(2));
     let last = cells.len() - 1;
-    let bar: String = cells
+    cells
         .iter()
         .enumerate()
         .map(|(i, seg)| {
@@ -224,259 +199,55 @@ fn progress_row(
             };
             icons.get(Icon::bar(cap, state)).markup()
         })
-        .collect();
-    if times {
-        format!(
-            "{bar} {} / {}",
-            fmt::duration(position_ms),
-            fmt::duration(duration_ms)
-        )
-    } else {
-        bar
-    }
+        .collect()
 }
 
-/// "in 🎧 #channel" as a real channel mention when the id is known.
-fn where_line(snap: &PlayerSnapshot) -> String {
-    let icon = snap.icons.get(Icon::Listening).markup();
-    match (snap.voice_channel, &snap.voice_channel_name) {
-        (Some(ch), _) => format!("in {icon} <#{}>", ch.get()),
-        (None, Some(name)) => format!("in {icon} {}", fmt::escape_md(name)),
-        (None, None) => snap.bot_name.clone(),
-    }
-}
-
-// ---- controller ----------------------------------------------------------------------------------
-
-// ---- layouts -------------------------------------------------------------------------------------
-
-/// What one render of a view draws from: the live snapshot, the view's own icon and title, and
-/// the facts only that view knows (the current track, the toast's lines, why the bot left).
-struct Scene<'a> {
-    snap: &'a PlayerSnapshot,
-    icon: Icon,
-    title: String,
-    /// The track the text variables describe.
-    track: Option<&'a TrackRow>,
-    cur: Option<&'a CurrentSnapshot>,
-    cover: Option<&'a Cover>,
-    /// The queued toast's line and meta line.
-    toast: Option<(String, String)>,
-    reason: Option<&'static str>,
-}
-
-impl Scene<'_> {
-    fn subtitle(&self, which: HeaderSubtitle) -> Option<String> {
-        match which {
-            HeaderSubtitle::Channel => Some(where_line(self.snap)),
-            HeaderSubtitle::Bot => Some(self.snap.bot_name.clone()),
-            HeaderSubtitle::None => None,
-        }
-    }
-
-    /// The variables a text block may use, already escaped.
-    fn vars(&self) -> Vec<(&'static str, String)> {
-        let snap = self.snap;
-        let t = self.track;
-        let (requested_by, position) = match self.cur {
-            Some(c) => (
-                if c.item.autoplay {
-                    "Autoplay".to_string()
-                } else {
-                    mention(c.item.requested_by)
-                },
-                fmt::duration(c.position_ms),
-            ),
-            None => (String::new(), String::new()),
-        };
-        vec![
-            (
-                "title",
-                t.map(|t| fmt::escape_md(&t.title)).unwrap_or_default(),
-            ),
-            (
-                "artist",
-                t.map(|t| fmt::escape_md(&t.artist)).unwrap_or_default(),
-            ),
-            (
-                "album",
-                t.and_then(|t| t.album.as_deref())
-                    .map(fmt::escape_md)
-                    .unwrap_or_default(),
-            ),
-            (
-                "channel",
-                fmt::escape_md(snap.voice_channel_name.as_deref().unwrap_or("")),
-            ),
-            ("bot", fmt::escape_md(&snap.bot_name)),
-            ("requested_by", requested_by),
-            ("queue_count", snap.queue.len().to_string()),
-            ("volume", snap.volume.to_string()),
-            ("position", position),
-            (
-                "duration",
-                t.map(|t| fmt::duration(t.duration_ms.max(0) as u64))
-                    .unwrap_or_default(),
-            ),
-            ("reason", self.reason.unwrap_or("").to_string()),
-        ]
-    }
-}
-
-/// Draw a view's blocks. Returns the components and whether any of them showed the cover, so the
-/// caller attaches the file only when something refers to it.
-fn render_layout(scene: &Scene, layout: &ViewLayout) -> (Vec<Component>, bool) {
-    let snap = scene.snap;
-    let icons = &snap.icons;
-    let web = snap.web_base.as_deref();
-    let mut out = Vec::new();
-    let mut art_used = false;
-    for block in &layout.blocks {
-        match block {
-            LayoutBlock::Header { subtitle } => out.extend(header(
-                &icons.get(scene.icon),
-                &scene.title,
-                scene.subtitle(*subtitle).as_deref(),
-            )),
-            LayoutBlock::Track { art, album, badges } => {
-                let Some(cur) = scene.cur else { continue };
-                let t = &cur.item.track;
-                let mut lines = vec![text(track_text(t, web, cur.links.as_ref(), *album))];
-                if *badges {
-                    lines.push(text(small(fmt::badges(&cur.facts).join(" · "))));
-                }
-                art_used |= place_art(&mut out, lines, *art, scene.cover);
-            }
-            LayoutBlock::Progress { cells, times, meta } => {
-                let Some(cur) = scene.cur else { continue };
-                let mut line = progress_row(
-                    icons,
-                    cur.position_ms,
-                    cur.item.track.duration_ms.max(0) as u64,
-                    *cells as usize,
-                    *times,
-                );
-                let meta = meta_line(snap, cur, meta);
-                if !meta.is_empty() {
-                    line.push('\n');
-                    line.push_str(&small(meta));
-                }
-                out.push(text(line));
-            }
-            LayoutBlock::Controls { rows } => {
-                let Some(cur) = scene.cur else { continue };
-                for r in rows {
-                    let buttons: Vec<Component> =
-                        r.iter().map(|b| control(snap, cur, *b)).collect();
-                    if !buttons.is_empty() {
-                        out.push(row(buttons));
-                    }
-                }
-            }
-            LayoutBlock::Separator { divider, spacing } => out.push(separator(
-                *divider,
-                match spacing {
-                    SeparatorSpacing::Small => Spacing::Small,
-                    SeparatorSpacing::Large => Spacing::Large,
-                },
-            )),
-            LayoutBlock::Text { content } => {
-                let vars = scene.vars();
-                let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                let rendered = fmt::render_template(content, &refs);
-                if !rendered.trim().is_empty() {
-                    out.push(text(rendered));
-                }
-            }
-            LayoutBlock::Summary { art } => {
-                let Some((line, meta)) = &scene.toast else {
-                    continue;
-                };
-                let lines = vec![text(format!("{line}\n{}", small(meta.clone())))];
-                art_used |= place_art(&mut out, lines, *art, scene.cover);
-            }
-        }
-    }
-    (out, art_used)
-}
-
-/// Put `lines` in with the cover placed as asked; says whether the cover was used.
-fn place_art(
-    out: &mut Vec<Component>,
-    lines: Vec<Component>,
-    art: ArtPlacement,
-    cover: Option<&Cover>,
-) -> bool {
-    match (art, cover) {
-        (ArtPlacement::Thumbnail, Some(c)) => {
-            out.extend(with_art(lines, Some(c)));
-            true
-        }
-        (ArtPlacement::Gallery, Some(c)) => {
-            out.extend(lines);
-            out.push(gallery(vec![Media::attachment(&c.filename)]));
-            true
-        }
-        _ => {
-            out.extend(lines);
-            false
-        }
-    }
-}
-
-/// The track lines, with or without the album.
-fn track_text(
-    t: &TrackRow,
-    web: Option<&str>,
-    links: Option<&ResolvedTrack>,
-    album: bool,
-) -> String {
-    if album {
-        return track_block_with(t, web, links);
-    }
-    format!(
-        "**{}**\n{}",
-        linked_to(
-            &t.title,
-            web,
-            album_page(links),
-            &format!("{} {}", t.title, t.artist)
-        ),
-        linked_to(&t.artist, web, artist_page(links), &t.artist)
-    )
-}
-
-/// The small line under the progress bar: the facts the layout asked for, in words.
-fn meta_line(snap: &PlayerSnapshot, cur: &CurrentSnapshot, opts: &MetaLine) -> String {
+/// The small line under the progress bar: who asked, the queue, the volume when it is not
+/// 100 %, and the modes that are on.
+fn meta_line(snap: &PlayerSnapshot, cur: &CurrentSnapshot) -> String {
     let mut meta: Vec<String> = Vec::new();
-    if opts.requested_by {
-        meta.push(if cur.item.autoplay {
-            "Autoplay".to_string()
-        } else {
-            format!("Requested by {}", mention(cur.item.requested_by))
-        });
-    }
-    if opts.queue {
-        meta.push(match snap.queue.len() {
-            0 => "queue empty".to_string(),
-            n => format!("{n} in queue"),
-        });
-    }
-    if opts.volume && snap.volume != 100 {
+    meta.push(if cur.item.autoplay {
+        "Autoplay".to_string()
+    } else {
+        format!("Requested by {}", mention(cur.item.requested_by))
+    });
+    meta.push(match snap.queue.len() {
+        0 => "queue empty".to_string(),
+        n => format!("{n} in queue"),
+    });
+    if snap.volume != 100 {
         meta.push(format!("vol {}%", snap.volume));
     }
-    if opts.modes {
-        if snap.loop_mode != LoopMode::Off {
-            meta.push(format!("loop: {}", snap.loop_mode.label()));
-        }
-        if snap.shuffle {
-            meta.push("shuffle".to_string());
-        }
-        if snap.autoplay {
-            meta.push("autoplay".to_string());
-        }
+    if snap.loop_mode != LoopMode::Off {
+        meta.push(format!("loop: {}", snap.loop_mode.label()));
+    }
+    if snap.shuffle {
+        meta.push("shuffle".to_string());
+    }
+    if snap.autoplay {
+        meta.push("autoplay".to_string());
     }
     meta.join(" · ")
+}
+
+/// `▶ **Title** · Artist `1:05``, or a small "Nothing playing".
+fn now_playing_line(snap: &PlayerSnapshot) -> String {
+    let icons = &snap.icons;
+    match &snap.current {
+        Some(cur) => format!(
+            "{} {} `{}`",
+            icons
+                .get(if cur.paused { Icon::Pause } else { Icon::Play })
+                .markup(),
+            title_line(
+                &cur.item.track,
+                snap.web_base.as_deref(),
+                cur.links.as_ref()
+            ),
+            fmt::duration(cur.position_ms)
+        ),
+        None => small("Nothing playing"),
+    }
 }
 
 /// One control as a button. Stateful ones carry their state in the icon's colour: white off,
@@ -523,54 +294,495 @@ fn control(snap: &PlayerSnapshot, cur: &CurrentSnapshot, which: ControlButton) -
     btn(snap, action, icon)
 }
 
-// ---- controller ----------------------------------------------------------------------------------
+// ---- the layout interpreter ----------------------------------------------------------------------
 
-/// The now-playing controller: the one public message per guild that is edited in place, laid
-/// out by the bot's `now_playing` layout.
-///
-/// `reuse` says this render will edit the message that already carries the cover upload, so the
-/// attachment can be kept by id instead of uploaded again.
-pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
-    let Some(cur) = &snap.current else {
-        return idle(snap);
+/// The facts of a `/play` confirmation.
+struct Toast<'a> {
+    added: String,
+    added_meta: String,
+    count: usize,
+    /// 1-based queue number of the first added track; 0 when it started at once.
+    position: usize,
+    eta_ms: u64,
+    source: Option<&'a str>,
+    requested_by: UserId,
+}
+
+/// Which message's paging buttons a list uses.
+#[derive(Clone, Copy)]
+enum Paging {
+    Queue,
+    History,
+}
+
+/// One entry of a list message: its own variables, laid over the scene's.
+struct Entry {
+    vars: Vec<(&'static str, String)>,
+}
+
+/// What one render of a view draws from: the live snapshot, the view's own icon and title, and
+/// the facts only that view knows (the current track, the toast's lines, why the bot left, the
+/// entries a list shows).
+struct Scene<'a> {
+    snap: &'a PlayerSnapshot,
+    icon: Icon,
+    heading: String,
+    /// The track the track variables describe.
+    track: Option<&'a TrackRow>,
+    links: Option<&'a ResolvedTrack>,
+    cur: Option<&'a CurrentSnapshot>,
+    /// The pictures a layout may show, as uploads.
+    cover: Option<&'a Cover>,
+    artist_art: Option<&'a Cover>,
+    toast: Option<Toast<'a>>,
+    reason: Option<&'static str>,
+    list: Vec<Entry>,
+    /// The page asked for (0-based); the list block clamps it.
+    page: usize,
+    paging: Option<Paging>,
+}
+
+impl<'a> Scene<'a> {
+    fn new(snap: &'a PlayerSnapshot, icon: Icon, heading: &str) -> Self {
+        Scene {
+            snap,
+            icon,
+            heading: heading.to_string(),
+            track: None,
+            links: None,
+            cur: None,
+            cover: None,
+            artist_art: None,
+            toast: None,
+            reason: None,
+            list: Vec::new(),
+            page: 0,
+            paging: None,
+        }
+    }
+
+    /// A variable's value: `None` for one this scene does not know (left as written), an empty
+    /// string for one it knows but has nothing for.
+    fn var(&self, name: &str, arg: Option<&str>) -> Option<String> {
+        let snap = self.snap;
+        let icons = &snap.icons;
+        let web = snap.web_base.as_deref();
+        let t = self.track;
+        let cells = || template::bar_cells(arg);
+        Some(match name {
+            "icon" => icons.get(self.icon).markup(),
+            "heading" => self.heading.clone(),
+            "bot" => fmt::escape_md(&snap.bot_name),
+            "channel" => match (snap.voice_channel, &snap.voice_channel_name) {
+                (Some(ch), _) => format!("<#{}>", ch.get()),
+                (None, Some(name)) => fmt::escape_md(name),
+                (None, None) => String::new(),
+            },
+            "channel_name" => snap
+                .voice_channel_name
+                .as_deref()
+                .map(fmt::escape_md)
+                .unwrap_or_default(),
+            "listeners" => snap.listeners.to_string(),
+            "queue_count" => snap.queue.len().to_string(),
+            "queue_tracks" => fmt::count(snap.queue.len(), "track"),
+            "queue_duration" => fmt::duration(snap.queue_duration_ms()),
+            "volume" => snap.volume.to_string(),
+            "volume_bar" => bar(icons, snap.volume.min(100) as u64, 100, cells()),
+            "loop" => snap.loop_mode.label().to_string(),
+            "shuffle" => onoff(snap.shuffle),
+            "autoplay" => onoff(snap.autoplay),
+            "meta" => self.cur.map(|c| meta_line(snap, c)).unwrap_or_default(),
+            "now_playing_line" => now_playing_line(snap),
+            "emoji" => icons.get(Icon::by_name(arg?.trim())?).markup(),
+            "track" => t
+                .map(|t| track_block(t, web, self.links))
+                .unwrap_or_default(),
+            "track_line" => t
+                .map(|t| title_line(t, web, self.links))
+                .unwrap_or_default(),
+            "title" => t.map(|t| fmt::escape_md(&t.title)).unwrap_or_default(),
+            "artist" => t.map(|t| fmt::escape_md(&t.artist)).unwrap_or_default(),
+            "album" => t
+                .and_then(|t| t.album.as_deref())
+                .map(fmt::escape_md)
+                .unwrap_or_default(),
+            "title_link" => t
+                .and_then(|t| link_for(web, album_page(self.links), &title_query(t)))
+                .unwrap_or_default(),
+            "artist_link" => t
+                .and_then(|t| link_for(web, artist_page(self.links), &t.artist))
+                .unwrap_or_default(),
+            "album_link" => t
+                .and_then(|t| {
+                    let album = t.album.as_deref().unwrap_or("");
+                    link_for(
+                        web,
+                        album_page(self.links),
+                        &format!("{album} {}", t.artist),
+                    )
+                })
+                .unwrap_or_default(),
+            "duration" => t
+                .map(|t| fmt::duration(t.duration_ms.max(0) as u64))
+                .unwrap_or_default(),
+            "position" => self
+                .cur
+                .map(|c| fmt::duration(c.position_ms))
+                .unwrap_or_default(),
+            "progress_bar" => self
+                .cur
+                .map(|c| {
+                    bar(
+                        icons,
+                        c.position_ms,
+                        c.item.track.duration_ms.max(0) as u64,
+                        cells(),
+                    )
+                })
+                .unwrap_or_default(),
+            "badges" => self
+                .cur
+                .map(|c| fmt::badges(&c.facts).join(" · "))
+                .unwrap_or_default(),
+            "requested_by" => match (self.cur, &self.toast) {
+                (Some(c), _) => requester(&c.item),
+                (None, Some(t)) => mention(t.requested_by),
+                _ => String::new(),
+            },
+            "added" => self
+                .toast
+                .as_ref()
+                .map(|t| t.added.clone())
+                .unwrap_or_default(),
+            "added_meta" => self
+                .toast
+                .as_ref()
+                .map(|t| t.added_meta.clone())
+                .unwrap_or_default(),
+            "count" => self
+                .toast
+                .as_ref()
+                .map(|t| t.count.to_string())
+                .unwrap_or_default(),
+            "queue_position" => self
+                .toast
+                .as_ref()
+                .filter(|t| t.position > 0)
+                .map(|t| t.position.to_string())
+                .unwrap_or_default(),
+            "eta" => self
+                .toast
+                .as_ref()
+                .filter(|t| t.position > 0)
+                .map(|t| fmt::duration(t.eta_ms))
+                .unwrap_or_default(),
+            "source" => self
+                .toast
+                .as_ref()
+                .and_then(|t| t.source)
+                .map(fmt::escape_md)
+                .unwrap_or_default(),
+            "reason" => self.reason.unwrap_or("").to_string(),
+            _ => return None,
+        })
+    }
+
+    fn render(&self, tpl: &str) -> String {
+        template::render(tpl, |n, a| self.var(n, a))
+    }
+
+    /// A list entry's line: its own variables first, then the scene's.
+    fn render_entry(&self, tpl: &str, entry: &Entry, index: String) -> String {
+        template::render(tpl, |n, a| {
+            if n == "index" {
+                return Some(index.clone());
+            }
+            entry
+                .vars
+                .iter()
+                .find(|(k, _)| *k == n)
+                .map(|(_, v)| v.clone())
+                .or_else(|| self.var(n, a))
+        })
+    }
+}
+
+/// What a layout drew, and which uploads it referred to, so the caller attaches only those.
+struct Rendered {
+    components: Vec<Component>,
+    cover: bool,
+    artist: bool,
+}
+
+fn media_for(scene: &Scene, source: &ImageSource, used: &mut Rendered) -> Option<Media> {
+    match source {
+        ImageSource::Cover => scene.cover.map(|c| {
+            used.cover = true;
+            Media::attachment(&c.filename)
+        }),
+        ImageSource::Artist => scene.artist_art.map(|c| {
+            used.artist = true;
+            Media::attachment(&c.filename)
+        }),
+        ImageSource::BotAvatar => scene.snap.bot_avatar.as_deref().map(Media::url),
+        ImageSource::Url { url } => {
+            let url = scene.render(url);
+            let url = url.trim();
+            (url.starts_with("https://") || url.starts_with("http://")).then(|| Media::url(url))
+        }
+    }
+}
+
+fn button_for(scene: &Scene, spec: &ButtonSpec) -> Option<Component> {
+    match spec {
+        ButtonSpec::Control { control: which } => scene.cur.map(|c| control(scene.snap, c, *which)),
+        ButtonSpec::Link { label, url } => {
+            let url = scene.render(url);
+            let url = url.trim();
+            if !(url.starts_with("https://") || url.starts_with("http://")) {
+                return None;
+            }
+            let label = super::v2::clip(scene.render(label), MAX_LABEL_CHARS);
+            Some(button(Button::link(url, label)))
+        }
+    }
+}
+
+/// Draw a view's blocks.
+fn render_layout(scene: &Scene, layout: &ViewLayout) -> Rendered {
+    let mut out = Rendered {
+        components: Vec::new(),
+        cover: false,
+        artist: false,
     };
-    let (icon, title, color) = if cur.paused {
-        (Icon::Pause, "Paused", accent::PAUSED)
-    } else {
-        (Icon::Play, "Now playing", snap.icons.accent())
+    for block in &layout.blocks {
+        match block {
+            LayoutBlock::Text { content } => {
+                let s = scene.render(content);
+                if !s.trim().is_empty() {
+                    out.components.push(text(s));
+                }
+            }
+            LayoutBlock::Section { content, accessory } => {
+                let s = scene.render(content);
+                let body = (!s.trim().is_empty()).then(|| text(s));
+                match accessory {
+                    Accessory::Image { source } => {
+                        match (media_for(scene, source, &mut out), body) {
+                            (Some(m), Some(b)) => {
+                                out.components.push(section(vec![b], thumbnail(m, None)))
+                            }
+                            (Some(m), None) => out.components.push(gallery(vec![m])),
+                            (None, Some(b)) => out.components.push(b),
+                            (None, None) => {}
+                        }
+                    }
+                    Accessory::Button { button: spec } => match (button_for(scene, spec), body) {
+                        (Some(b), Some(t)) => out.components.push(section(vec![t], b)),
+                        (Some(b), None) => out.components.push(row(vec![b])),
+                        (None, Some(t)) => out.components.push(t),
+                        (None, None) => {}
+                    },
+                }
+            }
+            LayoutBlock::Gallery { images } => {
+                let items: Vec<Media> = images
+                    .iter()
+                    .filter_map(|i| media_for(scene, i, &mut out))
+                    .collect();
+                if !items.is_empty() {
+                    out.components.push(gallery(items));
+                }
+            }
+            LayoutBlock::Separator { divider, spacing } => out.components.push(separator(
+                *divider,
+                match spacing {
+                    SeparatorSpacing::Small => Spacing::Small,
+                    SeparatorSpacing::Large => Spacing::Large,
+                },
+            )),
+            LayoutBlock::Row { buttons } => {
+                let items: Vec<Component> = buttons
+                    .iter()
+                    .filter_map(|b| button_for(scene, b))
+                    .collect();
+                if !items.is_empty() {
+                    out.components.push(row(items));
+                }
+            }
+            LayoutBlock::List {
+                item,
+                empty,
+                page_size,
+            } => render_list(scene, item, empty, *page_size, &mut out.components),
+        }
+    }
+    out
+}
+
+/// A text display holds 4000 characters; a page of long lines is split across several.
+const LIST_CHUNK_CHARS: usize = 3800;
+
+fn render_list(scene: &Scene, item: &str, empty: &str, page_size: u8, out: &mut Vec<Component>) {
+    let total = scene.list.len();
+    if total == 0 {
+        let s = scene.render(empty);
+        if !s.trim().is_empty() {
+            out.push(text(s));
+        }
+        return;
+    }
+    let size = page_size.clamp(MIN_PAGE, MAX_PAGE) as usize;
+    let pages = total.div_ceil(size);
+    let page = scene.page.min(pages - 1);
+    let start = page * size;
+    let end = (start + size).min(total);
+    let width = end.to_string().len();
+    let mut chunks: Vec<String> = Vec::new();
+    for (i, entry) in scene.list[start..end].iter().enumerate() {
+        let line = scene.render_entry(item, entry, format!("{:>width$}", start + i + 1));
+        match chunks.last_mut() {
+            Some(c) if c.chars().count() + line.chars().count() < LIST_CHUNK_CHARS => {
+                c.push('\n');
+                c.push_str(&line);
+            }
+            _ => chunks.push(line),
+        }
+    }
+    out.extend(chunks.into_iter().map(text));
+    if pages > 1 {
+        if let Some(paging) = scene.paging {
+            out.push(separator(false, Spacing::Large));
+            out.push(paging_row(scene.snap, paging, page, pages));
+        }
+    }
+}
+
+/// First / back / "2/5" / next / last. Every button carries a distinct custom id even at the
+/// edges (Discord refuses a message that repeats one), which is why first/last are their own
+/// actions.
+fn paging_row(snap: &PlayerSnapshot, paging: Paging, page: usize, pages: usize) -> Component {
+    let icons = &snap.icons;
+    let last = pages - 1;
+    let back = page.saturating_sub(1) as u32;
+    let next = (page + 1).min(last) as u32;
+    let (first, prev, fwd, end) = match paging {
+        Paging::Queue => (
+            Action::QueueFirst,
+            Action::Queue(back),
+            Action::Queue(next),
+            Action::QueueLast,
+        ),
+        Paging::History => (
+            Action::HistoryFirst,
+            Action::History(back),
+            Action::History(next),
+            Action::HistoryLast,
+        ),
     };
-    let scene = Scene {
-        snap,
-        icon,
-        title: title.to_string(),
-        track: Some(&cur.item.track),
-        cur: Some(cur),
-        cover: cur.cover.as_ref(),
-        toast: None,
-        reason: None,
-    };
-    let (body, art) = render_layout(&scene, &snap.layouts.now_playing);
-    carry_cover(
-        Message::new(vec![container(color, body)]),
-        if art { cur.cover.as_ref() } else { None },
+    row(vec![
+        button(
+            Button::new(ButtonStyle::Secondary, id(snap, first))
+                .emoji(icons.get(Icon::Prev))
+                .disabled(page == 0),
+        ),
+        button(
+            Button::new(ButtonStyle::Secondary, id(snap, prev))
+                .label("Back")
+                .disabled(page == 0),
+        ),
+        button(
+            Button::new(ButtonStyle::Secondary, id(snap, Action::Refresh))
+                .label(format!("{}/{}", page + 1, pages))
+                .disabled(true),
+        ),
+        button(
+            Button::new(ButtonStyle::Secondary, id(snap, fwd))
+                .label("Next")
+                .disabled(page >= last),
+        ),
+        button(
+            Button::new(ButtonStyle::Secondary, id(snap, end))
+                .emoji(icons.get(Icon::Next))
+                .disabled(page >= last),
+        ),
+    ])
+}
+
+/// The message with the uploads the layout referred to. `reuse` says this render will edit the
+/// message that already carries them, so an upload can be kept by attachment id instead of sent
+/// again. The same file is never attached twice.
+fn with_uploads(msg: Message, uploads: &[Option<&Cover>], reuse: bool) -> Message {
+    let mut msg = msg;
+    let mut seen: Vec<&str> = Vec::new();
+    for c in uploads.iter().flatten() {
+        if seen.contains(&c.filename.as_str()) {
+            continue;
+        }
+        seen.push(&c.filename);
+        msg = match (reuse, c.attachment_id) {
+            (true, Some(id)) => msg.keep_attachment(id),
+            _ => msg.attach(&c.filename, c.bytes.as_ref().clone()),
+        };
+    }
+    msg
+}
+
+fn finish(scene: &Scene, layout: &ViewLayout, color: u32, reuse: bool) -> Message {
+    let r = render_layout(scene, layout);
+    with_uploads(
+        Message::new(vec![container(color, r.components)]),
+        &[
+            r.cover.then_some(scene.cover).flatten(),
+            r.artist.then_some(scene.artist_art).flatten(),
+        ],
         reuse,
     )
 }
 
+/// Whether any of these layouts shows the artist's picture, so the player knows to fetch it.
+pub fn uses_artist_art(layouts: &BotLayouts) -> bool {
+    LayoutView::ALL.iter().any(|v| {
+        layouts.view(*v).blocks.iter().any(|b| match b {
+            LayoutBlock::Section {
+                accessory: Accessory::Image { source },
+                ..
+            } => matches!(source, ImageSource::Artist),
+            LayoutBlock::Gallery { images } => {
+                images.iter().any(|i| matches!(i, ImageSource::Artist))
+            }
+            _ => false,
+        })
+    })
+}
+
+// ---- controller ----------------------------------------------------------------------------------
+
+/// The now-playing controller: the one public message per guild that is edited in place, laid
+/// out by the `now_playing` layout.
+pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
+    let Some(cur) = &snap.current else {
+        return idle(snap);
+    };
+    let (icon, heading, color) = if cur.paused {
+        (Icon::Pause, "Paused", accent::PAUSED)
+    } else {
+        (Icon::Play, "Now playing", snap.icons.accent())
+    };
+    let mut scene = Scene::new(snap, icon, heading);
+    scene.track = Some(&cur.item.track);
+    scene.links = cur.links.as_ref();
+    scene.cur = Some(cur);
+    scene.cover = cur.cover.as_ref();
+    scene.artist_art = cur.artist_art.as_ref();
+    finish(&scene, &snap.layouts.now_playing, color, reuse)
+}
+
 /// The controller when nothing is playing.
 pub fn idle(snap: &PlayerSnapshot) -> Message {
-    let scene = Scene {
-        snap,
-        icon: Icon::Note,
-        title: "Nothing playing".to_string(),
-        track: None,
-        cur: None,
-        cover: None,
-        toast: None,
-        reason: None,
-    };
-    let (body, _) = render_layout(&scene, &snap.layouts.idle);
-    Message::new(vec![container(accent::PAUSED, body)])
+    let scene = Scene::new(snap, Icon::Note, "Nothing playing");
+    finish(&scene, &snap.layouts.idle, accent::PAUSED, false)
 }
 
 /// The goodbye the controller turns into when the bot leaves.
@@ -582,39 +794,36 @@ pub fn left(snap: &PlayerSnapshot, reason: LeaveReason) -> Message {
         LeaveReason::Shutdown => "the library is restarting",
         LeaveReason::Disconnected => "disconnected",
     };
-    let scene = Scene {
-        snap,
-        icon: Icon::Wave,
-        title: "Left the voice channel".to_string(),
-        track: None,
-        cur: None,
-        cover: None,
-        toast: None,
-        reason: Some(why),
-    };
-    let (body, _) = render_layout(&scene, &snap.layouts.left);
-    Message::new(vec![container(accent::PAUSED, body)])
+    let mut scene = Scene::new(snap, Icon::Wave, "Left the voice channel");
+    scene.reason = Some(why);
+    finish(&scene, &snap.layouts.left, accent::PAUSED, false)
 }
 
 // ---- toasts & lists --------------------------------------------------------------------------------
 
-/// Public confirmation after `/play`, laid out by the bot's `queued` layout. `source` names an
-/// album/artist when several tracks were added; `cover` is the first track's art, or the
-/// artist's picture.
+/// Public confirmation after `/play`, laid out by the `queued` layout. `source` names an
+/// album/artist when several tracks were added; `cover` is the picture for what was added (the
+/// first track's art, or the artist's when the query was an artist) and `artist_art` the
+/// artist's picture when it was fetched.
 pub fn queued(
     snap: &PlayerSnapshot,
     items: &[QueueItem],
     enq: &Enqueued,
     source: Option<&str>,
     cover: Option<&Cover>,
+    artist_art: Option<&Cover>,
 ) -> Message {
     let Some(first) = items.first() else {
         return notice(&snap.icons, "Nothing added", "No tracks matched.");
     };
-    let icons = &snap.icons;
     let web = snap.web_base.as_deref();
     let by = mention(first.requested_by);
-    let (icon, title, line, meta) = if enq.count > 1 {
+    let eta_ms = if enq.position > 0 {
+        snap.eta_ms(enq.position - 1)
+    } else {
+        0
+    };
+    let (icon, heading, added, added_meta) = if enq.count > 1 {
         let total_ms: u64 = items
             .iter()
             .map(|i| i.track.duration_ms.max(0) as u64)
@@ -637,38 +846,142 @@ pub fn queued(
         (
             Icon::Play,
             "Playing now".to_string(),
-            track_block(&first.track, web),
+            track_block(&first.track, web, None),
             format!("by {by}"),
         )
     } else {
-        let eta = snap.eta_ms(enq.position - 1);
         (
             Icon::Note,
             "Added to queue".to_string(),
-            track_block(&first.track, web),
+            track_block(&first.track, web, None),
             format!(
                 "#{} · plays in ~{} · by {by}",
                 enq.position,
-                fmt::duration(eta)
+                fmt::duration(eta_ms)
             ),
         )
     };
-    let scene = Scene {
-        snap,
-        icon,
-        title,
-        track: Some(&first.track),
-        cur: None,
-        cover,
-        toast: Some((line, meta)),
-        reason: None,
-    };
-    let (body, art) = render_layout(&scene, &snap.layouts.queued);
-    carry_cover(
-        Message::new(vec![container(icons.accent(), body)]),
-        if art { cover } else { None },
-        false,
-    )
+    let mut scene = Scene::new(snap, icon, &heading);
+    scene.track = Some(&first.track);
+    scene.cover = cover;
+    scene.artist_art = artist_art;
+    scene.toast = Some(Toast {
+        added,
+        added_meta,
+        count: enq.count,
+        position: enq.position,
+        eta_ms,
+        source,
+        requested_by: first.requested_by,
+    });
+    finish(&scene, &snap.layouts.queued, snap.icons.accent(), false)
+}
+
+fn track_vars(t: &TrackRow, web: Option<&str>) -> Vec<(&'static str, String)> {
+    vec![
+        ("track", track_block(t, web, None)),
+        ("track_line", title_line(t, web, None)),
+        ("title", fmt::escape_md(&t.title)),
+        ("artist", fmt::escape_md(&t.artist)),
+        (
+            "album",
+            t.album.as_deref().map(fmt::escape_md).unwrap_or_default(),
+        ),
+        (
+            "title_link",
+            link_for(web, None, &title_query(t)).unwrap_or_default(),
+        ),
+        (
+            "artist_link",
+            link_for(web, None, &t.artist).unwrap_or_default(),
+        ),
+        (
+            "album_link",
+            t.album
+                .as_deref()
+                .and_then(|a| link_for(web, None, &format!("{a} {}", t.artist)))
+                .unwrap_or_default(),
+        ),
+        ("duration", fmt::duration(t.duration_ms.max(0) as u64)),
+    ]
+}
+
+/// One page of the queue (0-based, clamped), laid out by the `queue` layout.
+pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
+    let web = snap.web_base.as_deref();
+    let mut scene = Scene::new(snap, Icon::Queue, "Queue");
+    scene.list = snap
+        .queue
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let mut vars = track_vars(&item.track, web);
+            vars.push(("requested_by", requester(item)));
+            vars.push(("eta", fmt::duration(snap.eta_ms(i))));
+            Entry { vars }
+        })
+        .collect();
+    scene.page = page;
+    scene.paging = Some(Paging::Queue);
+    finish(&scene, &snap.layouts.queue, snap.icons.accent(), false).ephemeral()
+}
+
+/// What this server heard, newest first, from the play log (a stop or a loop does not erase what
+/// was heard), laid out by the `history` layout.
+pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Message {
+    let web = snap.web_base.as_deref();
+    let icons = &snap.icons;
+    let mut scene = Scene::new(snap, Icon::List, "History");
+    scene.list = plays
+        .iter()
+        .map(|p| {
+            let mut line = format!(
+                "**{}**",
+                linked(&p.title, web, &format!("{} {}", p.title, p.artist))
+            );
+            if !p.artist.is_empty() {
+                line.push_str(" · ");
+                line.push_str(&linked(&p.artist, web, &p.artist));
+            }
+            let requested_by = p
+                .requested_by
+                .as_deref()
+                .and_then(|u| u.parse::<u64>().ok())
+                .map(|u| mention(UserId::new(u)))
+                .unwrap_or_default();
+            let counted = if p.scrobbled_for > 0 {
+                format!(
+                    "{} counted for {}",
+                    icons.get(Icon::Check).markup(),
+                    fmt::count(p.scrobbled_for as usize, "listener")
+                )
+            } else {
+                "not counted".to_string()
+            };
+            Entry {
+                vars: vec![
+                    ("track_line", line.clone()),
+                    ("track", line),
+                    ("title", fmt::escape_md(&p.title)),
+                    ("artist", fmt::escape_md(&p.artist)),
+                    ("played_at", format!("<t:{}:R>", p.started_at / 1000)),
+                    (
+                        "played_for",
+                        if p.ms_played > 0 {
+                            fmt::duration(p.ms_played as u64)
+                        } else {
+                            String::new()
+                        },
+                    ),
+                    ("requested_by", requested_by),
+                    ("counted", counted),
+                ],
+            }
+        })
+        .collect();
+    scene.page = page;
+    scene.paging = Some(Paging::History);
+    finish(&scene, &snap.layouts.history, icons.accent(), false).ephemeral()
 }
 
 /// What a server has played through the bot: a few headed sections of text.
@@ -681,147 +994,6 @@ pub fn stats(
     let mut body = header(&icons.get(Icon::Listening), title, Some(subtitle));
     for (heading, lines) in sections {
         body.push(text(format!("**{heading}**\n{lines}")));
-    }
-    Message::new(vec![container(icons.accent(), body)]).ephemeral()
-}
-
-/// One page of the queue (0-based, clamped), with paging buttons.
-pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
-    let icons = &snap.icons;
-    let web = snap.web_base.as_deref();
-    let total = snap.queue.len();
-    let pages = total.div_ceil(QUEUE_PAGE_SIZE).max(1);
-    let page = page.min(pages - 1);
-    let mut body = header(
-        &icons.get(Icon::Queue),
-        "Queue",
-        Some(&format!(
-            "{} · {} · {}",
-            fmt::count(total, "track"),
-            fmt::duration(snap.queue_duration_ms()),
-            snap.bot_name
-        )),
-    );
-    match &snap.current {
-        Some(cur) => body.push(text(format!(
-            "{} {} `{}`",
-            icons
-                .get(if cur.paused { Icon::Pause } else { Icon::Play })
-                .markup(),
-            title_line(&cur.item.track, web),
-            fmt::duration(cur.position_ms)
-        ))),
-        None => body.push(text(small("Nothing playing"))),
-    }
-    if total == 0 {
-        body.push(text(small("The queue is empty.")));
-    } else {
-        let start = page * QUEUE_PAGE_SIZE;
-        let lines: Vec<String> = snap
-            .queue
-            .iter()
-            .enumerate()
-            .skip(start)
-            .take(QUEUE_PAGE_SIZE)
-            .map(|(i, item)| {
-                format!(
-                    "`{:>2}.` {} · {} · {}",
-                    i + 1,
-                    title_line(&item.track, web),
-                    fmt::duration(item.track.duration_ms.max(0) as u64),
-                    mention(item.requested_by)
-                )
-            })
-            .collect();
-        body.push(separator(false, Spacing::Small));
-        body.push(text(lines.join("\n")));
-    }
-    if pages > 1 {
-        body.push(separator(false, Spacing::Large));
-        let last = pages - 1;
-        // Every button carries a distinct custom id even at the edges (Discord refuses a message
-        // that repeats one), which is why first/last are their own actions.
-        body.push(row(vec![
-            button(
-                Button::new(ButtonStyle::Secondary, id(snap, Action::QueueFirst))
-                    .emoji(icons.get(Icon::Prev))
-                    .disabled(page == 0),
-            ),
-            button(
-                Button::new(
-                    ButtonStyle::Secondary,
-                    id(snap, Action::Queue(page.saturating_sub(1) as u32)),
-                )
-                .label("Back")
-                .disabled(page == 0),
-            ),
-            button(
-                Button::new(ButtonStyle::Secondary, id(snap, Action::Refresh))
-                    .label(format!("{}/{}", page + 1, pages))
-                    .disabled(true),
-            ),
-            button(
-                Button::new(
-                    ButtonStyle::Secondary,
-                    id(snap, Action::Queue((page + 1).min(last) as u32)),
-                )
-                .label("Next")
-                .disabled(page >= last),
-            ),
-            button(
-                Button::new(ButtonStyle::Secondary, id(snap, Action::QueueLast))
-                    .emoji(icons.get(Icon::Next))
-                    .disabled(page >= last),
-            ),
-        ]));
-    }
-    Message::new(vec![container(icons.accent(), body)]).ephemeral()
-}
-
-/// Recently played, newest first.
-/// What this server heard, newest first, from the play log: when, who asked, how much of it, and
-/// whether it counted for anyone's history.
-pub fn history(icons: &IconSet, bot_name: &str, web: Option<&str>, plays: &[PlayEntry]) -> Message {
-    let mut body = header(&icons.get(Icon::List), "History", Some(bot_name));
-    if plays.is_empty() {
-        body.push(text(small("Nothing has played yet.")));
-    } else {
-        let lines: Vec<String> = plays
-            .iter()
-            .take(QUEUE_PAGE_SIZE)
-            .map(|p| {
-                let mut line = format!(
-                    "**{}**",
-                    linked(&p.title, web, &format!("{} {}", p.title, p.artist))
-                );
-                if !p.artist.is_empty() {
-                    line.push_str(" · ");
-                    line.push_str(&linked(&p.artist, web, &p.artist));
-                }
-                let mut meta = vec![format!("<t:{}:R>", p.started_at / 1000)];
-                if p.ms_played > 0 {
-                    meta.push(fmt::duration(p.ms_played as u64));
-                }
-                if let Some(by) = p
-                    .requested_by
-                    .as_deref()
-                    .and_then(|u| u.parse::<u64>().ok())
-                {
-                    meta.push(mention(UserId::new(by)));
-                }
-                meta.push(if p.scrobbled_for > 0 {
-                    format!(
-                        "{} counted for {}",
-                        icons.get(Icon::Check).markup(),
-                        fmt::count(p.scrobbled_for as usize, "listener")
-                    )
-                } else {
-                    "not counted".to_string()
-                });
-                format!("{line}\n{}", small(meta.join(" · ")))
-            })
-            .collect();
-        body.push(text(lines.join("\n")));
     }
     Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
@@ -1226,6 +1398,7 @@ mod tests {
         PlayerSnapshot {
             bot_index: 1,
             bot_name: "Chordia 2".into(),
+            bot_avatar: Some("https://cdn.discordapp.com/avatars/1/a.png".into()),
             icons: Arc::new(IconSet::default()),
             web_base: None,
             guild_id: GuildId::new(777),
@@ -1237,6 +1410,7 @@ mod tests {
                 position_ms: 65_000,
                 paused: false,
                 cover: with_cover.then(cover),
+                artist_art: None,
                 links: None,
             }),
             queue: (0..queue)
@@ -1249,8 +1423,28 @@ mod tests {
             normalize: true,
             listeners: 3,
             shuffle: false,
-            layouts: Arc::new(chordia_contracts::discord_layout::BotLayouts::default()),
+            layouts: Arc::new(BotLayouts::default()),
         }
+    }
+
+    fn plays(n: usize) -> Vec<PlayEntry> {
+        (0..n)
+            .map(|i| PlayEntry {
+                title: format!("Play {i}"),
+                artist: "Daft Punk".into(),
+                requested_by: (i % 2 == 0).then(|| "42".to_string()),
+                started_at: 1_700_000_000_000 + i as i64 * 1000,
+                ms_played: if i % 3 == 0 { 0 } else { 120_000 },
+                scrobbled_for: (i % 2) as i64,
+            })
+            .collect()
+    }
+
+    fn kids(m: &Message) -> Vec<serde_json::Value> {
+        m.body()["components"][0]["components"]
+            .as_array()
+            .unwrap()
+            .clone()
     }
 
     #[test]
@@ -1274,6 +1468,7 @@ mod tests {
                 },
                 None,
                 Some(&c),
+                None,
             ),
             queued(
                 &s,
@@ -1282,6 +1477,7 @@ mod tests {
                     position: 0,
                     count: 1,
                 },
+                None,
                 None,
                 None,
             ),
@@ -1294,11 +1490,14 @@ mod tests {
                 },
                 Some("Discovery"),
                 Some(&c),
+                Some(&c),
             ),
             queue_page(&s, 0),
             queue_page(&s, 99),
             queue_page(&snap(0, false, false), 0),
-            history(&s.icons, &s.bot_name, None, &[]),
+            history(&s, &[], 0),
+            history(&s, &plays(25), 1),
+            history(&s, &plays(25), 99),
             error(&icons, "Couldn't do that", "reason"),
             notice(&icons, "Heads up", "detail"),
             ok(&icons, "Skipped", "**x**"),
@@ -1363,7 +1562,7 @@ mod tests {
         assert_eq!(c["type"], 17);
         assert_eq!(c["accent_color"], accent::BRAND);
         let kids = c["components"].as_array().unwrap();
-        // header, divider, section (text + badges beside the art), gap, progress, gap, two rows
+        // header, divider, section (track and badges beside the art), gap, progress, gap, two rows
         assert_eq!(kids.len(), 8);
         let head = kids[0]["content"].as_str().unwrap();
         assert!(head.starts_with("### ▶ Now playing"), "{head}");
@@ -1374,14 +1573,17 @@ mod tests {
             kids[2]["accessory"]["media"]["url"],
             "attachment://cover-c.jpg"
         );
-        let badges = kids[2]["components"][1]["content"].as_str().unwrap();
-        assert!(badges.starts_with("-# FLAC · "));
-        assert!(badges.contains("Opus 96k"));
+        let track = kids[2]["components"][0]["content"].as_str().unwrap();
+        assert!(
+            track.starts_with("**One More Time**\nDaft Punk · *Discovery*\n-# FLAC · "),
+            "{track}"
+        );
+        assert!(track.contains("Opus 96k"));
         let progress = kids[4]["content"].as_str().unwrap();
         assert!(progress.contains("1:05 / 5:20"));
         // Without the emoji set the bar is its text fallback: 12 cells, playhead a fifth in.
         assert!(progress.starts_with("━━●─────────"), "{progress}");
-        assert!(progress.contains("3 in queue"));
+        assert!(progress.contains("\n-# Requested by <@42> · 3 in queue · vol 80%"));
         let row1 = kids[6]["components"].as_array().unwrap();
         let row2 = kids[7]["components"].as_array().unwrap();
         assert_eq!(row1.len(), 5);
@@ -1406,10 +1608,15 @@ mod tests {
     fn paused_controller_offers_play_and_goes_grey() {
         let mut s = snap(0, true, false);
         s.current.as_mut().unwrap().paused = true;
-        let b = now_playing(&s, false).body();
+        let m = now_playing(&s, false);
+        let b = m.body();
         assert_eq!(b["components"][0]["accent_color"], accent::PAUSED);
-        let kids = b["components"][0]["components"].as_array().unwrap();
-        assert_eq!(kids[7]["components"][1]["emoji"]["name"], "▶");
+        let kids = kids(&m);
+        assert!(kids[0]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("### ⏸ Paused"));
+        assert_eq!(kids[6]["components"][1]["emoji"]["name"], "▶");
     }
 
     #[test]
@@ -1420,20 +1627,22 @@ mod tests {
             set.insert_for_test(icon, 1000 + i as u64);
         }
         s.icons = Arc::new(set);
-        let b = now_playing(&s, false).body();
-        let kids = b["components"][0]["components"].as_array().unwrap();
+        let m = now_playing(&s, false);
+        let b = m.body();
+        let kids = kids(&m);
         let head = kids[0]["content"].as_str().unwrap();
         assert!(
             head.starts_with("### <:cd_play:1000> Now playing"),
             "{head}"
         );
-        // No art here, so the layout is flat and the first button row is the eighth child.
-        let pause = &kids[7]["components"][1]["emoji"];
+        assert!(head.contains("in <:cd_listening:"), "{head}");
+        // No art here, so the section is plain text and the first button row is the seventh child.
+        let pause = &kids[6]["components"][1]["emoji"];
         assert_eq!(pause["name"], "cd_pause");
         assert_eq!(pause["id"], "1001");
         assert!(!b.to_string().contains('⏸'));
         // The bar is emojis too: the left cap, ten middles, the right cap.
-        let progress = kids[5]["content"].as_str().unwrap();
+        let progress = kids[4]["content"].as_str().unwrap();
         // 65 s of 320 s: the first two segments full, the playhead mid-third.
         assert!(progress.starts_with("<:cd_bar_l3:"), "{progress}");
         assert!(progress.contains("<:cd_bar_m2:"), "{progress}");
@@ -1459,6 +1668,18 @@ mod tests {
             .body()
             .to_string()
             .contains("](https://chordia.dev/app/search?q="));
+        // The Hub's ids win over a search when they are known.
+        s.current.as_mut().unwrap().links = Some(ResolvedTrack {
+            track_ref: "c".into(),
+            track_id: uuid::Uuid::nil(),
+            album_id: Some(uuid::Uuid::nil()),
+            artist_id: None,
+        });
+        let deep = now_playing(&s, false).body().to_string();
+        assert!(
+            deep.contains("[One More Time](https://chordia.dev/app/albums/"),
+            "{deep}"
+        );
     }
 
     #[test]
@@ -1490,12 +1711,15 @@ mod tests {
 
     #[test]
     fn controller_without_art_is_flat() {
-        let b = now_playing(&snap(0, true, false), false).body();
-        let kids = b["components"][0]["components"].as_array().unwrap();
-        // header, divider, track, badges, gap, progress, gap, two rows
-        assert_eq!(kids.len(), 9);
+        let m = now_playing(&snap(0, true, false), false);
+        let b = m.body();
+        let kids = kids(&m);
+        // header, divider, track text, gap, progress, gap, two rows
+        assert_eq!(kids.len(), 8);
         assert_eq!(kids[2]["type"], 10);
         assert!(b["attachments"].as_array().unwrap().is_empty());
+        // With nothing queued the meta line says so.
+        assert!(kids[4]["content"].as_str().unwrap().contains("queue empty"));
     }
 
     #[test]
@@ -1542,79 +1766,177 @@ mod tests {
         out
     }
 
+    fn layouts_with(view: LayoutView, blocks: Vec<LayoutBlock>) -> BotLayouts {
+        let mut l = BotLayouts::default();
+        *l.view_mut(view) = ViewLayout { blocks };
+        l.validate().unwrap();
+        l
+    }
+
     #[test]
     fn a_custom_layout_renders_and_attaches_only_what_it_shows() {
-        use chordia_contracts::discord_layout::{BotLayouts, MetaLine};
         let mut s = snap(2, true, true);
-        let layouts = BotLayouts {
-            now_playing: ViewLayout {
-                blocks: vec![
+        s.layouts = Arc::new(layouts_with(
+            LayoutView::NowPlaying,
+            vec![
                 LayoutBlock::Text {
                     content:
                         "Now: **{title}** by {artist} for {requested_by} ({position}/{duration})"
                             .into(),
                 },
-                LayoutBlock::Track {
-                    art: ArtPlacement::Gallery,
-                    album: false,
-                    badges: false,
+                LayoutBlock::Text {
+                    content: "{progress_bar:6}\n-# {queue_count} queued · {volume_bar:4} {volume}%"
+                        .into(),
                 },
-                LayoutBlock::Progress {
-                    cells: 6,
-                    times: false,
-                    meta: MetaLine {
-                        requested_by: false,
-                        queue: true,
-                        volume: false,
-                        modes: false,
-                    },
+                LayoutBlock::Gallery {
+                    images: vec![ImageSource::Cover, ImageSource::Artist],
                 },
-                LayoutBlock::Controls {
-                    rows: vec![vec![ControlButton::PlayPause, ControlButton::Lyrics]],
+                LayoutBlock::Row {
+                    buttons: vec![
+                        ButtonSpec::Control {
+                            control: ControlButton::PlayPause,
+                        },
+                        ButtonSpec::Control {
+                            control: ControlButton::Lyrics,
+                        },
+                    ],
                 },
             ],
-            },
-            ..BotLayouts::default()
-        };
-        layouts
-            .now_playing
-            .validate(chordia_contracts::discord_layout::LayoutView::NowPlaying)
-            .unwrap();
-        s.layouts = Arc::new(layouts);
+        ));
         let m = now_playing(&s, false);
         m.validate().unwrap_or_else(|e| panic!("{e}"));
         let b = m.body();
-        let kids = b["components"][0]["components"].as_array().unwrap();
+        let kids = kids(&m);
         let first = kids[0]["content"].as_str().unwrap();
-        assert!(
-            first.starts_with("Now: **One More Time** by Daft Punk for <@42> (1:05/5:20)"),
-            "{first}"
+        assert_eq!(
+            first,
+            "Now: **One More Time** by Daft Punk for <@42> (1:05/5:20)"
         );
-        // Text, track text, gallery, progress, one row.
-        assert_eq!(kids.len(), 5);
-        assert_eq!(kids[2]["type"], 12, "a media gallery");
-        assert!(
-            !kids[1]["content"].as_str().unwrap().contains("Discovery"),
-            "no album"
-        );
-        let progress = kids[3]["content"].as_str().unwrap();
-        assert!(progress.contains("2 in queue") && !progress.contains("1:05 /"));
-        assert_eq!(kids[4]["components"].as_array().unwrap().len(), 2);
+        let second = kids[1]["content"].as_str().unwrap();
+        // Six cells, and a volume bar of four at 80 %.
+        assert_eq!(second.chars().filter(|c| "━●─".contains(*c)).count(), 10);
+        assert!(second.ends_with("\n-# 2 queued · ━━━● 80%"), "{second}");
+        // Text, text, gallery (the artist picture is not there, so one item), one row.
+        assert_eq!(kids.len(), 4);
+        assert_eq!(kids[2]["type"], 12);
+        assert_eq!(kids[2]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(kids[3]["components"].as_array().unwrap().len(), 2);
         assert_eq!(b["attachments"][0]["filename"], "cover-c.jpg");
 
         // With the art placed nowhere, nothing is uploaded.
-        let mut hidden = BotLayouts::default();
-        hidden.now_playing.blocks[1] = LayoutBlock::Track {
-            art: ArtPlacement::None,
-            album: true,
-            badges: true,
-        };
-        s.layouts = Arc::new(hidden);
+        s.layouts = Arc::new(layouts_with(
+            LayoutView::NowPlaying,
+            vec![LayoutBlock::Text {
+                content: "{track}".into(),
+            }],
+        ));
         let b = now_playing(&s, false).body();
         assert!(
             b["attachments"].as_array().is_none_or(|a| a.is_empty()),
             "{b}"
         );
+    }
+
+    #[test]
+    fn pictures_buttons_and_emoji_come_from_the_layout() {
+        let mut s = snap(0, true, true);
+        s.web_base = Some("https://chordia.dev".into());
+        s.layouts = Arc::new(layouts_with(
+            LayoutView::NowPlaying,
+            vec![
+                LayoutBlock::Section {
+                    content: "{emoji:listening} {channel} · {emoji:nope} · {bot}".into(),
+                    accessory: Accessory::Image {
+                        source: ImageSource::BotAvatar,
+                    },
+                },
+                LayoutBlock::Section {
+                    content: "{track_line}".into(),
+                    accessory: Accessory::Button {
+                        button: ButtonSpec::Link {
+                            label: "Open {album}".into(),
+                            url: "{album_link}".into(),
+                        },
+                    },
+                },
+                LayoutBlock::Section {
+                    content: "-# {badges}".into(),
+                    accessory: Accessory::Image {
+                        source: ImageSource::Url {
+                            url: "{nope}".into(),
+                        },
+                    },
+                },
+                LayoutBlock::Row {
+                    buttons: vec![
+                        ButtonSpec::Link {
+                            label: "Chordia".into(),
+                            url: "https://chordia.dev".into(),
+                        },
+                        ButtonSpec::Control {
+                            control: ControlButton::Skip,
+                        },
+                    ],
+                },
+            ],
+        ));
+        let m = now_playing(&s, false);
+        m.validate().unwrap_or_else(|e| panic!("{e}"));
+        let k = kids(&m);
+        // The avatar is a thumbnail by URL; an unknown emoji name stays visible.
+        assert_eq!(k[0]["accessory"]["type"], 11);
+        assert_eq!(
+            k[0]["accessory"]["media"]["url"],
+            "https://cdn.discordapp.com/avatars/1/a.png"
+        );
+        assert_eq!(
+            k[0]["components"][0]["content"],
+            "🎧 <#555> · {emoji:nope} · Chordia 2"
+        );
+        // A link button beside the track, to the album's search page.
+        assert_eq!(k[1]["accessory"]["type"], 2);
+        assert_eq!(k[1]["accessory"]["style"], 5);
+        assert_eq!(k[1]["accessory"]["label"], "Open Discovery");
+        assert_eq!(
+            k[1]["accessory"]["url"],
+            "https://chordia.dev/app/search?q=Discovery%20Daft%20Punk"
+        );
+        // A picture that did not resolve leaves plain text.
+        assert_eq!(k[2]["type"], 10);
+        assert!(k[2]["content"].as_str().unwrap().starts_with("-# FLAC"));
+        let row = k[3]["components"].as_array().unwrap();
+        assert_eq!(row[0]["style"], 5);
+        assert_eq!(row[1]["custom_id"], "cd:1:1:777:sk");
+        // Nothing referred to the cover, so it is not uploaded.
+        assert!(m.attachments.is_empty());
+
+        // Without a web client the album link has nowhere to go: no button, the text stays.
+        s.web_base = None;
+        let m = now_playing(&s, false);
+        m.validate().unwrap();
+        assert_eq!(kids(&m)[1]["type"], 10);
+    }
+
+    #[test]
+    fn a_server_lays_its_own_layout_over_the_bots() {
+        use chordia_contracts::discord_layout::LayoutOverrides;
+        let bot = BotLayouts::default();
+        let mut gs = GuildSettings::defaults("1", "777");
+        assert_eq!(gs.layouts(&bot), bot);
+        gs.layout_overrides = LayoutOverrides {
+            idle: Some(ViewLayout {
+                blocks: vec![LayoutBlock::Text {
+                    content: "Quiet in {channel}".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        let mut s = snap(0, false, false);
+        s.layouts = Arc::new(gs.layouts(&bot));
+        assert_eq!(s.layouts.now_playing, bot.now_playing);
+        let k = kids(&idle(&s));
+        assert_eq!(k.len(), 1);
+        assert_eq!(k[0]["content"], "Quiet in <#555>");
     }
 
     #[test]
@@ -1654,6 +1976,8 @@ mod tests {
             queue_page(&s, 0),
             queue_page(&s, 1),
             queue_page(&s, 2),
+            history(&s, &plays(25), 0),
+            history(&s, &plays(25), 2),
             settings(&s, &GuildSettings::defaults("1", "777")),
             lyrics(&s, "t", "a", &pages, 0),
             lyrics(&s, "t", "a", &pages, 2),
@@ -1669,19 +1993,67 @@ mod tests {
     #[test]
     fn queue_paging_buttons_disable_at_the_edges() {
         let s = snap(25, true, false);
-        let first = queue_page(&s, 0).body();
-        let rows = first["components"][0]["components"].as_array().unwrap();
+        let first = queue_page(&s, 0);
+        let rows = kids(&first);
         let nav = rows.last().unwrap()["components"].as_array().unwrap();
         assert_eq!(nav[0]["disabled"], true);
         assert_eq!(nav[0]["custom_id"], "cd:1:1:777:qf");
         assert_eq!(nav[3]["disabled"], false);
         assert_eq!(nav[2]["label"], "1/3");
-        let last = queue_page(&s, 2).body();
-        let rows = last["components"][0]["components"].as_array().unwrap();
+        // The entries are numbered, right-aligned to the page's widest number.
+        let head = rows[0]["content"].as_str().unwrap();
+        assert!(head.contains("25 tracks"), "{head}");
+        assert!(rows[2]["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("▶ **One More Time**"));
+        let list = rows[4]["content"].as_str().unwrap();
+        assert!(
+            list.starts_with("` 1.` **Track 0** · Daft Punk · 5:20 · <@42>"),
+            "{list}"
+        );
+        assert!(list.contains("\n`10.` **Track 9**"), "{list}");
+        let last = queue_page(&s, 2);
+        let rows = kids(&last);
         let nav = rows.last().unwrap()["components"].as_array().unwrap();
         assert_eq!(nav[3]["disabled"], true);
         assert_eq!(nav[4]["custom_id"], "cd:1:1:777:ql");
         assert_eq!(nav[2]["label"], "3/3");
+        // An empty queue says so and has no paging.
+        let empty = queue_page(&snap(0, false, false), 0);
+        let rows = kids(&empty);
+        assert_eq!(rows.last().unwrap()["content"], "-# The queue is empty.");
+    }
+
+    #[test]
+    fn history_pages_and_says_what_counted() {
+        let s = snap(0, true, false);
+        let m = history(&s, &plays(12), 1);
+        let rows = kids(&m);
+        let list = rows[2]["content"].as_str().unwrap();
+        // Page two of a ten-a-page list holds the last two entries.
+        assert_eq!(list.lines().count(), 4, "{list}");
+        assert!(
+            list.starts_with(
+                "**Play 10** · Daft Punk\n-# <t:1700000010:R> · 2:00 · <@42> · not counted"
+            ),
+            "{list}"
+        );
+        assert!(
+            list.contains(
+                "**Play 11** · Daft Punk\n-# <t:1700000011:R> · 2:00 · ✔ counted for 1 listener"
+            ),
+            "{list}"
+        );
+        let nav = rows.last().unwrap()["components"].as_array().unwrap();
+        assert_eq!(nav[0]["custom_id"], "cd:1:1:777:hf");
+        assert_eq!(nav[1]["custom_id"], "cd:1:1:777:h:0");
+        assert_eq!(nav[3]["disabled"], true);
+        let empty = history(&s, &[], 0);
+        assert_eq!(
+            kids(&empty).last().unwrap()["content"],
+            "-# Nothing has played yet."
+        );
     }
 
     #[test]
@@ -1698,12 +2070,13 @@ mod tests {
             },
             None,
             None,
+            None,
         );
         let body = m.body().to_string();
         assert!(body.contains("F\\\\*\\\\*K \\\\# 1"));
         for m in [
             queue_page(&s, 0),
-            history(&s.icons, &s.bot_name, None, &[]),
+            history(&s, &plays(3), 0),
             left(&s, LeaveReason::Alone),
             busy(&icons, "A", ChannelId::new(1), 1, &["C".into()]),
             idle(&s),
