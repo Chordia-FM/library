@@ -171,19 +171,6 @@ fn with_art(lines: Vec<Component>, cover: Option<&Cover>) -> Vec<Component> {
     }
 }
 
-/// The same, with a picture Discord fetches itself (an artist's, from the Hub).
-fn with_art_url(lines: Vec<Component>, url: &str) -> Vec<Component> {
-    vec![section(
-        lines,
-        thumbnail(
-            Media {
-                url: url.to_string(),
-            },
-            None,
-        ),
-    )]
-}
-
 /// Attach the cover to the message: either upload the bytes, or (`reuse`, on an edit of the same
 /// message that already carries it) keep the existing attachment by id.
 fn carry_cover(msg: Message, cover: Option<&Cover>, reuse: bool) -> Message {
@@ -382,7 +369,6 @@ pub fn queued(
     enq: &Enqueued,
     source: Option<&str>,
     cover: Option<&Cover>,
-    art_url: Option<&str>,
 ) -> Message {
     let Some(first) = items.first() else {
         return notice(&snap.icons, "Nothing added", "No tracks matched.");
@@ -431,13 +417,7 @@ pub fn queued(
     };
     let mut body = header(&snap.icons.get(icon), &title, None);
     let lines = vec![text(format!("{line}\n{}", small(meta)))];
-    // One picture: the artist's when there is one, else the cover. A cover attached but not
-    // shown would be an upload for nothing, and an invalid message.
-    let cover = if art_url.is_some() { None } else { cover };
-    body.extend(match art_url {
-        Some(url) => with_art_url(lines, url),
-        None => with_art(lines, cover),
-    });
+    body.extend(with_art(lines, cover));
     carry_cover(
         Message::new(vec![container(icons.accent(), body)]),
         cover,
@@ -1047,7 +1027,6 @@ mod tests {
                 },
                 None,
                 Some(&c),
-                None,
             ),
             queued(
                 &s,
@@ -1056,7 +1035,6 @@ mod tests {
                     position: 0,
                     count: 1,
                 },
-                None,
                 None,
                 None,
             ),
@@ -1069,7 +1047,6 @@ mod tests {
                 },
                 Some("Discovery"),
                 Some(&c),
-                Some("https://hub.example/v1/images/abc"),
             ),
             queue_page(&s, 0),
             queue_page(&s, 99),
@@ -1397,7 +1374,6 @@ mod tests {
                 position: 1,
                 count: 1,
             },
-            None,
             None,
             None,
         );

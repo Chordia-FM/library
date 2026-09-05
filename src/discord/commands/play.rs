@@ -44,12 +44,18 @@ pub struct ArtistRef {
     pub mbid: Option<String>,
 }
 
-/// The artist's picture from the Hub, as a URL Discord can fetch, when the query was an artist
-/// the Hub knows.
-pub async fn art_for(state: &crate::http::AppState, resolved: &Resolved) -> Option<String> {
+/// The artist's picture from the Hub as an attachment, when the query was an artist the Hub
+/// knows and has a picture for.
+pub async fn art_for(state: &crate::http::AppState, resolved: &Resolved) -> Option<Cover> {
     let a = resolved.artist.as_ref()?;
     let art = crate::discord::hub::artist_art(state, &a.name_normalized, a.mbid.as_deref()).await?;
-    crate::discord::hub::absolute(state, art.image_url.as_deref()?)
+    let rel = art.image_url?;
+    let (mime, bytes) = crate::discord::hub::image(state, &rel).await?;
+    Some(Cover::named(
+        &format!("artist-{}", art.artist_id),
+        &mime,
+        bytes,
+    ))
 }
 
 /// How many tracks an artist hit queues at most.
@@ -225,7 +231,7 @@ async fn queue_resolved(
         }
     }
     // An artist's own picture beats the first album's cover, when the Hub has one.
-    let art_url = art_for(&identity.state, &resolved).await;
+    let art = art_for(&identity.state, &resolved).await;
     let items: Vec<QueueItem> = resolved
         .tracks
         .into_iter()
@@ -235,8 +241,8 @@ async fn queue_resolved(
             autoplay: false,
         })
         .collect();
-    let cover = match art_url {
-        Some(_) => None,
+    let cover = match art {
+        Some(art) => Some(art),
         None => Cover::load(&identity.state.db, &items[0].track).await,
     };
     let enq = player.enqueue(items.clone(), position).await?;
@@ -249,7 +255,6 @@ async fn queue_resolved(
             &enq,
             resolved.source.as_deref(),
             cover.as_ref(),
-            art_url.as_deref(),
         ),
     )
     .await

@@ -130,6 +130,26 @@ pub struct Cover {
 const COVER_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 impl Cover {
+    /// A picture that did not come from a track's tags: an artist's, fetched from the Hub.
+    pub fn named(stem: &str, mime: &str, bytes: Arc<Vec<u8>>) -> Cover {
+        let ext = match mime {
+            "image/png" => "png",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            _ => "jpg",
+        };
+        let short: String = stem
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '-')
+            .take(24)
+            .collect();
+        Cover {
+            filename: format!("{short}.{ext}"),
+            bytes,
+            attachment_id: None,
+        }
+    }
+
     pub async fn load(db: &sqlx::SqlitePool, track: &TrackRow) -> Option<Cover> {
         let (mime, bytes) = crate::catalog::get_track_cover(db, &track.id)
             .await
@@ -772,6 +792,21 @@ impl GuildPlayer {
         };
         self.after_change().await;
         Ok(item)
+    }
+
+    /// Remove the items numbered `from` through `to` (1-based, inclusive, clamped to the queue).
+    pub async fn remove_range(&self, from: usize, to: usize) -> PlayerResult<Vec<QueueItem>> {
+        let items = {
+            let mut s = self.inner.lock().await;
+            let n = s.queue.len();
+            if from == 0 || from > n || to < from {
+                return Err(PlayerError::BadIndex);
+            }
+            let to = to.min(n);
+            s.queue.drain(from - 1..to).collect::<Vec<_>>()
+        };
+        self.after_change().await;
+        Ok(items)
     }
 
     /// Move the item at `from` to `to` (both 1-based).

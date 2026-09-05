@@ -32,7 +32,14 @@ pub struct Caches {
     listeners: Cached<ResolvedListener>,
     tracks: Cached<ResolvedTrack>,
     artists: Cached<ArtistArt>,
+    /// Fetched pictures by their Hub path, as `(mime, bytes)`.
+    images: Cached<(String, std::sync::Arc<Vec<u8>>)>,
 }
+
+/// Pictures are asked for at this width: plenty for a Discord thumbnail, small to fetch.
+const IMAGE_WIDTH: u32 = 512;
+/// Bigger than this is not attached to every toast.
+const IMAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
 
 fn caches() -> Option<std::sync::Arc<super::Runtime>> {
     super::runtime()
@@ -65,10 +72,51 @@ fn hub(state: &AppState) -> HubClient {
     HubClient::new(state.config.backend_url.clone(), state.http.clone())
 }
 
-/// A Hub-relative URL (`/v1/images/…`) as something Discord can fetch.
+/// A Hub-relative URL (`/v1/images/…`) as something this library can fetch.
 pub fn absolute(state: &AppState, rel: &str) -> Option<String> {
     let base = state.config.backend_url.as_deref()?.trim_end_matches('/');
     Some(format!("{base}{rel}"))
+}
+
+/// A picture from the Hub, by its relative path, as bytes the bot can attach. Fetched rather than
+/// linked: Discord fetches links from its own servers, which cannot see a Hub on a private
+/// network or a developer's machine, and an attachment works wherever the library can reach the
+/// Hub.
+pub async fn image(state: &AppState, rel: &str) -> Option<(String, std::sync::Arc<Vec<u8>>)> {
+    let rt = caches()?;
+    if let Some(hit) = fresh(&rt.hub.images, rel, LINK_TTL) {
+        return hit;
+    }
+    let url = format!("{}?w={IMAGE_WIDTH}", absolute(state, rel)?);
+    let value = match state.http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let mime = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("image/jpeg")
+                .split(';')
+                .next()
+                .unwrap_or("image/jpeg")
+                .to_string();
+            match resp.bytes().await {
+                Ok(b) if !b.is_empty() && b.len() <= IMAGE_MAX_BYTES => {
+                    Some((mime, std::sync::Arc::new(b.to_vec())))
+                }
+                _ => None,
+            }
+        }
+        Ok(resp) => {
+            tracing::debug!(status = %resp.status(), rel, "fetching a Hub image");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, rel, "fetching a Hub image");
+            return None;
+        }
+    };
+    remember(&rt.hub.images, rel.to_string(), value.clone());
+    value
 }
 
 /// The Chordia users among these listeners, from the cache; the ones it does not know are asked

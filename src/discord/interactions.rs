@@ -150,7 +150,7 @@ pub async fn handle(
                     .await;
                 }
             }
-            let art_url = crate::discord::commands::play::art_for(&identity.state, &resolved).await;
+            let art = crate::discord::commands::play::art_for(&identity.state, &resolved).await;
             let items: Vec<QueueItem> = resolved
                 .tracks
                 .into_iter()
@@ -160,8 +160,8 @@ pub async fn handle(
                     autoplay: false,
                 })
                 .collect();
-            let cover = match art_url {
-                Some(_) => None,
+            let cover = match art {
+                Some(art) => Some(art),
                 None => Cover::load(&identity.state.db, &items[0].track).await,
             };
             match player.enqueue(items.clone(), Position::Last).await {
@@ -174,7 +174,6 @@ pub async fn handle(
                         &enq,
                         resolved.source.as_deref(),
                         cover.as_ref(),
-                        art_url.as_deref(),
                     )
                     .ephemeral();
                     send::interaction_edit(http, token, toast).await

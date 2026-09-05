@@ -87,13 +87,16 @@ pub async fn history(ctx: Context<'_>) -> Result<(), Error> {
     .await
 }
 
-/// Remove a track from the queue
+/// Remove a track, or a run of tracks, from the queue
 #[poise::command(slash_command, guild_only)]
 pub async fn remove(
     ctx: Context<'_>,
     #[description = "Its number in /queue"]
     #[min = 1]
     index: u32,
+    #[description = "The last number of a range to remove, for more than one"]
+    #[min = 1]
+    to: Option<u32>,
 ) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     let Some(player) = player_or_notice(ctx).await? else {
@@ -102,8 +105,10 @@ pub async fn remove(
     if let Err(r) = guard::controller(ctx, &player).await {
         return send::respond(ctx, r.view(&super::icons(ctx))).await;
     }
-    match player.remove(index as usize).await {
-        Ok(item) => {
+    let to = to.unwrap_or(index).max(index) as usize;
+    match player.remove_range(index as usize, to).await {
+        Ok(items) if items.len() == 1 => {
+            let item = &items[0];
             send::respond(
                 ctx,
                 views::ok(
@@ -113,6 +118,23 @@ pub async fn remove(
                         "**{}** · {}",
                         fmt::escape_md(&item.track.title),
                         fmt::escape_md(&item.track.artist)
+                    ),
+                ),
+            )
+            .await
+        }
+        Ok(items) => {
+            let (first, last) = (&items[0].track, &items[items.len() - 1].track);
+            send::respond(
+                ctx,
+                views::ok(
+                    &super::icons(ctx),
+                    &format!("Removed {}", fmt::count(items.len(), "track")),
+                    &format!(
+                        "-# #{index} **{}** through #{} **{}**",
+                        fmt::escape_md(&first.title),
+                        index as usize + items.len() - 1,
+                        fmt::escape_md(&last.title)
                     ),
                 ),
             )
