@@ -23,17 +23,24 @@ mod imp {
     use crate::api::v1::mgmt::require_mgmt_auth;
     use crate::discord::emoji;
     use crate::discord::identity::{DiscordUser, Identity, RoleInfo};
+    use crate::discord::preview;
     use crate::discord::settings::{
         self, BotSettings, BotSettingsPatch, GuildSettings, GuildSettingsPatch,
     };
     use crate::discord::theme::{self, ThemeStatus};
     use crate::error::{AppError, AppResult};
     use crate::http::AppState;
+    use chordia_contracts::discord_layout::{BotLayouts, LayoutView, ViewLayout};
     use serenity::all::GuildId;
 
     pub fn router() -> Router<AppState> {
         Router::new()
             .route("/mgmt/discord", get(overview))
+            .route("/mgmt/discord/layouts/defaults", get(layout_defaults))
+            .route(
+                "/mgmt/discord/bots/{app_id}/layouts/preview",
+                post(layout_preview),
+            )
             .route("/mgmt/discord/bots/{app_id}/settings", put(set_settings))
             .route("/mgmt/discord/bots/{app_id}/emojis", post(set_colour))
             .route("/mgmt/discord/bots/{app_id}/avatar", post(set_avatar))
@@ -439,6 +446,40 @@ mod imp {
         Ok(Json(status))
     }
 
+    /// `GET /v1/mgmt/discord/layouts/defaults`: the design the bot ships with, for "reset".
+    async fn layout_defaults(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+    ) -> AppResult<Json<BotLayouts>> {
+        require_mgmt_auth(&headers, &state).await?;
+        Ok(Json(BotLayouts::default()))
+    }
+
+    #[derive(Deserialize)]
+    struct PreviewRequest {
+        view: LayoutView,
+        layout: ViewLayout,
+    }
+
+    /// `POST /v1/mgmt/discord/bots/{app_id}/layouts/preview`: one view rendered with a layout that
+    /// need not be saved, over a sample scene, as the message the bot would send.
+    async fn layout_preview(
+        State(state): State<AppState>,
+        headers: HeaderMap,
+        Path(app_id): Path<String>,
+        Json(body): Json<PreviewRequest>,
+    ) -> AppResult<Json<preview::Preview>> {
+        require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
+        body.layout
+            .validate(body.view)
+            .map_err(AppError::BadRequest)?;
+        preview::render(&identity, body.view, &body.layout)
+            .await
+            .map(Json)
+            .map_err(AppError::Internal)
+    }
+
     /// `PUT /v1/mgmt/discord/bots/{app_id}/settings`: any of the bot's runtime settings. Turning
     /// `avatar_managed` back on re-applies the mark.
     async fn set_settings(
@@ -452,6 +493,9 @@ mod imp {
         let theme_change = patch.emoji_hex.is_some() || patch.avatar_managed.is_some();
         if theme_change {
             ensure_unlocked(&identity)?;
+        }
+        if let Some(layouts) = &patch.layouts {
+            layouts.validate().map_err(AppError::BadRequest)?;
         }
         let mut settings = identity.settings();
         patch.apply(&mut settings);

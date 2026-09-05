@@ -31,16 +31,22 @@ use serenity::all::UserId;
 use super::custom_id::{Action, CustomId};
 use super::fmt::{self, accent};
 use super::v2::{
-    button, container, row, section, separator, text, thumbnail, Button, ButtonStyle, Component,
-    Emoji, Media, Message, SelectOption, Spacing,
+    button, container, gallery, row, section, separator, text, thumbnail, Button, ButtonStyle,
+    Component, Emoji, Media, Message, SelectOption, Spacing,
 };
 use crate::catalog::TrackRow;
 use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
-use crate::discord::player::{Cover, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem};
+use crate::discord::player::{
+    Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem,
+};
 use crate::discord::settings::GuildSettings;
 use crate::discord::settings::PlayEntry;
 use crate::search::{HitKind, SearchHit};
 use chordia_contracts::discord::ResolvedTrack;
+use chordia_contracts::discord_layout::{
+    ArtPlacement, ControlButton, HeaderSubtitle, LayoutBlock, MetaLine, SeparatorSpacing,
+    ViewLayout,
+};
 
 pub const QUEUE_PAGE_SIZE: usize = 10;
 
@@ -187,9 +193,16 @@ fn carry_cover(msg: Message, cover: Option<&Cover>, reuse: bool) -> Message {
 /// width of the title line; more and the row wraps on a phone.
 pub const PROGRESS_CELLS: usize = 12;
 
-/// The progress bar as a row of bar-segment emojis (or their text fallbacks), then the times.
-fn progress_row(icons: &IconSet, position_ms: u64, duration_ms: u64) -> String {
-    let cells = fmt::progress_cells(position_ms, duration_ms, PROGRESS_CELLS);
+/// The progress bar as a row of bar-segment emojis (or their text fallbacks), then the times
+/// when `times` is on.
+fn progress_row(
+    icons: &IconSet,
+    position_ms: u64,
+    duration_ms: u64,
+    cells: usize,
+    times: bool,
+) -> String {
+    let cells = fmt::progress_cells(position_ms, duration_ms, cells.max(2));
     let last = cells.len() - 1;
     let bar: String = cells
         .iter()
@@ -212,11 +225,15 @@ fn progress_row(icons: &IconSet, position_ms: u64, duration_ms: u64) -> String {
             icons.get(Icon::bar(cap, state)).markup()
         })
         .collect();
-    format!(
-        "{bar} {} / {}",
-        fmt::duration(position_ms.min(duration_ms)),
-        fmt::duration(duration_ms)
-    )
+    if times {
+        format!(
+            "{bar} {} / {}",
+            fmt::duration(position_ms),
+            fmt::duration(duration_ms)
+        )
+    } else {
+        bar
+    }
 }
 
 /// "in 🎧 #channel" as a real channel mention when the id is known.
@@ -231,68 +248,250 @@ fn where_line(snap: &PlayerSnapshot) -> String {
 
 // ---- controller ----------------------------------------------------------------------------------
 
-/// The now-playing controller: the one public message per guild that is edited in place.
-///
-/// `reuse` says this render will edit the message that already carries the cover upload, so the
-/// attachment can be kept by id instead of uploaded again.
-pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
-    let Some(cur) = &snap.current else {
-        return idle(snap);
-    };
+// ---- layouts -------------------------------------------------------------------------------------
+
+/// What one render of a view draws from: the live snapshot, the view's own icon and title, and
+/// the facts only that view knows (the current track, the toast's lines, why the bot left).
+struct Scene<'a> {
+    snap: &'a PlayerSnapshot,
+    icon: Icon,
+    title: String,
+    /// The track the text variables describe.
+    track: Option<&'a TrackRow>,
+    cur: Option<&'a CurrentSnapshot>,
+    cover: Option<&'a Cover>,
+    /// The queued toast's line and meta line.
+    toast: Option<(String, String)>,
+    reason: Option<&'static str>,
+}
+
+impl Scene<'_> {
+    fn subtitle(&self, which: HeaderSubtitle) -> Option<String> {
+        match which {
+            HeaderSubtitle::Channel => Some(where_line(self.snap)),
+            HeaderSubtitle::Bot => Some(self.snap.bot_name.clone()),
+            HeaderSubtitle::None => None,
+        }
+    }
+
+    /// The variables a text block may use, already escaped.
+    fn vars(&self) -> Vec<(&'static str, String)> {
+        let snap = self.snap;
+        let t = self.track;
+        let (requested_by, position) = match self.cur {
+            Some(c) => (
+                if c.item.autoplay {
+                    "Autoplay".to_string()
+                } else {
+                    mention(c.item.requested_by)
+                },
+                fmt::duration(c.position_ms),
+            ),
+            None => (String::new(), String::new()),
+        };
+        vec![
+            (
+                "title",
+                t.map(|t| fmt::escape_md(&t.title)).unwrap_or_default(),
+            ),
+            (
+                "artist",
+                t.map(|t| fmt::escape_md(&t.artist)).unwrap_or_default(),
+            ),
+            (
+                "album",
+                t.and_then(|t| t.album.as_deref())
+                    .map(fmt::escape_md)
+                    .unwrap_or_default(),
+            ),
+            (
+                "channel",
+                fmt::escape_md(snap.voice_channel_name.as_deref().unwrap_or("")),
+            ),
+            ("bot", fmt::escape_md(&snap.bot_name)),
+            ("requested_by", requested_by),
+            ("queue_count", snap.queue.len().to_string()),
+            ("volume", snap.volume.to_string()),
+            ("position", position),
+            (
+                "duration",
+                t.map(|t| fmt::duration(t.duration_ms.max(0) as u64))
+                    .unwrap_or_default(),
+            ),
+            ("reason", self.reason.unwrap_or("").to_string()),
+        ]
+    }
+}
+
+/// Draw a view's blocks. Returns the components and whether any of them showed the cover, so the
+/// caller attaches the file only when something refers to it.
+fn render_layout(scene: &Scene, layout: &ViewLayout) -> (Vec<Component>, bool) {
+    let snap = scene.snap;
     let icons = &snap.icons;
     let web = snap.web_base.as_deref();
-    let t = &cur.item.track;
-    let (icon, title, color) = if cur.paused {
-        (Icon::Pause, "Paused", accent::PAUSED)
-    } else {
-        (Icon::Play, "Now playing", icons.accent())
-    };
-    let mut meta = vec![if cur.item.autoplay {
-        "Autoplay".to_string()
-    } else {
-        format!("Requested by {}", mention(cur.item.requested_by))
-    }];
-    meta.push(match snap.queue.len() {
-        0 => "queue empty".to_string(),
-        n => format!("{n} in queue"),
-    });
-    if snap.volume != 100 {
+    let mut out = Vec::new();
+    let mut art_used = false;
+    for block in &layout.blocks {
+        match block {
+            LayoutBlock::Header { subtitle } => out.extend(header(
+                &icons.get(scene.icon),
+                &scene.title,
+                scene.subtitle(*subtitle).as_deref(),
+            )),
+            LayoutBlock::Track { art, album, badges } => {
+                let Some(cur) = scene.cur else { continue };
+                let t = &cur.item.track;
+                let mut lines = vec![text(track_text(t, web, cur.links.as_ref(), *album))];
+                if *badges {
+                    lines.push(text(small(fmt::badges(&cur.facts).join(" · "))));
+                }
+                art_used |= place_art(&mut out, lines, *art, scene.cover);
+            }
+            LayoutBlock::Progress { cells, times, meta } => {
+                let Some(cur) = scene.cur else { continue };
+                let mut line = progress_row(
+                    icons,
+                    cur.position_ms,
+                    cur.item.track.duration_ms.max(0) as u64,
+                    *cells as usize,
+                    *times,
+                );
+                let meta = meta_line(snap, cur, meta);
+                if !meta.is_empty() {
+                    line.push('\n');
+                    line.push_str(&small(meta));
+                }
+                out.push(text(line));
+            }
+            LayoutBlock::Controls { rows } => {
+                let Some(cur) = scene.cur else { continue };
+                for r in rows {
+                    let buttons: Vec<Component> =
+                        r.iter().map(|b| control(snap, cur, *b)).collect();
+                    if !buttons.is_empty() {
+                        out.push(row(buttons));
+                    }
+                }
+            }
+            LayoutBlock::Separator { divider, spacing } => out.push(separator(
+                *divider,
+                match spacing {
+                    SeparatorSpacing::Small => Spacing::Small,
+                    SeparatorSpacing::Large => Spacing::Large,
+                },
+            )),
+            LayoutBlock::Text { content } => {
+                let vars = scene.vars();
+                let refs: Vec<(&str, &str)> = vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                let rendered = fmt::render_template(content, &refs);
+                if !rendered.trim().is_empty() {
+                    out.push(text(rendered));
+                }
+            }
+            LayoutBlock::Summary { art } => {
+                let Some((line, meta)) = &scene.toast else {
+                    continue;
+                };
+                let lines = vec![text(format!("{line}\n{}", small(meta.clone())))];
+                art_used |= place_art(&mut out, lines, *art, scene.cover);
+            }
+        }
+    }
+    (out, art_used)
+}
+
+/// Put `lines` in with the cover placed as asked; says whether the cover was used.
+fn place_art(
+    out: &mut Vec<Component>,
+    lines: Vec<Component>,
+    art: ArtPlacement,
+    cover: Option<&Cover>,
+) -> bool {
+    match (art, cover) {
+        (ArtPlacement::Thumbnail, Some(c)) => {
+            out.extend(with_art(lines, Some(c)));
+            true
+        }
+        (ArtPlacement::Gallery, Some(c)) => {
+            out.extend(lines);
+            out.push(gallery(vec![Media::attachment(&c.filename)]));
+            true
+        }
+        _ => {
+            out.extend(lines);
+            false
+        }
+    }
+}
+
+/// The track lines, with or without the album.
+fn track_text(
+    t: &TrackRow,
+    web: Option<&str>,
+    links: Option<&ResolvedTrack>,
+    album: bool,
+) -> String {
+    if album {
+        return track_block_with(t, web, links);
+    }
+    format!(
+        "**{}**\n{}",
+        linked_to(
+            &t.title,
+            web,
+            album_page(links),
+            &format!("{} {}", t.title, t.artist)
+        ),
+        linked_to(&t.artist, web, artist_page(links), &t.artist)
+    )
+}
+
+/// The small line under the progress bar: the facts the layout asked for, in words.
+fn meta_line(snap: &PlayerSnapshot, cur: &CurrentSnapshot, opts: &MetaLine) -> String {
+    let mut meta: Vec<String> = Vec::new();
+    if opts.requested_by {
+        meta.push(if cur.item.autoplay {
+            "Autoplay".to_string()
+        } else {
+            format!("Requested by {}", mention(cur.item.requested_by))
+        });
+    }
+    if opts.queue {
+        meta.push(match snap.queue.len() {
+            0 => "queue empty".to_string(),
+            n => format!("{n} in queue"),
+        });
+    }
+    if opts.volume && snap.volume != 100 {
         meta.push(format!("vol {}%", snap.volume));
     }
-    // The stateful buttons say it in colour; this line says it in words, for anyone reading.
-    if snap.loop_mode != LoopMode::Off {
-        meta.push(format!("loop: {}", snap.loop_mode.label()));
+    if opts.modes {
+        if snap.loop_mode != LoopMode::Off {
+            meta.push(format!("loop: {}", snap.loop_mode.label()));
+        }
+        if snap.shuffle {
+            meta.push("shuffle".to_string());
+        }
+        if snap.autoplay {
+            meta.push("autoplay".to_string());
+        }
     }
-    if snap.shuffle {
-        meta.push("shuffle".to_string());
-    }
-    if snap.autoplay {
-        meta.push("autoplay".to_string());
-    }
-    let mut body = header(&icons.get(icon), title, Some(&where_line(snap)));
-    body.extend(with_art(
-        vec![
-            text(track_block_with(t, web, cur.links.as_ref())),
-            text(small(fmt::badges(&cur.facts).join(" · "))),
-        ],
-        cur.cover.as_ref(),
-    ));
-    body.push(separator(false, Spacing::Small));
-    body.push(text(format!(
-        "{}\n{}",
-        progress_row(icons, cur.position_ms, t.duration_ms.max(0) as u64),
-        small(meta.join(" · "))
-    )));
-    body.push(separator(false, Spacing::Large));
-    // The play/pause button shows what pressing it will do.
-    let play_icon = if cur.paused { Icon::Play } else { Icon::Pause };
-    body.push(row(vec![
-        btn(snap, Action::Previous, Icon::Prev),
-        btn(snap, Action::PlayPause, play_icon),
-        btn(snap, Action::Skip, Icon::Next),
-        btn(snap, Action::Stop, Icon::Stop),
-        btn(
-            snap,
+    meta.join(" · ")
+}
+
+/// One control as a button. Stateful ones carry their state in the icon's colour: white off,
+/// accent on, and the loop's "1" for one track. No labels; the icons are their own explanation.
+fn control(snap: &PlayerSnapshot, cur: &CurrentSnapshot, which: ControlButton) -> Component {
+    let (action, icon) = match which {
+        ControlButton::Previous => (Action::Previous, Icon::Prev),
+        // The play/pause button shows what pressing it will do.
+        ControlButton::PlayPause => (
+            Action::PlayPause,
+            if cur.paused { Icon::Play } else { Icon::Pause },
+        ),
+        ControlButton::Skip => (Action::Skip, Icon::Next),
+        ControlButton::Stop => (Action::Stop, Icon::Stop),
+        ControlButton::Shuffle => (
             Action::Shuffle,
             if snap.shuffle {
                 Icon::Shuffle
@@ -300,21 +499,18 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
                 Icon::ShuffleOff
             },
         ),
-    ]));
-    // Stateful buttons carry their state in the icon's colour: white off, accent on, and the
-    // loop's "1" for one track. No labels; the icons are their own explanation.
-    let loop_icon = match snap.loop_mode {
-        LoopMode::Off => Icon::LoopOff,
-        LoopMode::Track => Icon::LoopTrack,
-        LoopMode::Queue => Icon::LoopQueue,
-    };
-    body.push(row(vec![
-        btn(snap, Action::LoopCycle, loop_icon),
-        btn(snap, Action::VolumeDown, Icon::VolumeDown),
-        btn(snap, Action::VolumeUp, Icon::Volume),
-        btn(snap, Action::QueueOpen, Icon::Queue),
-        btn(
-            snap,
+        ControlButton::Loop => (
+            Action::LoopCycle,
+            match snap.loop_mode {
+                LoopMode::Off => Icon::LoopOff,
+                LoopMode::Track => Icon::LoopTrack,
+                LoopMode::Queue => Icon::LoopQueue,
+            },
+        ),
+        ControlButton::VolumeDown => (Action::VolumeDown, Icon::VolumeDown),
+        ControlButton::VolumeUp => (Action::VolumeUp, Icon::Volume),
+        ControlButton::Queue => (Action::QueueOpen, Icon::Queue),
+        ControlButton::Autoplay => (
             Action::AutoplayToggle,
             if snap.autoplay {
                 Icon::Radio
@@ -322,22 +518,58 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
                 Icon::RadioOff
             },
         ),
-    ]));
+        ControlButton::Lyrics => (Action::Lyrics, Icon::Lyrics),
+    };
+    btn(snap, action, icon)
+}
+
+// ---- controller ----------------------------------------------------------------------------------
+
+/// The now-playing controller: the one public message per guild that is edited in place, laid
+/// out by the bot's `now_playing` layout.
+///
+/// `reuse` says this render will edit the message that already carries the cover upload, so the
+/// attachment can be kept by id instead of uploaded again.
+pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
+    let Some(cur) = &snap.current else {
+        return idle(snap);
+    };
+    let (icon, title, color) = if cur.paused {
+        (Icon::Pause, "Paused", accent::PAUSED)
+    } else {
+        (Icon::Play, "Now playing", snap.icons.accent())
+    };
+    let scene = Scene {
+        snap,
+        icon,
+        title: title.to_string(),
+        track: Some(&cur.item.track),
+        cur: Some(cur),
+        cover: cur.cover.as_ref(),
+        toast: None,
+        reason: None,
+    };
+    let (body, art) = render_layout(&scene, &snap.layouts.now_playing);
     carry_cover(
         Message::new(vec![container(color, body)]),
-        cur.cover.as_ref(),
+        if art { cur.cover.as_ref() } else { None },
         reuse,
     )
 }
 
 /// The controller when nothing is playing.
 pub fn idle(snap: &PlayerSnapshot) -> Message {
-    let mut body = header(
-        &snap.icons.get(Icon::Note),
-        "Nothing playing",
-        Some(&where_line(snap)),
-    );
-    body.push(text(small("The queue is empty. `/play` something.")));
+    let scene = Scene {
+        snap,
+        icon: Icon::Note,
+        title: "Nothing playing".to_string(),
+        track: None,
+        cur: None,
+        cover: None,
+        toast: None,
+        reason: None,
+    };
+    let (body, _) = render_layout(&scene, &snap.layouts.idle);
     Message::new(vec![container(accent::PAUSED, body)])
 }
 
@@ -350,19 +582,25 @@ pub fn left(snap: &PlayerSnapshot, reason: LeaveReason) -> Message {
         LeaveReason::Shutdown => "the library is restarting",
         LeaveReason::Disconnected => "disconnected",
     };
-    let mut body = header(
-        &snap.icons.get(Icon::Wave),
-        "Left the voice channel",
-        Some(&snap.bot_name),
-    );
-    body.push(text(small(format!("{why} · `/play` to bring me back"))));
+    let scene = Scene {
+        snap,
+        icon: Icon::Wave,
+        title: "Left the voice channel".to_string(),
+        track: None,
+        cur: None,
+        cover: None,
+        toast: None,
+        reason: Some(why),
+    };
+    let (body, _) = render_layout(&scene, &snap.layouts.left);
     Message::new(vec![container(accent::PAUSED, body)])
 }
 
 // ---- toasts & lists --------------------------------------------------------------------------------
 
-/// Public confirmation after `/play`. `source` names an album/artist when several tracks were
-/// added; `cover` is the first track's art.
+/// Public confirmation after `/play`, laid out by the bot's `queued` layout. `source` names an
+/// album/artist when several tracks were added; `cover` is the first track's art, or the
+/// artist's picture.
 pub fn queued(
     snap: &PlayerSnapshot,
     items: &[QueueItem],
@@ -415,12 +653,20 @@ pub fn queued(
             ),
         )
     };
-    let mut body = header(&snap.icons.get(icon), &title, None);
-    let lines = vec![text(format!("{line}\n{}", small(meta)))];
-    body.extend(with_art(lines, cover));
+    let scene = Scene {
+        snap,
+        icon,
+        title,
+        track: Some(&first.track),
+        cur: None,
+        cover,
+        toast: Some((line, meta)),
+        reason: None,
+    };
+    let (body, art) = render_layout(&scene, &snap.layouts.queued);
     carry_cover(
         Message::new(vec![container(icons.accent(), body)]),
-        cover,
+        if art { cover } else { None },
         false,
     )
 }
@@ -1003,6 +1249,7 @@ mod tests {
             normalize: true,
             listeners: 3,
             shuffle: false,
+            layouts: Arc::new(chordia_contracts::discord_layout::BotLayouts::default()),
         }
     }
 
@@ -1293,6 +1540,79 @@ mod tests {
         let mut out = Vec::new();
         msg.components.iter().for_each(|c| walk(c, &mut out));
         out
+    }
+
+    #[test]
+    fn a_custom_layout_renders_and_attaches_only_what_it_shows() {
+        use chordia_contracts::discord_layout::{BotLayouts, MetaLine};
+        let mut s = snap(2, true, true);
+        let mut layouts = BotLayouts::default();
+        layouts.now_playing = ViewLayout {
+            blocks: vec![
+                LayoutBlock::Text {
+                    content:
+                        "Now: **{title}** by {artist} for {requested_by} ({position}/{duration})"
+                            .into(),
+                },
+                LayoutBlock::Track {
+                    art: ArtPlacement::Gallery,
+                    album: false,
+                    badges: false,
+                },
+                LayoutBlock::Progress {
+                    cells: 6,
+                    times: false,
+                    meta: MetaLine {
+                        requested_by: false,
+                        queue: true,
+                        volume: false,
+                        modes: false,
+                    },
+                },
+                LayoutBlock::Controls {
+                    rows: vec![vec![ControlButton::PlayPause, ControlButton::Lyrics]],
+                },
+            ],
+        };
+        layouts
+            .now_playing
+            .validate(chordia_contracts::discord_layout::LayoutView::NowPlaying)
+            .unwrap();
+        s.layouts = Arc::new(layouts);
+        let m = now_playing(&s, false);
+        m.validate().unwrap_or_else(|e| panic!("{e}"));
+        let b = m.body();
+        let kids = b["components"][0]["components"].as_array().unwrap();
+        let first = kids[0]["content"].as_str().unwrap();
+        assert!(
+            first.starts_with("Now: **One More Time** by Daft Punk for <@42> (1:05/5:20)"),
+            "{first}"
+        );
+        // Text, track text, gallery, progress, one row.
+        assert_eq!(kids.len(), 5);
+        assert_eq!(kids[2]["type"], 12, "a media gallery");
+        assert!(
+            !kids[1]["content"].as_str().unwrap().contains("Discovery"),
+            "no album"
+        );
+        let progress = kids[3]["content"].as_str().unwrap();
+        assert!(progress.contains("2 in queue") && !progress.contains("1:05 /"));
+        assert_eq!(kids[4]["components"].as_array().unwrap().len(), 2);
+        assert_eq!(b["attachments"][0]["filename"], "cover-c.jpg");
+
+        // With the art placed nowhere, nothing is uploaded.
+        let mut hidden = BotLayouts::default();
+        hidden.now_playing.blocks[1] = LayoutBlock::Track {
+            art: ArtPlacement::None,
+            album: true,
+            badges: true,
+        };
+        s.layouts = Arc::new(hidden);
+        let b = now_playing(&s, false).body();
+        assert!(
+            b["attachments"].as_array().is_none_or(|a| a.is_empty()),
+            "{b}"
+        );
     }
 
     #[test]

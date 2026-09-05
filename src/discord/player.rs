@@ -21,6 +21,7 @@ use songbird::tracks::{PlayMode, TrackHandle};
 use tokio::sync::{Mutex, Notify};
 
 use chordia_contracts::discord::ResolvedTrack;
+use chordia_contracts::discord_layout::BotLayouts;
 use chordia_contracts::scrobble::{ClientType, ListeningEvent, PlaybackSource};
 use chordia_contracts::social::NowPlayingReport;
 use uuid::Uuid;
@@ -322,6 +323,8 @@ pub struct PlayerSnapshot {
     pub volume: u8,
     pub normalize: bool,
     pub listeners: usize,
+    /// How this bot lays out its messages.
+    pub layouts: Arc<BotLayouts>,
 }
 
 impl PlayerSnapshot {
@@ -900,6 +903,12 @@ impl GuildPlayer {
                 volume: s.volume,
                 normalize: s.normalize,
                 listeners: s.listeners.len(),
+                layouts: Arc::new(
+                    identity
+                        .as_ref()
+                        .map(|i| i.settings().layouts)
+                        .unwrap_or_default(),
+                ),
             };
             (handle, snap)
         };
@@ -1668,6 +1677,7 @@ mod tests {
             normalize: true,
             listeners: 0,
             shuffle: false,
+            layouts: Arc::new(BotLayouts::default()),
         };
         assert_eq!(snap.queue_duration_ms(), 30_000);
         assert_eq!(snap.eta_ms(0), 60_000);

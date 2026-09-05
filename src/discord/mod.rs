@@ -37,6 +37,7 @@ pub mod interactions;
 pub mod lyrics;
 pub mod player;
 pub mod presence;
+pub mod preview;
 pub mod rest;
 pub mod settings;
 pub mod source;
