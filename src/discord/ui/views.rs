@@ -1546,9 +1546,9 @@ mod tests {
     fn a_custom_layout_renders_and_attaches_only_what_it_shows() {
         use chordia_contracts::discord_layout::{BotLayouts, MetaLine};
         let mut s = snap(2, true, true);
-        let mut layouts = BotLayouts::default();
-        layouts.now_playing = ViewLayout {
-            blocks: vec![
+        let layouts = BotLayouts {
+            now_playing: ViewLayout {
+                blocks: vec![
                 LayoutBlock::Text {
                     content:
                         "Now: **{title}** by {artist} for {requested_by} ({position}/{duration})"
@@ -1573,6 +1573,8 @@ mod tests {
                     rows: vec![vec![ControlButton::PlayPause, ControlButton::Lyrics]],
                 },
             ],
+            },
+            ..BotLayouts::default()
         };
         layouts
             .now_playing
