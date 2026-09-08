@@ -15,6 +15,11 @@
 
 use serde::Serialize;
 
+use chordia_contracts::discord_layout::{
+    BotLayouts, ContainerAccent, LayoutBlock, LayoutOverrides, LayoutView, ViewLayout,
+    LAYOUT_VERSION,
+};
+
 use crate::discord::emoji::{Icon, IconSet};
 use crate::discord::ui::v2::Emoji;
 
@@ -441,6 +446,135 @@ pub fn tidy(s: &str) -> String {
     lines.join("\n")
 }
 
+// ---- older layouts --------------------------------------------------------------------------------
+
+/// The name a variable had before the namespaces, for what was saved then.
+fn renamed(view: LayoutView, name: &str) -> Option<&'static str> {
+    Some(match name {
+        "channel_name" => "channel.name",
+        "listeners" => "channel.listeners",
+        "queue_count" => "queue.count",
+        "queue_tracks" => "queue.tracks",
+        "queue_duration" => "queue.duration",
+        "volume" => "player.volume",
+        "volume_bar" => "player.volume_bar",
+        "loop" => "player.loop",
+        "shuffle" => "player.shuffle",
+        "autoplay" => "player.autoplay",
+        "meta" => "player.meta",
+        "now_playing_line" => "player.line",
+        "position" => "player.position",
+        "progress_bar" => "player.progress_bar",
+        "track_line" => "track.line",
+        "title" => "track.title",
+        "artist" => "track.artist",
+        "album" => "track.album",
+        "title_link" => "track.url",
+        "artist_link" => "track.artist_url",
+        "album_link" => "track.album_url",
+        "duration" => "track.duration",
+        "badges" => "file",
+        "requested_by" => "requester",
+        "added_meta" => "added.meta",
+        "count" => "added.count",
+        "queue_position" => "added.position",
+        "eta" if view == LayoutView::Queued => "added.eta",
+        "source" => "added.source",
+        "reason" => "left.reason",
+        "played_at" => "play.at",
+        "played_for" => "play.length",
+        "counted" => "play.counted",
+        _ => return None,
+    })
+}
+
+/// `text` with the variables it names brought up to date; everything else untouched.
+pub fn modernize(view: LayoutView, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for piece in parse(text) {
+        match piece {
+            Piece::Literal(s) => out.push_str(s),
+            Piece::Var { name, arg } => {
+                out.push('{');
+                out.push_str(renamed(view, name).unwrap_or(name));
+                if let Some(a) = arg {
+                    out.push(':');
+                    out.push_str(a);
+                }
+                out.push('}');
+            }
+        }
+    }
+    out
+}
+
+fn modernize_block(view: LayoutView, block: &mut LayoutBlock) {
+    match block {
+        LayoutBlock::Text { content } => *content = modernize(view, content),
+        LayoutBlock::Section { content, .. } => *content = modernize(view, content),
+        LayoutBlock::List { item, empty, .. } => {
+            *item = modernize(view, item);
+            *empty = modernize(view, empty);
+        }
+        LayoutBlock::Container { blocks, .. } => {
+            for b in blocks {
+                modernize_block(view, b);
+            }
+        }
+        LayoutBlock::Gallery { .. } | LayoutBlock::Separator { .. } | LayoutBlock::Row { .. } => {}
+    }
+}
+
+/// A layout from before [`LAYOUT_VERSION`]: its variables renamed, and the container every message
+/// used to be drawn in made explicit, so it looks exactly as it did.
+fn upgrade_view(view: LayoutView, layout: &mut ViewLayout) {
+    for b in &mut layout.blocks {
+        modernize_block(view, b);
+    }
+    if !layout
+        .blocks
+        .iter()
+        .any(|b| matches!(b, LayoutBlock::Container { .. }))
+    {
+        let blocks = std::mem::take(&mut layout.blocks);
+        layout.blocks = vec![LayoutBlock::Container {
+            accent: ContainerAccent::Bot,
+            blocks,
+        }];
+    }
+}
+
+/// Bring a bot's saved layouts up to date, once.
+pub fn upgrade(layouts: &mut BotLayouts) {
+    if layouts.version >= LAYOUT_VERSION {
+        return;
+    }
+    for view in LayoutView::ALL {
+        upgrade_view(view, layouts.view_mut(view));
+    }
+    layouts.version = LAYOUT_VERSION;
+}
+
+/// Bring a server's saved versions up to date, once.
+pub fn upgrade_overrides(overrides: &mut LayoutOverrides) {
+    if overrides.version >= LAYOUT_VERSION {
+        return;
+    }
+    for (view, slot) in [
+        (LayoutView::NowPlaying, &mut overrides.now_playing),
+        (LayoutView::Idle, &mut overrides.idle),
+        (LayoutView::Queued, &mut overrides.queued),
+        (LayoutView::Left, &mut overrides.left),
+        (LayoutView::Queue, &mut overrides.queue),
+        (LayoutView::History, &mut overrides.history),
+    ] {
+        if let Some(l) = slot {
+            upgrade_view(view, l);
+        }
+    }
+    overrides.version = LAYOUT_VERSION;
+}
+
 /// The count a `{…_bar:n}` argument asks for, within the allowed range.
 pub fn bar_cells(arg: Option<&str>) -> usize {
     let n = arg.and_then(|a| a.trim().parse::<u8>().ok()).unwrap_or(12);
@@ -502,6 +636,88 @@ mod tests {
         assert!(mentions("{progress_bar:8}", "progress_bar"));
         assert!(!mentions("{progress_bar:8}", "progress"));
         assert!(!mentions("progress_bar", "progress_bar"));
+    }
+
+    #[test]
+    fn older_layouts_come_up_to_date_once() {
+        let old = r####"{"now_playing":{"blocks":[
+            {"kind":"text","content":"### {icon} {heading}\n-# {channel_name}"},
+            {"kind":"section","content":"{track}\n-# {badges}","accessory":{"kind":"image","source":{"kind":"cover"}}},
+            {"kind":"text","content":"{progress_bar:8} {position} / {duration}\n-# {meta}"}
+        ]},"queued":{"blocks":[{"kind":"text","content":"{added} · {eta} · {requested_by}"}]},
+        "queue":{"blocks":[{"kind":"list","item":"{index}. {track_line} · {eta}","empty":"-","page_size":5}]}}"####;
+        let mut l: BotLayouts = serde_json::from_str(old).unwrap();
+        assert_eq!(l.version, 0);
+        upgrade(&mut l);
+        assert_eq!(l.version, LAYOUT_VERSION);
+        let LayoutBlock::Container { accent, blocks } = &l.now_playing.blocks[0] else {
+            panic!("boxed");
+        };
+        assert_eq!(*accent, ContainerAccent::Bot);
+        assert_eq!(blocks.len(), 3);
+        let LayoutBlock::Text { content } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(content, "### {icon} {heading}\n-# {channel.name}");
+        let LayoutBlock::Section { content, .. } = &blocks[1] else {
+            panic!()
+        };
+        assert_eq!(content, "{track}\n-# {file}");
+        let LayoutBlock::Text { content } = &blocks[2] else {
+            panic!()
+        };
+        assert_eq!(
+            content,
+            "{player.progress_bar:8} {player.position} / {track.duration}\n-# {player.meta}"
+        );
+        // `{eta}` means the toast's on the queued message and the entry's on the queue.
+        let LayoutBlock::Container { blocks, .. } = &l.queued.blocks[0] else {
+            panic!()
+        };
+        let LayoutBlock::Text { content } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(content, "{added} · {added.eta} · {requester}");
+        let LayoutBlock::Container { blocks, .. } = &l.queue.blocks[0] else {
+            panic!()
+        };
+        let LayoutBlock::List { item, .. } = &blocks[0] else {
+            panic!()
+        };
+        assert_eq!(item, "{index}. {track.line} · {eta}");
+        // Untouched views got the (already boxed) defaults, and a second pass changes nothing.
+        let again = l.clone();
+        upgrade(&mut l);
+        assert_eq!(l, again);
+        l.validate().unwrap();
+        // A current save is left alone even when it has no container.
+        let mut current = BotLayouts {
+            idle: ViewLayout {
+                blocks: vec![LayoutBlock::Text {
+                    content: "{bot}".into(),
+                }],
+            },
+            ..Default::default()
+        };
+        let before = current.clone();
+        upgrade(&mut current);
+        assert_eq!(current, before);
+        let mut o = LayoutOverrides {
+            version: 0,
+            idle: Some(ViewLayout {
+                blocks: vec![LayoutBlock::Text {
+                    content: "{volume}".into(),
+                }],
+            }),
+            ..Default::default()
+        };
+        upgrade_overrides(&mut o);
+        assert_eq!(o.version, LAYOUT_VERSION);
+        assert!(matches!(
+            &o.idle.as_ref().unwrap().blocks[0],
+            LayoutBlock::Container { blocks, .. }
+                if matches!(&blocks[0], LayoutBlock::Text { content } if content == "{player.volume}")
+        ));
     }
 
     #[test]

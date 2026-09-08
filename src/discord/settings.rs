@@ -6,6 +6,7 @@ use chordia_contracts::discord_layout::{BotLayouts, LayoutOverrides};
 use serde::{Deserialize, Serialize};
 use sqlx::{AssertSqlSafe, SqlitePool};
 
+use crate::discord::ui::template;
 use crate::error::AppResult;
 
 pub(crate) fn now_ms() -> i64 {
@@ -301,6 +302,10 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
                 .layouts
                 .as_deref()
                 .and_then(|j| serde_json::from_str(j).ok())
+                .map(|mut l: BotLayouts| {
+                    template::upgrade(&mut l);
+                    l
+                })
                 .unwrap_or_default(),
             emoji_hex: r.emoji_hex,
             emoji_hex_applied: r.emoji_hex_applied,
@@ -542,6 +547,10 @@ impl From<GuildRow> for GuildSettings {
                 .layout_overrides
                 .as_deref()
                 .and_then(|j| serde_json::from_str(j).ok())
+                .map(|mut o: LayoutOverrides| {
+                    template::upgrade_overrides(&mut o);
+                    o
+                })
                 .unwrap_or_default(),
         }
     }

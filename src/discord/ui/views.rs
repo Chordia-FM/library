@@ -55,8 +55,8 @@ use crate::discord::source::TrackFacts;
 use crate::search::{HitKind, SearchHit};
 use chordia_contracts::discord::ResolvedTrack;
 use chordia_contracts::discord_layout::{
-    Accessory, BotLayouts, ButtonSpec, ControlButton, ImageSource, LayoutBlock, LayoutView,
-    SeparatorSpacing, ViewLayout, MAX_LABEL_CHARS, MAX_PAGE, MIN_PAGE,
+    Accessory, BotLayouts, ButtonSpec, ContainerAccent, ControlButton, ImageSource, LayoutBlock,
+    LayoutView, SeparatorSpacing, ViewLayout, MAX_LABEL_CHARS, MAX_PAGE, MIN_PAGE,
 };
 
 /// How far back `/history` pages: enough for a long evening, not the whole log.
@@ -335,6 +335,8 @@ struct Scene<'a> {
     snap: &'a PlayerSnapshot,
     icon: Icon,
     heading: String,
+    /// The colour a container in the bot's colour takes on this message.
+    accent: u32,
     /// The track the track variables describe.
     track: Option<&'a TrackRow>,
     links: Option<&'a ResolvedTrack>,
@@ -352,11 +354,12 @@ struct Scene<'a> {
 }
 
 impl<'a> Scene<'a> {
-    fn new(snap: &'a PlayerSnapshot, icon: Icon, heading: &str) -> Self {
+    fn new(snap: &'a PlayerSnapshot, icon: Icon, heading: &str, accent: u32) -> Self {
         Scene {
             snap,
             icon,
             heading: heading.to_string(),
+            accent,
             track: None,
             links: None,
             cur: None,
@@ -642,15 +645,50 @@ fn button_for(scene: &Scene, spec: &ButtonSpec) -> Option<Component> {
     }
 }
 
+/// `#rrggbb` as Discord's integer colour.
+fn hex_colour(hex: &str) -> Option<u32> {
+    u32::from_str_radix(hex.trim().trim_start_matches('#'), 16).ok()
+}
+
+/// A divider with nothing under it reads as a mistake: the separators a block list ends with go.
+fn trim_trailing_separators(components: &mut Vec<Component>) {
+    while matches!(components.last(), Some(Component::Separator { .. })) {
+        components.pop();
+    }
+}
+
 /// Draw a view's blocks.
 fn render_layout(scene: &Scene, layout: &ViewLayout) -> Rendered {
+    let mut out = render_blocks(scene, &layout.blocks);
+    trim_trailing_separators(&mut out.components);
+    out
+}
+
+fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
     let mut out = Rendered {
         components: Vec::new(),
         cover: false,
         artist: false,
     };
-    for block in &layout.blocks {
+    for block in blocks {
         match block {
+            LayoutBlock::Container { accent, blocks } => {
+                let mut inner = render_blocks(scene, blocks);
+                trim_trailing_separators(&mut inner.components);
+                out.cover |= inner.cover;
+                out.artist |= inner.artist;
+                if inner.components.is_empty() {
+                    continue;
+                }
+                out.components.push(Component::Container {
+                    accent: match accent {
+                        ContainerAccent::Bot => Some(scene.accent),
+                        ContainerAccent::Fixed { hex } => hex_colour(hex),
+                        ContainerAccent::None => None,
+                    },
+                    components: inner.components,
+                });
+            }
             LayoutBlock::Text { content } => {
                 let s = scene.render(content);
                 if !s.trim().is_empty() {
@@ -822,10 +860,10 @@ fn with_uploads(msg: Message, uploads: &[Option<&Cover>], reuse: bool) -> Messag
     msg
 }
 
-fn finish(scene: &Scene, layout: &ViewLayout, color: u32, reuse: bool) -> Message {
+fn finish(scene: &Scene, layout: &ViewLayout, reuse: bool) -> Message {
     let r = render_layout(scene, layout);
     with_uploads(
-        Message::new(vec![container(color, r.components)]),
+        Message::new(r.components),
         &[
             r.cover.then_some(scene.cover).flatten(),
             r.artist.then_some(scene.artist_art).flatten(),
@@ -837,7 +875,7 @@ fn finish(scene: &Scene, layout: &ViewLayout, color: u32, reuse: bool) -> Messag
 /// Whether any of these layouts shows the artist's picture, so the player knows to fetch it.
 pub fn uses_artist_art(layouts: &BotLayouts) -> bool {
     LayoutView::ALL.iter().any(|v| {
-        layouts.view(*v).blocks.iter().any(|b| match b {
+        layouts.view(*v).flat().into_iter().any(|b| match b {
             LayoutBlock::Section {
                 accessory: Accessory::Image { source },
                 ..
@@ -863,19 +901,19 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
     } else {
         (Icon::Play, "Now playing", snap.icons.accent())
     };
-    let mut scene = Scene::new(snap, icon, heading);
+    let mut scene = Scene::new(snap, icon, heading, color);
     scene.track = Some(&cur.item.track);
     scene.links = cur.links.as_ref();
     scene.cur = Some(cur);
     scene.cover = cur.cover.as_ref();
     scene.artist_art = cur.artist_art.as_ref();
-    finish(&scene, &snap.layouts.now_playing, color, reuse)
+    finish(&scene, &snap.layouts.now_playing, reuse)
 }
 
 /// The controller when nothing is playing.
 pub fn idle(snap: &PlayerSnapshot) -> Message {
-    let scene = Scene::new(snap, Icon::Note, "Nothing playing");
-    finish(&scene, &snap.layouts.idle, accent::PAUSED, false)
+    let scene = Scene::new(snap, Icon::Note, "Nothing playing", accent::PAUSED);
+    finish(&scene, &snap.layouts.idle, false)
 }
 
 /// The goodbye the controller turns into when the bot leaves.
@@ -887,9 +925,9 @@ pub fn left(snap: &PlayerSnapshot, reason: LeaveReason) -> Message {
         LeaveReason::Shutdown => "the library is restarting",
         LeaveReason::Disconnected => "disconnected",
     };
-    let mut scene = Scene::new(snap, Icon::Wave, "Left the voice channel");
+    let mut scene = Scene::new(snap, Icon::Wave, "Left the voice channel", accent::PAUSED);
     scene.reason = Some(why);
-    finish(&scene, &snap.layouts.left, accent::PAUSED, false)
+    finish(&scene, &snap.layouts.left, false)
 }
 
 // ---- toasts & lists --------------------------------------------------------------------------------
@@ -954,7 +992,7 @@ pub fn queued(
             ),
         )
     };
-    let mut scene = Scene::new(snap, icon, &heading);
+    let mut scene = Scene::new(snap, icon, &heading, snap.icons.accent());
     scene.track = Some(&first.track);
     scene.cover = cover;
     scene.artist_art = artist_art;
@@ -968,7 +1006,7 @@ pub fn queued(
         source,
         requested_by: first.requested_by,
     });
-    finish(&scene, &snap.layouts.queued, snap.icons.accent(), false)
+    finish(&scene, &snap.layouts.queued, false)
 }
 
 /// A list entry's track, under the same names a scene answers for its own.
@@ -1017,7 +1055,7 @@ fn track_vars(t: &TrackRow, web: Option<&str>) -> Vec<(&'static str, String)> {
 /// One page of the queue (0-based, clamped), laid out by the `queue` layout.
 pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
     let web = snap.web_base.as_deref();
-    let mut scene = Scene::new(snap, Icon::Queue, "Queue");
+    let mut scene = Scene::new(snap, Icon::Queue, "Queue", snap.icons.accent());
     let list = snap
         .queue
         .iter()
@@ -1038,7 +1076,7 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
         })
         .collect();
     scene.paged(list, page, &snap.layouts.queue, Paging::Queue);
-    finish(&scene, &snap.layouts.queue, snap.icons.accent(), false).ephemeral()
+    finish(&scene, &snap.layouts.queue, false).ephemeral()
 }
 
 /// What this server heard, newest first, from the play log (a stop or a loop does not erase what
@@ -1046,7 +1084,7 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
 pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Message {
     let web = snap.web_base.as_deref();
     let icons = &snap.icons;
-    let mut scene = Scene::new(snap, Icon::List, "History");
+    let mut scene = Scene::new(snap, Icon::List, "History", icons.accent());
     let list = plays
         .iter()
         .map(|p| {
@@ -1108,7 +1146,7 @@ pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Messa
         })
         .collect();
     scene.paged(list, page, &snap.layouts.history, Paging::History);
-    finish(&scene, &snap.layouts.history, icons.accent(), false).ephemeral()
+    finish(&scene, &snap.layouts.history, false).ephemeral()
 }
 
 /// What a server has played through the bot: a few headed sections of text.
@@ -1895,11 +1933,79 @@ mod tests {
         out
     }
 
+    /// The blocks in one container in the bot's colour, the way the defaults are.
     fn layouts_with(view: LayoutView, blocks: Vec<LayoutBlock>) -> BotLayouts {
         let mut l = BotLayouts::default();
-        *l.view_mut(view) = ViewLayout { blocks };
+        *l.view_mut(view) = ViewLayout {
+            blocks: vec![LayoutBlock::Container {
+                accent: ContainerAccent::Bot,
+                blocks,
+            }],
+        };
         l.validate().unwrap();
         l
+    }
+
+    #[test]
+    fn containers_are_blocks_with_a_colour_of_their_own() {
+        let mut s = snap(0, true, false);
+        let l = BotLayouts {
+            now_playing: ViewLayout {
+                blocks: vec![
+                    LayoutBlock::Text {
+                        content: "outside".into(),
+                    },
+                    LayoutBlock::Container {
+                        accent: ContainerAccent::Fixed {
+                            hex: "#123456".into(),
+                        },
+                        blocks: vec![
+                            LayoutBlock::Text {
+                                content: "{track.title}".into(),
+                            },
+                            LayoutBlock::Separator {
+                                divider: true,
+                                spacing: SeparatorSpacing::Small,
+                            },
+                        ],
+                    },
+                    LayoutBlock::Container {
+                        accent: ContainerAccent::None,
+                        blocks: vec![LayoutBlock::Text {
+                            content: "-# {file.codec}".into(),
+                        }],
+                    },
+                    LayoutBlock::Container {
+                        accent: ContainerAccent::Bot,
+                        blocks: vec![LayoutBlock::Text {
+                            content: "{nothing.here.but.unknown}".into(),
+                        }],
+                    },
+                    LayoutBlock::Separator {
+                        divider: false,
+                        spacing: SeparatorSpacing::Large,
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+        l.validate().unwrap();
+        s.layouts = Arc::new(l);
+        let m = now_playing(&s, false);
+        m.validate().unwrap_or_else(|e| panic!("{e}"));
+        let b = m.body();
+        let top = b["components"].as_array().unwrap();
+        // The text, two containers, the bot-coloured one; the trailing gap is dropped, and so is
+        // the separator that ended the first container.
+        assert_eq!(top.len(), 4, "{b}");
+        assert_eq!(top[0]["type"], 10);
+        assert_eq!(top[0]["content"], "outside");
+        assert_eq!(top[1]["type"], 17);
+        assert_eq!(top[1]["accent_color"], 0x12_34_56);
+        assert_eq!(top[1]["components"].as_array().unwrap().len(), 1);
+        assert_eq!(top[2]["type"], 17);
+        assert!(top[2]["accent_color"].is_null());
+        assert_eq!(top[3]["accent_color"], accent::BRAND);
     }
 
     #[test]
@@ -2070,9 +2176,10 @@ mod tests {
         let mut s = snap(0, false, false);
         s.layouts = Arc::new(gs.layouts(&bot));
         assert_eq!(s.layouts.now_playing, bot.now_playing);
-        let k = kids(&idle(&s));
-        assert_eq!(k.len(), 1);
-        assert_eq!(k[0]["content"], "Quiet in <#555>");
+        // The server's version has no container, so the text is the message.
+        let b = idle(&s).body();
+        assert_eq!(b["components"].as_array().unwrap().len(), 1);
+        assert_eq!(b["components"][0]["content"], "Quiet in <#555>");
     }
 
     #[test]
