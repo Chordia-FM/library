@@ -105,12 +105,7 @@ pub fn badges(f: &TrackFacts) -> Vec<String> {
     let mut out = Vec::with_capacity(5);
     out.push(codec_label(&f.codec).to_string());
     if f.sample_rate_hz > 0 {
-        let khz = f.sample_rate_hz as f64 / 1000.0;
-        let rate = if khz.fract() == 0.0 {
-            format!("{khz:.0} kHz")
-        } else {
-            format!("{khz:.1} kHz")
-        };
+        let rate = sample_rate(f.sample_rate_hz);
         if f.bit_depth > 0 && f.lossless {
             out.push(format!("{rate} · {}-bit", f.bit_depth));
         } else {
@@ -126,14 +121,28 @@ pub fn badges(f: &TrackFacts) -> Vec<String> {
         out.push(format!("Opus {kbps}k"));
     }
     if let Some(g) = f.gain_db {
-        out.push(format!(
-            "RG {}{:.1} dB",
-            if g < 0.0 { "−" } else { "+" },
-            g.abs()
-        ));
+        out.push(format!("RG {}", gain(g)));
     }
     out.truncate(5);
     out
+}
+
+/// `44.1 kHz`, `48 kHz`; empty for an unknown rate.
+pub fn sample_rate(hz: u32) -> String {
+    if hz == 0 {
+        return String::new();
+    }
+    let khz = hz as f64 / 1000.0;
+    if khz.fract() == 0.0 {
+        format!("{khz:.0} kHz")
+    } else {
+        format!("{khz:.1} kHz")
+    }
+}
+
+/// `−7.1 dB` (a real minus sign), `+1.0 dB`.
+pub fn gain(db: f32) -> String {
+    format!("{}{:.1} dB", if db < 0.0 { "−" } else { "+" }, db.abs())
 }
 
 /// Badges as inline code chips: `` `FLAC` `44.1 kHz · 16-bit` `Lossless` ``.

@@ -1,8 +1,8 @@
 //! The template language every layout text is written in, and the catalogue of what it can say.
 //!
-//! A template is Discord markdown with variables in braces: `{track}`, `{channel}`,
-//! `{progress_bar:12}`, `{emoji:listening}`. A variable is a lowercase name, optionally followed
-//! by a colon and an argument. Anything else in braces is left exactly as written, so a typo is
+//! A template is Discord markdown with variables in braces: `{track.title}`, `{channel}`,
+//! `{player.progress_bar:12}`, `{emoji:listening}`. A variable is a lowercase dotted name,
+//! optionally followed by a colon and an argument. Anything else in braces is left exactly as written, so a typo is
 //! visible instead of silently blank, and a JSON snippet or a `{}` in a title survives.
 //!
 //! Rendering is forgiving about what is missing: a variable that has nothing to say (no album,
@@ -15,7 +15,8 @@
 
 use serde::Serialize;
 
-use crate::discord::emoji::Icon;
+use crate::discord::emoji::{Icon, IconSet};
+use crate::discord::ui::v2::Emoji;
 
 /// One variable the dashboard can offer, with where it applies.
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +42,9 @@ pub struct ArgInfo {
 const ANY: &[&str] = &[];
 const TRACK: &[&str] = &["now_playing", "queued", "item"];
 const PLAYING: &[&str] = &["now_playing"];
+const QUEUED: &[&str] = &["queued"];
+const ITEM: &[&str] = &["item"];
+const PAGED: &[&str] = &["queue", "history"];
 const BAR: Option<ArgInfo> = Some(ArgInfo {
     label: "segments",
     min: 4,
@@ -48,7 +52,8 @@ const BAR: Option<ArgInfo> = Some(ArgInfo {
     default: 12,
 });
 
-/// The catalogue, in the order the dashboard lists it.
+/// The catalogue, in the order the dashboard lists it: a namespace per thing (`track.`, `file.`,
+/// `player.`, …), every fact its own variable, and a bare name for the composed shortcut.
 pub fn variables() -> Vec<VariableInfo> {
     fn v(
         name: &str,
@@ -63,181 +68,239 @@ pub fn variables() -> Vec<VariableInfo> {
             arg,
         }
     }
-    let mut out = vec![
+    vec![
+        // the message
         v(
             "icon",
-            "This message's icon (play, pause, a note, a wave…)",
+            "This message's icon: play, pause, a note, a wave",
             ANY,
             None,
         ),
         v(
             "heading",
-            "This message's title, e.g. \"Now playing\" or \"Added to queue\"",
+            "This message's title, e.g. Now playing, Added to queue",
             ANY,
             None,
         ),
+        v(
+            "emoji:name",
+            "One of the bot's icons by name, e.g. {emoji:listening}",
+            ANY,
+            None,
+        ),
+        // the bot, the server, the channel
         v("bot", "The bot's name", ANY, None),
+        v("bot.name", "The bot's name", ANY, None),
+        v("bot.mention", "The bot, as a mention", ANY, None),
+        v("bot.avatar", "The address of the bot's avatar", ANY, None),
+        v("server", "The server's name", ANY, None),
         v(
             "channel",
             "The voice channel, as a clickable mention",
             ANY,
             None,
         ),
-        v("channel_name", "The voice channel's name, plain", ANY, None),
+        v("channel.name", "The voice channel's name, plain", ANY, None),
         v(
-            "listeners",
+            "channel.listeners",
             "How many people are in the voice channel",
             ANY,
             None,
         ),
-        v(
-            "queue_count",
-            "How many tracks are queued, as a number",
-            ANY,
-            None,
-        ),
-        v("queue_tracks", "\"3 tracks\"", ANY, None),
-        v(
-            "queue_duration",
-            "How long the queue runs, e.g. 12:34",
-            ANY,
-            None,
-        ),
-        v("volume", "The volume as a number, e.g. 80", ANY, None),
-        v("volume_bar", "The volume as a bar of segments", ANY, BAR),
-        v("loop", "The loop mode: off, track or queue", ANY, None),
-        v("shuffle", "Shuffle: on or off", ANY, None),
-        v("autoplay", "Autoplay: on or off", ANY, None),
-        v(
-            "meta",
-            "Who asked, the queue count, the volume and the modes, in one line",
-            PLAYING,
-            None,
-        ),
-        v(
-            "now_playing_line",
-            "What is playing, one line, or \"Nothing playing\"",
-            ANY,
-            None,
-        ),
+        // the track
         v(
             "track",
-            "The track: bold title, then artist and album, linked",
+            "Bold title, then artist and album, each linked",
             TRACK,
             None,
         ),
         v(
-            "track_line",
-            "The track on one line: bold title · artist, linked",
+            "track.line",
+            "One line: bold title · artist, linked",
             TRACK,
             None,
         ),
-        v("title", "The track's title, plain", TRACK, None),
-        v("artist", "The track's artist, plain", TRACK, None),
-        v("album", "The track's album, plain", TRACK, None),
+        v("track.title", "The title", TRACK, None),
+        v("track.artist", "The artist", TRACK, None),
+        v("track.album", "The album", TRACK, None),
+        v("track.album_artist", "The album's artist", TRACK, None),
+        v("track.year", "The album's year", TRACK, None),
+        v("track.genre", "The album's genre", TRACK, None),
+        v("track.number", "The track number on the album", TRACK, None),
+        v("track.disc", "The disc number", TRACK, None),
+        v("track.duration", "The length, e.g. 3:45", TRACK, None),
         v(
-            "title_link",
+            "track.url",
             "The web client address for the track",
             TRACK,
             None,
         ),
         v(
-            "artist_link",
+            "track.artist_url",
             "The web client address for the artist",
             TRACK,
             None,
         ),
         v(
-            "album_link",
+            "track.album_url",
             "The web client address for the album",
             TRACK,
             None,
         ),
-        v("duration", "The track's length, e.g. 3:45", TRACK, None),
+        v("track.title_link", "The title as a link", TRACK, None),
+        v("track.artist_link", "The artist as a link", TRACK, None),
+        v("track.album_link", "The album as a link", TRACK, None),
+        // the file
+        v("file", "The quality badges in one line", PLAYING, None),
+        v("file.codec", "FLAC, MP3, Opus…", PLAYING, None),
+        v("file.sample_rate", "e.g. 44.1 kHz", PLAYING, None),
         v(
-            "position",
+            "file.bit_depth",
+            "e.g. 16-bit; empty for lossy files",
+            PLAYING,
+            None,
+        ),
+        v("file.channels", "stereo, mono, or the count", PLAYING, None),
+        v(
+            "file.quality",
+            "Lossless or Atmos, else empty",
+            PLAYING,
+            None,
+        ),
+        v(
+            "file.bitrate",
+            "The Opus bitrate the channel gets, e.g. 96 kbps",
+            PLAYING,
+            None,
+        ),
+        v("file.gain", "The ReplayGain, e.g. −7.1 dB", PLAYING, None),
+        // the player
+        v("player.status", "playing, paused or idle", ANY, None),
+        v(
+            "player.position",
             "How far into the track, e.g. 1:05",
             PLAYING,
             None,
         ),
         v(
-            "progress_bar",
+            "player.remaining",
+            "How much of the track is left",
+            PLAYING,
+            None,
+        ),
+        v(
+            "player.progress_bar",
             "How far into the track, as a bar of segments",
             PLAYING,
             BAR,
         ),
         v(
-            "badges",
-            "The file's quality: codec, rate, lossless, Opus bitrate, ReplayGain",
+            "player.volume",
+            "The volume as a number, e.g. 80",
+            ANY,
+            None,
+        ),
+        v(
+            "player.volume_bar",
+            "The volume as a bar of segments",
+            ANY,
+            BAR,
+        ),
+        v("player.loop", "off, track or queue", ANY, None),
+        v("player.shuffle", "on or off", ANY, None),
+        v("player.autoplay", "on or off", ANY, None),
+        v(
+            "player.meta",
+            "Who asked, the queue, the volume and the modes, in one line",
             PLAYING,
             None,
         ),
         v(
-            "requested_by",
-            "Who asked for the track, as a mention (or \"Autoplay\")",
+            "player.line",
+            "What is playing, on one line, or Nothing playing",
+            ANY,
+            None,
+        ),
+        // the queue
+        v(
+            "queue.count",
+            "How many tracks are queued, as a number",
+            ANY,
+            None,
+        ),
+        v("queue.tracks", "e.g. 3 tracks", ANY, None),
+        v(
+            "queue.duration",
+            "How long the queue runs, e.g. 12:34",
+            ANY,
+            None,
+        ),
+        v("queue.next", "The next track, on one line", ANY, None),
+        // who asked
+        v(
+            "requester",
+            "Who asked for the track, as a mention (or Autoplay)",
             TRACK,
             None,
         ),
+        v("requester.id", "Their Discord id", TRACK, None),
+        // what was added
         v(
             "added",
             "What was added: the track, or the album or artist and a count",
-            &["queued"],
+            QUEUED,
             None,
         ),
         v(
-            "added_meta",
+            "added.meta",
             "Where it sits, when it plays and who asked, in one line",
-            &["queued"],
+            QUEUED,
             None,
         ),
-        v("count", "How many tracks were added", &["queued"], None),
+        v("added.count", "How many tracks were added", QUEUED, None),
         v(
-            "queue_position",
-            "The number the first added track has in the queue",
-            &["queued"],
+            "added.position",
+            "The queue number of the first added track",
+            QUEUED,
+            None,
+        ),
+        v("added.eta", "How long until it plays", QUEUED, None),
+        v(
+            "added.duration",
+            "How long everything added runs",
+            QUEUED,
             None,
         ),
         v(
-            "eta",
-            "How long until the added track plays",
-            &["queued", "item"],
+            "added.source",
+            "The album or artist the tracks came from",
+            QUEUED,
             None,
         ),
+        // why the bot left
+        v("left.reason", "Why the bot left", &["left"], None),
+        // list entries
+        v("index", "The entry's number in the list", ITEM, None),
+        v("eta", "How long until the entry plays", ITEM, None),
+        v("play.at", "When it played, as a relative time", ITEM, None),
+        v("play.length", "How much of it played", ITEM, None),
         v(
-            "source",
-            "The album or artist the tracks came from, when several were added",
-            &["queued"],
-            None,
-        ),
-        v("reason", "Why the bot left", &["left"], None),
-        v("index", "The entry's number in the list", &["item"], None),
-        v(
-            "played_at",
-            "When the entry played, as a relative time",
-            &["item"],
-            None,
-        ),
-        v("played_for", "How much of it played", &["item"], None),
-        v(
-            "counted",
+            "play.counted",
             "Whether it counted for anyone's listening history",
-            &["item"],
+            ITEM,
             None,
         ),
         v(
-            "page",
-            "The page number, e.g. 2/5",
-            &["queue", "history"],
+            "play.counted_for",
+            "How many listeners it counted for",
+            ITEM,
             None,
         ),
-    ];
-    out.push(VariableInfo {
-        name: "emoji:name".to_string(),
-        description: "One of the bot's own icons by name, e.g. {emoji:listening}",
-        scopes: ANY,
-        arg: None,
-    });
-    out
+        // pages
+        v("page", "The page, e.g. 2/5", PAGED, None),
+        v("page.number", "The page number", PAGED, None),
+        v("page.count", "How many pages there are", PAGED, None),
+    ]
 }
 
 /// The bot's icons a template may name with `{emoji:name}`.
@@ -246,13 +309,20 @@ pub struct EmojiInfo {
     pub name: &'static str,
     /// What the icon looks like without the emoji set, so the dashboard can show it.
     pub fallback: &'static str,
+    /// The application emoji's id once the set is live, so the dashboard can show the real one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
-pub fn emojis() -> Vec<EmojiInfo> {
+pub fn emojis(icons: &IconSet) -> Vec<EmojiInfo> {
     Icon::named()
         .map(|(name, icon)| EmojiInfo {
             name,
             fallback: icon.fallback(),
+            id: match icons.get(icon) {
+                Emoji::Custom { id, .. } => Some(id.to_string()),
+                Emoji::Unicode(_) => None,
+            },
         })
         .collect()
 }
@@ -266,10 +336,14 @@ enum Piece<'a> {
     Var { name: &'a str, arg: Option<&'a str> },
 }
 
+/// `track.title`, `player.progress_bar`: lowercase words, joined by dots.
 fn is_name(s: &str) -> bool {
     !s.is_empty()
+        && !s.starts_with('.')
+        && !s.ends_with('.')
+        && !s.contains("..")
         && s.chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '.')
 }
 
 fn parse(template: &str) -> Vec<Piece<'_>> {
@@ -387,6 +461,7 @@ mod tests {
     fn r(t: &str) -> String {
         render(t, |name, arg| match name {
             "title" => Some("One More Time".into()),
+            "track.title" => Some("TRACK.TITLE".into()),
             "album" => Some(String::new()),
             "bar" => Some(format!("[{}]", bar_cells(arg))),
             _ => None,
@@ -402,7 +477,11 @@ mod tests {
         assert_eq!(r("{bar} {bar:99} {bar:x}"), "[12] [20] [12]");
         assert_eq!(r("{} {{title}} { title }"), "{} {One More Time} { title }");
         assert_eq!(r("a { b"), "a { b");
-        assert_eq!(r("{Title}"), "{Title}");
+        assert_eq!(
+            r("{Title} {.title} {title.} {a..b}"),
+            "{Title} {.title} {title.} {a..b}"
+        );
+        assert_eq!(r("{track.title}"), "TRACK.TITLE");
     }
 
     #[test]
@@ -436,6 +515,7 @@ mod tests {
         names.sort();
         names.dedup();
         assert_eq!(names.len(), vars.len());
-        assert!(emojis().iter().any(|e| e.name == "listening"));
+        let list = emojis(&IconSet::default());
+        assert!(list.iter().any(|e| e.name == "listening" && e.id.is_none()));
     }
 }

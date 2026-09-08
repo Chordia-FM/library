@@ -51,6 +51,7 @@ use crate::discord::player::{
     Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem,
 };
 use crate::discord::settings::{GuildSettings, PlayEntry};
+use crate::discord::source::TrackFacts;
 use crate::search::{HitKind, SearchHit};
 use chordia_contracts::discord::ResolvedTrack;
 use chordia_contracts::discord_layout::{
@@ -114,6 +115,11 @@ fn artist_page(links: Option<&ResolvedTrack>) -> Option<String> {
 
 fn title_query(t: &TrackRow) -> String {
     format!("{} {}", t.title, t.artist)
+}
+
+fn album_url(t: &TrackRow, web: Option<&str>, links: Option<&ResolvedTrack>) -> Option<String> {
+    let album = t.album.as_deref().filter(|a| !a.is_empty())?;
+    link_for(web, album_page(links), &format!("{album} {}", t.artist))
 }
 
 /// `**Title** · Artist`, one line.
@@ -301,6 +307,8 @@ struct Toast<'a> {
     added: String,
     added_meta: String,
     count: usize,
+    /// How long everything added runs.
+    duration_ms: u64,
     /// 1-based queue number of the first added track; 0 when it started at once.
     position: usize,
     eta_ms: u64,
@@ -337,8 +345,9 @@ struct Scene<'a> {
     toast: Option<Toast<'a>>,
     reason: Option<&'static str>,
     list: Vec<Entry>,
-    /// The page asked for (0-based); the list block clamps it.
+    /// The page shown (0-based, already clamped) and how many there are.
     page: usize,
+    pages: usize,
     paging: Option<Paging>,
 }
 
@@ -357,8 +366,27 @@ impl<'a> Scene<'a> {
             reason: None,
             list: Vec::new(),
             page: 0,
+            pages: 1,
             paging: None,
         }
+    }
+
+    /// Give the scene its entries and the page asked for; the page is clamped to what the
+    /// layout's list block holds, so `{page}` in a header agrees with the list under it.
+    fn paged(&mut self, list: Vec<Entry>, page: usize, layout: &ViewLayout, paging: Paging) {
+        let size = layout
+            .blocks
+            .iter()
+            .find_map(|b| match b {
+                LayoutBlock::List { page_size, .. } => Some(*page_size),
+                _ => None,
+            })
+            .unwrap_or(10)
+            .clamp(MIN_PAGE, MAX_PAGE) as usize;
+        self.pages = list.len().div_ceil(size).max(1);
+        self.page = page.min(self.pages - 1);
+        self.list = list;
+        self.paging = Some(paging);
     }
 
     /// A variable's value: `None` for one this scene does not know (left as written), an empty
@@ -368,122 +396,187 @@ impl<'a> Scene<'a> {
         let icons = &snap.icons;
         let web = snap.web_base.as_deref();
         let t = self.track;
+        let cur = self.cur;
+        let facts = cur.map(|c| &c.facts);
+        let toast = self.toast.as_ref();
         let cells = || template::bar_cells(arg);
+        let of_track = |f: &dyn Fn(&TrackRow) -> String| t.map(f).unwrap_or_default();
+        let of_facts = |f: &dyn Fn(&TrackFacts) -> String| facts.map(f).unwrap_or_default();
+        let of_toast = |f: &dyn Fn(&Toast) -> String| toast.map(f).unwrap_or_default();
+        let of_cur = |f: &dyn Fn(&CurrentSnapshot) -> String| cur.map(f).unwrap_or_default();
         Some(match name {
+            // the message
             "icon" => icons.get(self.icon).markup(),
             "heading" => self.heading.clone(),
-            "bot" => fmt::escape_md(&snap.bot_name),
+            "emoji" => icons.get(Icon::by_name(arg?.trim())?).markup(),
+            // the bot, the server, the channel
+            "bot" | "bot.name" => fmt::escape_md(&snap.bot_name),
+            "bot.mention" => snap
+                .bot_user_id
+                .map(|id| format!("<@{id}>"))
+                .unwrap_or_default(),
+            "bot.avatar" => snap.bot_avatar.clone().unwrap_or_default(),
+            "server" => snap
+                .guild_name
+                .as_deref()
+                .map(fmt::escape_md)
+                .unwrap_or_default(),
             "channel" => match (snap.voice_channel, &snap.voice_channel_name) {
                 (Some(ch), _) => format!("<#{}>", ch.get()),
                 (None, Some(name)) => fmt::escape_md(name),
                 (None, None) => String::new(),
             },
-            "channel_name" => snap
+            "channel.name" => snap
                 .voice_channel_name
                 .as_deref()
                 .map(fmt::escape_md)
                 .unwrap_or_default(),
-            "listeners" => snap.listeners.to_string(),
-            "queue_count" => snap.queue.len().to_string(),
-            "queue_tracks" => fmt::count(snap.queue.len(), "track"),
-            "queue_duration" => fmt::duration(snap.queue_duration_ms()),
-            "volume" => snap.volume.to_string(),
-            "volume_bar" => bar(icons, snap.volume.min(100) as u64, 100, cells()),
-            "loop" => snap.loop_mode.label().to_string(),
-            "shuffle" => onoff(snap.shuffle),
-            "autoplay" => onoff(snap.autoplay),
-            "meta" => self.cur.map(|c| meta_line(snap, c)).unwrap_or_default(),
-            "now_playing_line" => now_playing_line(snap),
-            "emoji" => icons.get(Icon::by_name(arg?.trim())?).markup(),
-            "track" => t
-                .map(|t| track_block(t, web, self.links))
+            "channel.listeners" => snap.listeners.to_string(),
+            // the track
+            "track" => of_track(&|t| track_block(t, web, self.links)),
+            "track.line" => of_track(&|t| title_line(t, web, self.links)),
+            "track.title" => of_track(&|t| fmt::escape_md(&t.title)),
+            "track.artist" => of_track(&|t| fmt::escape_md(&t.artist)),
+            "track.album" => {
+                of_track(&|t| t.album.as_deref().map(fmt::escape_md).unwrap_or_default())
+            }
+            "track.album_artist" => of_track(&|t| {
+                t.album_artist
+                    .as_deref()
+                    .map(fmt::escape_md)
+                    .unwrap_or_default()
+            }),
+            "track.year" => of_track(&|t| t.year.map(|y| y.to_string()).unwrap_or_default()),
+            "track.genre" => {
+                of_track(&|t| t.genre.as_deref().map(fmt::escape_md).unwrap_or_default())
+            }
+            "track.number" => of_track(&|t| t.track_no.map(|n| n.to_string()).unwrap_or_default()),
+            "track.disc" => of_track(&|t| t.disc_no.map(|n| n.to_string()).unwrap_or_default()),
+            "track.duration" => of_track(&|t| fmt::duration(t.duration_ms.max(0) as u64)),
+            "track.url" => of_track(&|t| {
+                link_for(web, album_page(self.links), &title_query(t)).unwrap_or_default()
+            }),
+            "track.artist_url" => {
+                of_track(&|t| link_for(web, artist_page(self.links), &t.artist).unwrap_or_default())
+            }
+            "track.album_url" => of_track(&|t| album_url(t, web, self.links).unwrap_or_default()),
+            "track.title_link" => {
+                of_track(&|t| linked_to(&t.title, web, album_page(self.links), &title_query(t)))
+            }
+            "track.artist_link" => {
+                of_track(&|t| linked_to(&t.artist, web, artist_page(self.links), &t.artist))
+            }
+            "track.album_link" => of_track(&|t| match t.album.as_deref() {
+                Some(album) if !album.is_empty() => linked_to(
+                    album,
+                    web,
+                    album_page(self.links),
+                    &format!("{album} {}", t.artist),
+                ),
+                _ => String::new(),
+            }),
+            // the file
+            "file" => of_facts(&|f| fmt::badges(f).join(" · ")),
+            "file.codec" => of_facts(&|f| fmt::codec_label(&f.codec).to_string()),
+            "file.sample_rate" => of_facts(&|f| fmt::sample_rate(f.sample_rate_hz)),
+            "file.bit_depth" => of_facts(&|f| {
+                if f.lossless && f.bit_depth > 0 {
+                    format!("{}-bit", f.bit_depth)
+                } else {
+                    String::new()
+                }
+            }),
+            "file.channels" => of_facts(&|f| match f.channels {
+                1 => "mono".to_string(),
+                2 => "stereo".to_string(),
+                n => format!("{n} channels"),
+            }),
+            "file.quality" => of_facts(&|f| {
+                if f.spatial {
+                    "Atmos".to_string()
+                } else if f.lossless {
+                    "Lossless".to_string()
+                } else {
+                    String::new()
+                }
+            }),
+            "file.bitrate" => {
+                of_facts(&|f| f.opus_kbps.map(|k| format!("{k} kbps")).unwrap_or_default())
+            }
+            "file.gain" => of_facts(&|f| f.gain_db.map(fmt::gain).unwrap_or_default()),
+            // the player
+            "player.status" => match cur {
+                Some(c) if c.paused => "paused".to_string(),
+                Some(_) => "playing".to_string(),
+                None => "idle".to_string(),
+            },
+            "player.position" => of_cur(&|c| fmt::duration(c.position_ms)),
+            "player.remaining" => of_cur(&|c| {
+                fmt::duration(
+                    (c.item.track.duration_ms.max(0) as u64).saturating_sub(c.position_ms),
+                )
+            }),
+            "player.progress_bar" => of_cur(&|c| {
+                bar(
+                    icons,
+                    c.position_ms,
+                    c.item.track.duration_ms.max(0) as u64,
+                    cells(),
+                )
+            }),
+            "player.volume" => snap.volume.to_string(),
+            "player.volume_bar" => bar(icons, snap.volume.min(100) as u64, 100, cells()),
+            "player.loop" => snap.loop_mode.label().to_string(),
+            "player.shuffle" => onoff(snap.shuffle),
+            "player.autoplay" => onoff(snap.autoplay),
+            "player.meta" => of_cur(&|c| meta_line(snap, c)),
+            "player.line" => now_playing_line(snap),
+            // the queue
+            "queue.count" => snap.queue.len().to_string(),
+            "queue.tracks" => fmt::count(snap.queue.len(), "track"),
+            "queue.duration" => fmt::duration(snap.queue_duration_ms()),
+            "queue.next" => snap
+                .queue
+                .first()
+                .map(|i| title_line(&i.track, web, None))
                 .unwrap_or_default(),
-            "track_line" => t
-                .map(|t| title_line(t, web, self.links))
-                .unwrap_or_default(),
-            "title" => t.map(|t| fmt::escape_md(&t.title)).unwrap_or_default(),
-            "artist" => t.map(|t| fmt::escape_md(&t.artist)).unwrap_or_default(),
-            "album" => t
-                .and_then(|t| t.album.as_deref())
-                .map(fmt::escape_md)
-                .unwrap_or_default(),
-            "title_link" => t
-                .and_then(|t| link_for(web, album_page(self.links), &title_query(t)))
-                .unwrap_or_default(),
-            "artist_link" => t
-                .and_then(|t| link_for(web, artist_page(self.links), &t.artist))
-                .unwrap_or_default(),
-            "album_link" => t
-                .and_then(|t| {
-                    let album = t.album.as_deref().unwrap_or("");
-                    link_for(
-                        web,
-                        album_page(self.links),
-                        &format!("{album} {}", t.artist),
-                    )
-                })
-                .unwrap_or_default(),
-            "duration" => t
-                .map(|t| fmt::duration(t.duration_ms.max(0) as u64))
-                .unwrap_or_default(),
-            "position" => self
-                .cur
-                .map(|c| fmt::duration(c.position_ms))
-                .unwrap_or_default(),
-            "progress_bar" => self
-                .cur
-                .map(|c| {
-                    bar(
-                        icons,
-                        c.position_ms,
-                        c.item.track.duration_ms.max(0) as u64,
-                        cells(),
-                    )
-                })
-                .unwrap_or_default(),
-            "badges" => self
-                .cur
-                .map(|c| fmt::badges(&c.facts).join(" · "))
-                .unwrap_or_default(),
-            "requested_by" => match (self.cur, &self.toast) {
+            // who asked
+            "requester" => match (cur, toast) {
                 (Some(c), _) => requester(&c.item),
                 (None, Some(t)) => mention(t.requested_by),
                 _ => String::new(),
             },
-            "added" => self
-                .toast
-                .as_ref()
-                .map(|t| t.added.clone())
-                .unwrap_or_default(),
-            "added_meta" => self
-                .toast
-                .as_ref()
-                .map(|t| t.added_meta.clone())
-                .unwrap_or_default(),
-            "count" => self
-                .toast
-                .as_ref()
-                .map(|t| t.count.to_string())
-                .unwrap_or_default(),
-            "queue_position" => self
-                .toast
-                .as_ref()
-                .filter(|t| t.position > 0)
-                .map(|t| t.position.to_string())
-                .unwrap_or_default(),
-            "eta" => self
-                .toast
-                .as_ref()
-                .filter(|t| t.position > 0)
-                .map(|t| fmt::duration(t.eta_ms))
-                .unwrap_or_default(),
-            "source" => self
-                .toast
-                .as_ref()
-                .and_then(|t| t.source)
-                .map(fmt::escape_md)
-                .unwrap_or_default(),
-            "reason" => self.reason.unwrap_or("").to_string(),
+            "requester.id" => match (cur, toast) {
+                (Some(c), _) if !c.item.autoplay => c.item.requested_by.get().to_string(),
+                (None, Some(t)) => t.requested_by.get().to_string(),
+                _ => String::new(),
+            },
+            // what was added
+            "added" => of_toast(&|t| t.added.clone()),
+            "added.meta" => of_toast(&|t| t.added_meta.clone()),
+            "added.count" => of_toast(&|t| t.count.to_string()),
+            "added.position" => of_toast(&|t| {
+                if t.position > 0 {
+                    t.position.to_string()
+                } else {
+                    String::new()
+                }
+            }),
+            "added.eta" => of_toast(&|t| {
+                if t.position > 0 {
+                    fmt::duration(t.eta_ms)
+                } else {
+                    String::new()
+                }
+            }),
+            "added.duration" => of_toast(&|t| fmt::duration(t.duration_ms)),
+            "added.source" => of_toast(&|t| t.source.map(fmt::escape_md).unwrap_or_default()),
+            // why the bot left
+            "left.reason" => self.reason.unwrap_or("").to_string(),
+            // pages
+            "page" => format!("{}/{}", self.page + 1, self.pages),
+            "page.number" => (self.page + 1).to_string(),
+            "page.count" => self.pages.to_string(),
             _ => return None,
         })
     }
@@ -634,8 +727,8 @@ fn render_list(scene: &Scene, item: &str, empty: &str, page_size: u8, out: &mut 
         return;
     }
     let size = page_size.clamp(MIN_PAGE, MAX_PAGE) as usize;
-    let pages = total.div_ceil(size);
-    let page = scene.page.min(pages - 1);
+    let pages = scene.pages;
+    let page = scene.page;
     let start = page * size;
     let end = (start + size).min(total);
     let width = end.to_string().len();
@@ -823,11 +916,11 @@ pub fn queued(
     } else {
         0
     };
+    let total_ms: u64 = items
+        .iter()
+        .map(|i| i.track.duration_ms.max(0) as u64)
+        .sum();
     let (icon, heading, added, added_meta) = if enq.count > 1 {
-        let total_ms: u64 = items
-            .iter()
-            .map(|i| i.track.duration_ms.max(0) as u64)
-            .sum();
         let what = source
             .map(|s| format!("**{}**", linked(s, web, s)))
             .unwrap_or_else(|| fmt::count(enq.count, "track"));
@@ -869,6 +962,7 @@ pub fn queued(
         added,
         added_meta,
         count: enq.count,
+        duration_ms: total_ms,
         position: enq.position,
         eta_ms,
         source,
@@ -877,32 +971,46 @@ pub fn queued(
     finish(&scene, &snap.layouts.queued, snap.icons.accent(), false)
 }
 
+/// A list entry's track, under the same names a scene answers for its own.
 fn track_vars(t: &TrackRow, web: Option<&str>) -> Vec<(&'static str, String)> {
+    let opt = |s: Option<&str>| s.map(fmt::escape_md).unwrap_or_default();
+    let num = |n: Option<i64>| n.map(|n| n.to_string()).unwrap_or_default();
     vec![
         ("track", track_block(t, web, None)),
-        ("track_line", title_line(t, web, None)),
-        ("title", fmt::escape_md(&t.title)),
-        ("artist", fmt::escape_md(&t.artist)),
+        ("track.line", title_line(t, web, None)),
+        ("track.title", fmt::escape_md(&t.title)),
+        ("track.artist", fmt::escape_md(&t.artist)),
+        ("track.album", opt(t.album.as_deref())),
+        ("track.album_artist", opt(t.album_artist.as_deref())),
+        ("track.year", num(t.year)),
+        ("track.genre", opt(t.genre.as_deref())),
+        ("track.number", num(t.track_no)),
+        ("track.disc", num(t.disc_no)),
+        ("track.duration", fmt::duration(t.duration_ms.max(0) as u64)),
         (
-            "album",
-            t.album.as_deref().map(fmt::escape_md).unwrap_or_default(),
-        ),
-        (
-            "title_link",
+            "track.url",
             link_for(web, None, &title_query(t)).unwrap_or_default(),
         ),
         (
-            "artist_link",
+            "track.artist_url",
             link_for(web, None, &t.artist).unwrap_or_default(),
         ),
         (
-            "album_link",
-            t.album
-                .as_deref()
-                .and_then(|a| link_for(web, None, &format!("{a} {}", t.artist)))
-                .unwrap_or_default(),
+            "track.album_url",
+            album_url(t, web, None).unwrap_or_default(),
         ),
-        ("duration", fmt::duration(t.duration_ms.max(0) as u64)),
+        (
+            "track.title_link",
+            linked_to(&t.title, web, None, &title_query(t)),
+        ),
+        ("track.artist_link", linked(&t.artist, web, &t.artist)),
+        (
+            "track.album_link",
+            match t.album.as_deref() {
+                Some(a) if !a.is_empty() => linked(a, web, &format!("{a} {}", t.artist)),
+                _ => String::new(),
+            },
+        ),
     ]
 }
 
@@ -910,19 +1018,26 @@ fn track_vars(t: &TrackRow, web: Option<&str>) -> Vec<(&'static str, String)> {
 pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
     let web = snap.web_base.as_deref();
     let mut scene = Scene::new(snap, Icon::Queue, "Queue");
-    scene.list = snap
+    let list = snap
         .queue
         .iter()
         .enumerate()
         .map(|(i, item)| {
             let mut vars = track_vars(&item.track, web);
-            vars.push(("requested_by", requester(item)));
+            vars.push(("requester", requester(item)));
+            vars.push((
+                "requester.id",
+                if item.autoplay {
+                    String::new()
+                } else {
+                    item.requested_by.get().to_string()
+                },
+            ));
             vars.push(("eta", fmt::duration(snap.eta_ms(i))));
             Entry { vars }
         })
         .collect();
-    scene.page = page;
-    scene.paging = Some(Paging::Queue);
+    scene.paged(list, page, &snap.layouts.queue, Paging::Queue);
     finish(&scene, &snap.layouts.queue, snap.icons.accent(), false).ephemeral()
 }
 
@@ -932,7 +1047,7 @@ pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Messa
     let web = snap.web_base.as_deref();
     let icons = &snap.icons;
     let mut scene = Scene::new(snap, Icon::List, "History");
-    scene.list = plays
+    let list = plays
         .iter()
         .map(|p| {
             let mut line = format!(
@@ -943,12 +1058,10 @@ pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Messa
                 line.push_str(" · ");
                 line.push_str(&linked(&p.artist, web, &p.artist));
             }
-            let requested_by = p
+            let requester_id = p
                 .requested_by
                 .as_deref()
-                .and_then(|u| u.parse::<u64>().ok())
-                .map(|u| mention(UserId::new(u)))
-                .unwrap_or_default();
+                .and_then(|u| u.parse::<u64>().ok());
             let counted = if p.scrobbled_for > 0 {
                 format!(
                     "{} counted for {}",
@@ -960,27 +1073,41 @@ pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Messa
             };
             Entry {
                 vars: vec![
-                    ("track_line", line.clone()),
+                    ("track.line", line.clone()),
                     ("track", line),
-                    ("title", fmt::escape_md(&p.title)),
-                    ("artist", fmt::escape_md(&p.artist)),
-                    ("played_at", format!("<t:{}:R>", p.started_at / 1000)),
+                    ("track.title", fmt::escape_md(&p.title)),
+                    ("track.artist", fmt::escape_md(&p.artist)),
                     (
-                        "played_for",
+                        "track.title_link",
+                        linked(&p.title, web, &format!("{} {}", p.title, p.artist)),
+                    ),
+                    ("track.artist_link", linked(&p.artist, web, &p.artist)),
+                    ("play.at", format!("<t:{}:R>", p.started_at / 1000)),
+                    (
+                        "play.length",
                         if p.ms_played > 0 {
                             fmt::duration(p.ms_played as u64)
                         } else {
                             String::new()
                         },
                     ),
-                    ("requested_by", requested_by),
-                    ("counted", counted),
+                    (
+                        "requester",
+                        requester_id
+                            .map(|u| mention(UserId::new(u)))
+                            .unwrap_or_default(),
+                    ),
+                    (
+                        "requester.id",
+                        requester_id.map(|u| u.to_string()).unwrap_or_default(),
+                    ),
+                    ("play.counted", counted),
+                    ("play.counted_for", p.scrobbled_for.to_string()),
                 ],
             }
         })
         .collect();
-    scene.page = page;
-    scene.paging = Some(Paging::History);
+    scene.paged(list, page, &snap.layouts.history, Paging::History);
     finish(&scene, &snap.layouts.history, icons.accent(), false).ephemeral()
 }
 
@@ -1399,6 +1526,8 @@ mod tests {
             bot_index: 1,
             bot_name: "Chordia 2".into(),
             bot_avatar: Some("https://cdn.discordapp.com/avatars/1/a.png".into()),
+            bot_user_id: Some(9),
+            guild_name: Some("Test guild".into()),
             icons: Arc::new(IconSet::default()),
             web_base: None,
             guild_id: GuildId::new(777),
@@ -1781,11 +1910,11 @@ mod tests {
             vec![
                 LayoutBlock::Text {
                     content:
-                        "Now: **{title}** by {artist} for {requested_by} ({position}/{duration})"
+                        "Now: **{track.title}** by {track.artist} for {requester} ({player.position}/{track.duration})"
                             .into(),
                 },
                 LayoutBlock::Text {
-                    content: "{progress_bar:6}\n-# {queue_count} queued · {volume_bar:4} {volume}%"
+                    content: "{player.progress_bar:6}\n-# {queue.count} queued · {player.volume_bar:4} {player.volume}%"
                         .into(),
                 },
                 LayoutBlock::Gallery {
@@ -1845,22 +1974,22 @@ mod tests {
             LayoutView::NowPlaying,
             vec![
                 LayoutBlock::Section {
-                    content: "{emoji:listening} {channel} · {emoji:nope} · {bot}".into(),
+                    content: "{emoji:listening} {channel} · {emoji:nope} · {bot} · {server}".into(),
                     accessory: Accessory::Image {
                         source: ImageSource::BotAvatar,
                     },
                 },
                 LayoutBlock::Section {
-                    content: "{track_line}".into(),
+                    content: "{track.line}".into(),
                     accessory: Accessory::Button {
                         button: ButtonSpec::Link {
-                            label: "Open {album}".into(),
-                            url: "{album_link}".into(),
+                            label: "Open {track.album}".into(),
+                            url: "{track.album_url}".into(),
                         },
                     },
                 },
                 LayoutBlock::Section {
-                    content: "-# {badges}".into(),
+                    content: "-# {file} · {file.codec} · {file.bitrate} · {file.gain}".into(),
                     accessory: Accessory::Image {
                         source: ImageSource::Url {
                             url: "{nope}".into(),
@@ -1891,7 +2020,7 @@ mod tests {
         );
         assert_eq!(
             k[0]["components"][0]["content"],
-            "🎧 <#555> · {emoji:nope} · Chordia 2"
+            "🎧 <#555> · {emoji:nope} · Chordia 2 · Test guild"
         );
         // A link button beside the track, to the album's search page.
         assert_eq!(k[1]["accessory"]["type"], 2);
@@ -1903,7 +2032,14 @@ mod tests {
         );
         // A picture that did not resolve leaves plain text.
         assert_eq!(k[2]["type"], 10);
-        assert!(k[2]["content"].as_str().unwrap().starts_with("-# FLAC"));
+        assert!(
+            k[2]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("Opus 96k · RG −7.1 dB · FLAC · 96 kbps · −7.1 dB"),
+            "{}",
+            k[2]["content"]
+        );
         let row = k[3]["components"].as_array().unwrap();
         assert_eq!(row[0]["style"], 5);
         assert_eq!(row[1]["custom_id"], "cd:1:1:777:sk");

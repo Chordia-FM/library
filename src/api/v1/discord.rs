@@ -38,7 +38,10 @@ mod imp {
         Router::new()
             .route("/mgmt/discord", get(overview))
             .route("/mgmt/discord/layouts/defaults", get(layout_defaults))
-            .route("/mgmt/discord/layouts/schema", get(layout_schema))
+            .route(
+                "/mgmt/discord/bots/{app_id}/layouts/schema",
+                get(layout_schema),
+            )
             .route(
                 "/mgmt/discord/bots/{app_id}/layouts/preview",
                 post(layout_preview),
@@ -513,15 +516,18 @@ mod imp {
         controls: Vec<chordia_contracts::discord_layout::ControlButton>,
     }
 
-    /// `GET /v1/mgmt/discord/layouts/schema`: for the editor's autocomplete.
+    /// `GET /v1/mgmt/discord/bots/{app_id}/layouts/schema`: for the editor's autocomplete and its
+    /// reference list; the emojis carry the bot's live ids so the page can show the real icons.
     async fn layout_schema(
         State(state): State<AppState>,
         headers: HeaderMap,
+        Path(app_id): Path<String>,
     ) -> AppResult<Json<LayoutSchema>> {
         require_mgmt_auth(&headers, &state).await?;
+        let identity = find(&app_id)?;
         Ok(Json(LayoutSchema {
             variables: template::variables(),
-            emojis: template::emojis(),
+            emojis: template::emojis(&identity.icons()),
             controls: chordia_contracts::discord_layout::ControlButton::ALL.to_vec(),
         }))
     }

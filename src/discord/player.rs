@@ -314,6 +314,10 @@ pub struct PlayerSnapshot {
     pub bot_name: String,
     /// The bot's avatar on Discord's CDN, for layouts that show it.
     pub bot_avatar: Option<String>,
+    /// The bot's own user id, for `{bot.mention}`.
+    pub bot_user_id: Option<u64>,
+    /// The guild's name, for `{server}`.
+    pub guild_name: Option<String>,
     pub icons: Arc<IconSet>,
     /// The web client's origin when the library is paired to a Hub; views link into it.
     pub web_base: Option<String>,
@@ -885,6 +889,8 @@ impl GuildPlayer {
                 .as_ref()
                 .and_then(|i| i.profile())
                 .and_then(|p| p.avatar_url);
+            let bot_user_id = identity.as_ref().and_then(|i| i.user_id()).map(|u| u.get());
+            let guild_name = identity.as_ref().and_then(|i| i.guild_name(self.guild_id));
             let layouts = s.settings.layouts(
                 &identity
                     .as_ref()
@@ -899,6 +905,8 @@ impl GuildPlayer {
                 bot_index,
                 bot_name,
                 bot_avatar,
+                bot_user_id,
+                guild_name,
                 icons,
                 web_base,
                 guild_id: self.guild_id,
@@ -1705,6 +1713,8 @@ mod tests {
             bot_name: "Chordia".into(),
             icons: Arc::new(IconSet::default()),
             bot_avatar: None,
+            bot_user_id: None,
+            guild_name: None,
             web_base: None,
             guild_id: GuildId::new(1),
             voice_channel: None,
