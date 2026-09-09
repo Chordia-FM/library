@@ -378,6 +378,38 @@ pub struct Enqueued {
     pub count: usize,
 }
 
+impl PlayerSnapshot {
+    /// The bot's facts with no player at hand, for a reply outside any server: nothing plays,
+    /// nothing is queued, and the layouts are the bot's own.
+    pub async fn bare(identity: &Identity) -> PlayerSnapshot {
+        let settings = identity.settings();
+        PlayerSnapshot {
+            bot_index: identity.index,
+            bot_name: identity.display_name_sync(),
+            bot_avatar: identity.profile().and_then(|p| p.avatar_url),
+            bot_user_id: identity.user_id().map(|u| u.get()),
+            guild_name: None,
+            guild_icon: None,
+            icons: identity.icons(),
+            web_base: identity.web_base().await,
+            guild_id: GuildId::new(1),
+            voice_channel: None,
+            voice_channel_name: None,
+            current: None,
+            queue: Vec::new(),
+            history: Vec::new(),
+            loop_mode: LoopMode::Off,
+            autoplay: false,
+            shuffle: false,
+            volume: settings.default_volume,
+            muted: false,
+            normalize: true,
+            listeners: 0,
+            layouts: Arc::new(settings.layouts),
+        }
+    }
+}
+
 pub struct GuildPlayer {
     pub guild_id: GuildId,
     identity: Weak<Identity>,
@@ -1532,7 +1564,7 @@ impl GuildPlayer {
             return;
         };
         let msg = views::error(
-            &identity.icons(),
+            &self.snapshot().await,
             "Couldn't play a track",
             &format!(
                 "**{}** · {}\n-# {err}",

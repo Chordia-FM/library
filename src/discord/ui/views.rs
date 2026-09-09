@@ -334,6 +334,15 @@ struct Toast<'a> {
 enum Paging {
     Queue,
     History,
+    Lyrics,
+}
+
+/// Whether a layout has page buttons anywhere; without them there is no way past page one.
+fn has_pager(layout: &ViewLayout) -> bool {
+    layout
+        .flat()
+        .iter()
+        .any(|b| matches!(b, LayoutBlock::Pager))
 }
 
 /// One entry of a list message: its own variables, laid over the scene's.
@@ -360,6 +369,10 @@ struct Scene<'a> {
     artist_banner: Option<&'a Cover>,
     toast: Option<Toast<'a>>,
     reason: Option<&'static str>,
+    /// What a reply says under its title.
+    detail: Option<&'a str>,
+    /// The page of lyrics shown.
+    lyrics: Option<&'a str>,
     list: Vec<Entry>,
     /// The page shown (0-based, already clamped) and how many there are.
     page: usize,
@@ -382,6 +395,8 @@ impl<'a> Scene<'a> {
             artist_banner: None,
             toast: None,
             reason: None,
+            detail: None,
+            lyrics: None,
             list: Vec::new(),
             page: 0,
             pages: 1,
@@ -403,12 +418,25 @@ impl<'a> Scene<'a> {
             .unwrap_or(10)
             .clamp(MIN_PAGE, MAX_PAGE) as usize;
         self.pages = list.len().div_ceil(size).max(1);
-        let pager = layout
-            .flat()
-            .iter()
-            .any(|b| matches!(b, LayoutBlock::Pager));
+        let pager = has_pager(layout);
         self.page = if pager { page.min(self.pages - 1) } else { 0 };
         self.list = list;
+        self.paging = pager.then_some(paging);
+    }
+
+    /// Give the scene pages of text (lyrics) and the page asked for, as [`Scene::paged`] does
+    /// for entries.
+    fn paged_text(
+        &mut self,
+        pages: &'a [String],
+        page: usize,
+        layout: &ViewLayout,
+        paging: Paging,
+    ) {
+        self.pages = pages.len().max(1);
+        let pager = has_pager(layout);
+        self.page = if pager { page.min(self.pages - 1) } else { 0 };
+        self.lyrics = pages.get(self.page).map(String::as_str);
         self.paging = pager.then_some(paging);
     }
 
@@ -431,6 +459,7 @@ impl<'a> Scene<'a> {
             // the message
             "icon" => icons.get(self.icon).markup(),
             "heading" => self.heading.clone(),
+            "detail" => self.detail.unwrap_or("").to_string(),
             "emoji" => icons.get(Icon::by_name(arg?.trim())?).markup(),
             // the bot, the server, the channel
             "bot" | "bot.name" => fmt::escape_md(&snap.bot_name),
@@ -597,6 +626,8 @@ impl<'a> Scene<'a> {
             "added.source" => of_toast(&|t| t.source.map(fmt::escape_md).unwrap_or_default()),
             // why the bot left
             "left.reason" => self.reason.unwrap_or("").to_string(),
+            // lyrics
+            "lyrics" => self.lyrics.map(fmt::escape_md).unwrap_or_default(),
             // pages
             "page" => format!("{}/{}", self.page + 1, self.pages),
             "page.number" => (self.page + 1).to_string(),
@@ -845,6 +876,12 @@ fn paging_row(snap: &PlayerSnapshot, paging: Paging, page: usize, pages: usize) 
             Action::History(next),
             Action::HistoryLast,
         ),
+        Paging::Lyrics => (
+            Action::LyricsFirst,
+            Action::LyricsPage(back),
+            Action::LyricsPage(next),
+            Action::LyricsLast,
+        ),
     };
     row(vec![
         button(
@@ -968,21 +1005,24 @@ pub fn left(snap: &PlayerSnapshot, reason: LeaveReason) -> Message {
 
 // ---- toasts & lists --------------------------------------------------------------------------------
 
-/// Public confirmation after `/play`, laid out by the `queued` layout. `source` names an
-/// album/artist when several tracks were added; `cover` is the picture for what was added (the
-/// first track's art, or the artist's when the query was an artist) and `artist_art` the
-/// artist's picture when it was fetched.
+/// Public confirmation after `/play`, laid out by the `queued`, `queued_album` or
+/// `queued_artist` layout by what the query was. `source` names the album/artist when several
+/// tracks were added; `cover` is the picture for what was added (the first track's art, or the
+/// artist's when the query was an artist) and `artist_art` the artist's picture when it was
+/// fetched.
+#[allow(clippy::too_many_arguments)]
 pub fn queued(
     snap: &PlayerSnapshot,
     items: &[QueueItem],
     enq: &Enqueued,
+    kind: HitKind,
     source: Option<&str>,
     cover: Option<&Cover>,
     artist_art: Option<&Cover>,
     artist_banner: Option<&Cover>,
 ) -> Message {
     let Some(first) = items.first() else {
-        return notice(&snap.icons, "Nothing added", "No tracks matched.");
+        return notice(snap, "Nothing added", "No tracks matched.");
     };
     let web = snap.web_base.as_deref();
     let by = mention(first.requested_by);
@@ -995,30 +1035,36 @@ pub fn queued(
         .iter()
         .map(|i| i.track.duration_ms.max(0) as u64)
         .sum();
-    let (icon, heading, added, added_meta) = if enq.count > 1 {
-        let what = source
-            .map(|s| format!("**{}**", linked(s, web, s)))
-            .unwrap_or_else(|| fmt::count(enq.count, "track"));
-        let position = if enq.position == 0 {
-            "playing now".to_string()
-        } else {
-            format!("starting at #{}", enq.position)
-        };
-        (
-            Icon::Album,
-            format!("Added {}", fmt::count(enq.count, "track")),
-            what,
-            format!("{position} · {} · by {by}", fmt::duration(total_ms)),
-        )
-    } else if enq.position == 0 {
-        (
+    let (icon, heading, added, added_meta, layout) = match kind {
+        HitKind::Album | HitKind::Artist => {
+            let what = source
+                .map(|s| format!("**{}**", linked(s, web, s)))
+                .unwrap_or_else(|| fmt::count(enq.count, "track"));
+            let position = if enq.position == 0 {
+                "playing now".to_string()
+            } else {
+                format!("starting at #{}", enq.position)
+            };
+            let (icon, layout) = match kind {
+                HitKind::Artist => (Icon::Artist, &snap.layouts.queued_artist),
+                _ => (Icon::Album, &snap.layouts.queued_album),
+            };
+            (
+                icon,
+                format!("Added {}", fmt::count(enq.count, "track")),
+                what,
+                format!("{position} · {} · by {by}", fmt::duration(total_ms)),
+                layout,
+            )
+        }
+        HitKind::Track if enq.position == 0 => (
             Icon::Play,
             "Playing now".to_string(),
             track_block(&first.track, web, None),
             format!("by {by}"),
-        )
-    } else {
-        (
+            &snap.layouts.queued,
+        ),
+        HitKind::Track => (
             Icon::Note,
             "Added to queue".to_string(),
             track_block(&first.track, web, None),
@@ -1027,7 +1073,8 @@ pub fn queued(
                 enq.position,
                 fmt::duration(eta_ms)
             ),
-        )
+            &snap.layouts.queued,
+        ),
     };
     let mut scene = Scene::new(snap, icon, &heading, snap.icons.accent());
     scene.track = Some(&first.track);
@@ -1044,7 +1091,7 @@ pub fn queued(
         source,
         requested_by: first.requested_by,
     });
-    finish(&scene, &snap.layouts.queued, false)
+    finish(&scene, layout, false)
 }
 
 /// A list entry's track, under the same names a scene answers for its own.
@@ -1300,37 +1347,55 @@ pub fn search_results(
 
 // ---- status & feedback -----------------------------------------------------------------------------
 
-pub fn error(icons: &IconSet, title: &str, detail: &str) -> Message {
-    let mut body = header(&icons.get(Icon::Cross), title, None);
-    body.push(text(detail.to_string()));
-    Message::new(vec![container(accent::ERROR, body)]).ephemeral()
+/// Which reply layout an acknowledgement is laid out by.
+#[derive(Clone, Copy)]
+enum Reply {
+    Done,
+    Notice,
+    Error,
 }
 
-pub fn notice(icons: &IconSet, title: &str, detail: &str) -> Message {
-    let mut body = header(&icons.get(Icon::Warning), title, None);
-    body.push(text(detail.to_string()));
-    Message::new(vec![container(accent::NOTICE, body)]).ephemeral()
-}
-
-/// A short, positive acknowledgement ("Skipped **Title**"). With no detail it is the title line
-/// alone: a divider with nothing under it reads as a mistake.
-pub fn ok(icons: &IconSet, title: &str, detail: &str) -> Message {
-    let body = if detail.is_empty() {
-        vec![text(format!(
-            "### {} {title}",
-            icons.get(Icon::Check).markup()
-        ))]
-    } else {
-        let mut b = header(&icons.get(Icon::Check), title, None);
-        b.push(text(detail.to_string()));
-        b
+/// A reply to a command or a button: the title is `{heading}`, the rest `{detail}`, and what is
+/// playing (if anything) is there for the layout to mention.
+fn reply(snap: &PlayerSnapshot, kind: Reply, title: &str, detail: &str) -> Message {
+    let (icon, accent, layout) = match kind {
+        Reply::Done => (Icon::Check, snap.icons.accent(), &snap.layouts.done),
+        Reply::Notice => (Icon::Warning, accent::NOTICE, &snap.layouts.notice),
+        Reply::Error => (Icon::Cross, accent::ERROR, &snap.layouts.error),
     };
-    Message::new(vec![container(icons.accent(), body)]).ephemeral()
+    let mut scene = Scene::new(snap, icon, title, accent);
+    scene.detail = Some(detail);
+    if let Some(cur) = &snap.current {
+        scene.track = Some(&cur.item.track);
+        scene.links = cur.links.as_ref();
+        scene.cur = Some(cur);
+        scene.cover = cur.cover.as_ref();
+        scene.artist_art = cur.artist_art.as_ref();
+        scene.artist_banner = cur.artist_banner.as_ref();
+    }
+    finish(&scene, layout, false).ephemeral()
+}
+
+/// Something went wrong: red, laid out by the `error` layout.
+pub fn error(snap: &PlayerSnapshot, title: &str, detail: &str) -> Message {
+    reply(snap, Reply::Error, title, detail)
+}
+
+/// A heads-up rather than a failure: yellow, laid out by the `notice` layout.
+pub fn notice(snap: &PlayerSnapshot, title: &str, detail: &str) -> Message {
+    reply(snap, Reply::Notice, title, detail)
+}
+
+/// A short, positive acknowledgement ("Skipped **Title**"), laid out by the `done` layout. With
+/// no detail the default layout is the title line alone: a divider with nothing under it reads
+/// as a mistake.
+pub fn ok(snap: &PlayerSnapshot, title: &str, detail: &str) -> Message {
+    reply(snap, Reply::Done, title, detail)
 }
 
 /// The bot is busy in another channel of this guild; name the siblings that are free.
 pub fn busy(
-    icons: &IconSet,
+    snap: &PlayerSnapshot,
     bot_name: &str,
     channel: serenity::all::ChannelId,
     listeners: usize,
@@ -1356,7 +1421,7 @@ pub fn busy(
                 .join(", ")
         )),
     }
-    notice(icons, "Already playing elsewhere", &detail)
+    notice(snap, "Already playing elsewhere", &detail)
 }
 
 /// This server's settings for the bot: a summary, a DJ-role picker and toggle buttons. Every
@@ -1447,53 +1512,24 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
     Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
-/// One page of lyrics, with paging when there is more than one.
-pub fn lyrics(
-    snap: &PlayerSnapshot,
-    title: &str,
-    artist: &str,
-    pages: &[String],
-    page: usize,
-) -> Message {
-    let icons = &snap.icons;
-    let last = pages.len().saturating_sub(1);
-    let page = page.min(last);
-    let mut body = header(
-        &icons.get(Icon::Lyrics),
-        &fmt::escape_md(title),
-        Some(&fmt::escape_md(artist)),
-    );
-    match pages.get(page) {
-        Some(p) => body.push(text(fmt::escape_md(p))),
-        None => body.push(text(small("No lyrics in this file's tags."))),
+/// One page of a track's lyrics, laid out by the `lyrics` layout; its page buttons turn the
+/// pages. The cover and the file facts are there when the track is the one playing.
+pub fn lyrics(snap: &PlayerSnapshot, track: &TrackRow, pages: &[String], page: usize) -> Message {
+    let mut scene = Scene::new(snap, Icon::Lyrics, "Lyrics", snap.icons.accent());
+    scene.track = Some(track);
+    if let Some(cur) = snap
+        .current
+        .as_ref()
+        .filter(|c| c.item.track.id == track.id)
+    {
+        scene.links = cur.links.as_ref();
+        scene.cur = Some(cur);
+        scene.cover = cur.cover.as_ref();
+        scene.artist_art = cur.artist_art.as_ref();
+        scene.artist_banner = cur.artist_banner.as_ref();
     }
-    if pages.len() > 1 {
-        body.push(separator(false, Spacing::Large));
-        body.push(row(vec![
-            button(
-                Button::new(
-                    ButtonStyle::Secondary,
-                    id(snap, Action::LyricsPage(page.saturating_sub(1) as u32)),
-                )
-                .emoji(icons.get(Icon::PageBack))
-                .disabled(page == 0),
-            ),
-            button(
-                Button::new(ButtonStyle::Secondary, id(snap, Action::Refresh))
-                    .label(format!("{}/{}", page + 1, pages.len()))
-                    .disabled(true),
-            ),
-            button(
-                Button::new(
-                    ButtonStyle::Secondary,
-                    id(snap, Action::LyricsPage((page + 1).min(last) as u32)),
-                )
-                .emoji(icons.get(Icon::PageNext))
-                .disabled(page >= last),
-            ),
-        ]));
-    }
-    Message::new(vec![container(icons.accent(), body)]).ephemeral()
+    scene.paged_text(pages, page, &snap.layouts.lyrics, Paging::Lyrics);
+    finish(&scene, &snap.layouts.lyrics, false).ephemeral()
 }
 
 /// A minimal replacement for a picker that was dismissed.
@@ -1674,6 +1710,7 @@ mod tests {
                     position: 4,
                     count: 1,
                 },
+                HitKind::Track,
                 None,
                 Some(&c),
                 None,
@@ -1686,6 +1723,7 @@ mod tests {
                     position: 0,
                     count: 1,
                 },
+                HitKind::Track,
                 None,
                 None,
                 None,
@@ -1698,6 +1736,7 @@ mod tests {
                     position: 0,
                     count: 23,
                 },
+                HitKind::Album,
                 Some("Discovery"),
                 Some(&c),
                 Some(&c),
@@ -1709,18 +1748,12 @@ mod tests {
             history(&s, &[], 0),
             history(&s, &plays(25), 1),
             history(&s, &plays(25), 99),
-            error(&icons, "Couldn't do that", "reason"),
-            notice(&icons, "Heads up", "detail"),
-            ok(&icons, "Skipped", "**x**"),
-            ok(&icons, "Left", ""),
-            busy(
-                &icons,
-                "Chordia",
-                ChannelId::new(555),
-                3,
-                &["Chordia 2".into()],
-            ),
-            busy(&icons, "Chordia", ChannelId::new(555), 3, &[]),
+            error(&s, "Couldn't do that", "reason"),
+            notice(&s, "Heads up", "detail"),
+            ok(&s, "Skipped", "**x**"),
+            ok(&s, "Left", ""),
+            busy(&s, "Chordia", ChannelId::new(555), 3, &["Chordia 2".into()]),
+            busy(&s, "Chordia", ChannelId::new(555), 3, &[]),
             cancelled(),
             bots(
                 &icons,
@@ -1896,18 +1929,18 @@ mod tests {
         let q = queue_page(&s, 0).body();
         assert_eq!(q["components"][0]["accent_color"], 0xE6_74_51);
         // Errors stay red whatever the theme.
-        let e = error(&s.icons, "x", "y").body();
+        let e = error(&s, "x", "y").body();
         assert_eq!(e["components"][0]["accent_color"], accent::ERROR);
     }
 
     #[test]
     fn a_bare_acknowledgement_has_no_dangling_divider() {
-        let icons = IconSet::default();
-        let b = ok(&icons, "Left", "").body();
+        let s = snap(0, false, false);
+        let b = ok(&s, "Left", "").body();
         let kids = b["components"][0]["components"].as_array().unwrap();
         assert_eq!(kids.len(), 1);
         assert_eq!(kids[0]["type"], 10);
-        let b = ok(&icons, "Skipped", "**x**").body();
+        let b = ok(&s, "Skipped", "**x**").body();
         assert_eq!(
             b["components"][0]["components"].as_array().unwrap().len(),
             3
@@ -2248,9 +2281,111 @@ mod tests {
             6
         );
         let pages: Vec<String> = vec!["la la".into(), "da da".into()];
-        lyrics(&s, "Song", "Band", &pages, 0).validate().unwrap();
-        lyrics(&s, "Song", "Band", &pages, 9).validate().unwrap();
-        lyrics(&s, "Song", "Band", &[], 0).validate().unwrap();
+        let t = track("c", "Song");
+        lyrics(&s, &t, &pages, 0).validate().unwrap();
+        lyrics(&s, &t, &pages, 9).validate().unwrap();
+        lyrics(&s, &t, &[], 0).validate().unwrap();
+    }
+
+    #[test]
+    fn lyrics_page_through_their_own_layout() {
+        let s = snap(0, true, false);
+        let t = track("c", "One More Time");
+        let pages: Vec<String> = vec!["one".into(), "two".into(), "three".into()];
+        let m = lyrics(&s, &t, &pages, 1);
+        m.validate().unwrap();
+        let k = kids(&m);
+        let head = k[0]["content"].as_str().unwrap();
+        assert!(head.ends_with(" One More Time\n-# Daft Punk"), "{head}");
+        assert_eq!(k[2]["content"], "two");
+        let nav = k.last().unwrap()["components"].as_array().unwrap();
+        assert_eq!(nav[0]["custom_id"], "cd:1:1:777:lyf");
+        assert_eq!(nav[1]["custom_id"], "cd:1:1:777:lyp:0");
+        assert_eq!(nav[2]["label"], "2/3");
+        assert_eq!(nav[3]["custom_id"], "cd:1:1:777:lyp:2");
+        assert_eq!(nav[4]["custom_id"], "cd:1:1:777:lyl");
+        // The playing track's cover is there for a layout that shows it; another track's is not.
+        let mut s = snap(0, true, true);
+        s.layouts = Arc::new(BotLayouts {
+            lyrics: ViewLayout {
+                blocks: vec![LayoutBlock::Section {
+                    texts: vec!["{lyrics}".into()],
+                    accessory: Accessory::Image {
+                        source: ImageSource::Cover,
+                    },
+                }],
+            },
+            ..Default::default()
+        });
+        assert!(lyrics(&s, &t, &pages, 0)
+            .body()
+            .to_string()
+            .contains("cover-c.jpg"));
+        assert!(!lyrics(&s, &track("d", "Other"), &pages, 0)
+            .body()
+            .to_string()
+            .contains("cover-c.jpg"));
+    }
+
+    #[test]
+    fn replies_and_toasts_use_their_own_layouts() {
+        let mut s = snap(3, true, false);
+        // A reply laid out without a container: its text is top-level, and the title, the
+        // detail and the player's facts come through as variables.
+        s.layouts = Arc::new(BotLayouts {
+            done: ViewLayout {
+                blocks: vec![LayoutBlock::Text {
+                    content: "{heading} · {detail} · {player.volume}%".into(),
+                }],
+            },
+            ..Default::default()
+        });
+        let b = ok(&s, "Volume", "80").body();
+        assert_eq!(b["components"][0]["type"], 10);
+        assert_eq!(b["components"][0]["content"], "Volume · 80 · 80%");
+        // Errors keep their colour through a container in "the bot's colour".
+        let e = error(&s, "x", "y").body();
+        assert_eq!(e["components"][0]["accent_color"], accent::ERROR);
+        // An artist add takes the artist layout, an album add the album layout.
+        s.layouts = Arc::new(BotLayouts {
+            queued_artist: ViewLayout {
+                blocks: vec![LayoutBlock::Text {
+                    content: "artist: {added} ({added.count})".into(),
+                }],
+            },
+            ..Default::default()
+        });
+        let items: Vec<QueueItem> = (0..3)
+            .map(|i| item(&i.to_string(), &format!("T{i}")))
+            .collect();
+        let enq = Enqueued {
+            position: 1,
+            count: 3,
+        };
+        let m = queued(
+            &s,
+            &items,
+            &enq,
+            HitKind::Artist,
+            Some("Daft Punk"),
+            None,
+            None,
+            None,
+        )
+        .body();
+        assert_eq!(m["components"][0]["content"], "artist: **Daft Punk** (3)");
+        let m = queued(
+            &s,
+            &items,
+            &enq,
+            HitKind::Album,
+            Some("Discovery"),
+            None,
+            None,
+            None,
+        )
+        .body();
+        assert_eq!(m["components"][0]["type"], 17);
     }
 
     #[test]
@@ -2265,8 +2400,8 @@ mod tests {
             history(&s, &plays(25), 0),
             history(&s, &plays(25), 2),
             settings(&s, &GuildSettings::defaults("1", "777")),
-            lyrics(&s, "t", "a", &pages, 0),
-            lyrics(&s, "t", "a", &pages, 2),
+            lyrics(&s, &track("c", "t"), &pages, 0),
+            lyrics(&s, &track("c", "t"), &pages, 2),
         ] {
             let ids = custom_ids(&m);
             let mut dedup = ids.clone();
@@ -2381,7 +2516,6 @@ mod tests {
     #[test]
     fn titles_are_markdown_escaped_and_nothing_uses_dashes() {
         let s = snap(0, true, false);
-        let icons = IconSet::default();
         let it = vec![item("x", "F**K # 1")];
         let m = queued(
             &s,
@@ -2390,6 +2524,7 @@ mod tests {
                 position: 1,
                 count: 1,
             },
+            HitKind::Track,
             None,
             None,
             None,
@@ -2401,7 +2536,7 @@ mod tests {
             queue_page(&s, 0),
             history(&s, &plays(3), 0),
             left(&s, LeaveReason::Alone),
-            busy(&icons, "A", ChannelId::new(1), 1, &["C".into()]),
+            busy(&s, "A", ChannelId::new(1), 1, &["C".into()]),
             idle(&s),
         ] {
             assert!(!m.body().to_string().contains('—'), "{}", m.body());

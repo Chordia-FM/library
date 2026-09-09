@@ -38,7 +38,6 @@ pub async fn handle(
     if cid.bot != identity.index || ic.guild_id != Some(guild) {
         return send::component_ack(http, ic).await;
     }
-    let icons = identity.icons();
     let user = ic.user.id;
     let token = ic.token.as_str();
 
@@ -69,17 +68,23 @@ pub async fn handle(
             if let Err(r) =
                 guard::controller_for(identity, &player, guild, user, ic.member.as_ref()).await
             {
-                return send::interaction_followup(http, token, r.view(&icons)).await;
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
             }
             if matches!(cid.action, Action::AutoplayToggle)
                 && !player.snapshot().await.autoplay
                 && !player.settings().await.can_autoplay
             {
                 let r = guard::Refusal::NotAllowed("autoplay");
-                return send::interaction_followup(http, token, r.view(&icons)).await;
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
             }
             if let Err(e) = controlled_action(&cid.action, &player).await {
-                let err = views::error(&icons, "Couldn't do that", &format!("-# {e}"));
+                let err = views::error(
+                    &player.snapshot().await,
+                    "Couldn't do that",
+                    &format!("-# {e}"),
+                );
                 send::interaction_followup(http, token, err).await?;
             }
             Ok(())
@@ -123,7 +128,8 @@ pub async fn handle(
         Action::Cancel => send::interaction_edit(http, token, views::cancelled()).await,
         Action::Select(ref ctx_name) if ctx_name == "dj" => {
             if let Err(r) = guard::admin_for(identity, user, ic.member.as_ref()) {
-                return send::interaction_followup(http, token, r.view(&icons)).await;
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
             }
             let roles: Vec<String> = match &ic.data.kind {
                 ComponentInteractionDataKind::RoleSelect { values } => {
@@ -151,7 +157,10 @@ pub async fn handle(
             };
             let (vc, player) = match guard::listener_for(identity, guild, user).await {
                 Ok(x) => x,
-                Err(r) => return send::interaction_edit(http, token, r.view(&icons)).await,
+                Err(r) => {
+                    return send::interaction_edit(http, token, r.view(&player.snapshot().await))
+                        .await
+                }
             };
             let resolved = resolve(
                 &identity.state.db,
@@ -163,7 +172,11 @@ pub async fn handle(
                 return send::interaction_edit(
                     http,
                     token,
-                    views::notice(&icons, "Gone", "-# That track is no longer in the library."),
+                    views::notice(
+                        &player.snapshot().await,
+                        "Gone",
+                        "-# That track is no longer in the library.",
+                    ),
                 )
                 .await;
             }
@@ -172,7 +185,11 @@ pub async fn handle(
                     return send::interaction_edit(
                         http,
                         token,
-                        views::error(&icons, "Couldn't join", &format!("-# {e}")),
+                        views::error(
+                            &player.snapshot().await,
+                            "Couldn't join",
+                            &format!("-# {e}"),
+                        ),
                     )
                     .await;
                 }
@@ -199,6 +216,7 @@ pub async fn handle(
                         &snap,
                         &items,
                         &enq,
+                        resolved.kind,
                         resolved.source.as_deref(),
                         cover.as_ref(),
                         art.image.as_ref(),
@@ -211,15 +229,20 @@ pub async fn handle(
                     send::interaction_edit(
                         http,
                         token,
-                        views::error(&icons, "Couldn't queue that", &format!("-# {e}")),
+                        views::error(
+                            &player.snapshot().await,
+                            "Couldn't queue that",
+                            &format!("-# {e}"),
+                        ),
                     )
                     .await
                 }
             }
         }
-        Action::Lyrics | Action::LyricsPage(_) => {
+        Action::Lyrics | Action::LyricsPage(_) | Action::LyricsFirst | Action::LyricsLast => {
             let page = match cid.action {
                 Action::LyricsPage(p) => p as usize,
+                Action::LyricsLast => usize::MAX,
                 _ => 0,
             };
             let snap = player.snapshot().await;
@@ -228,7 +251,7 @@ pub async fn handle(
                     http,
                     token,
                     views::notice(
-                        &icons,
+                        &snap,
                         "Nothing playing",
                         "-# Lyrics follow the current track.",
                     ),
@@ -245,16 +268,20 @@ pub async fn handle(
                 &crate::discord::lyrics::lines(&raw),
                 crate::discord::lyrics::PAGE_CHARS,
             );
-            send::interaction_edit(
-                http,
-                token,
-                views::lyrics(&snap, &track.title, &track.artist, &pages, page),
-            )
-            .await
+            if pages.is_empty() {
+                return send::interaction_edit(
+                    http,
+                    token,
+                    views::notice(&snap, "No lyrics", "-# This file's tags hold none."),
+                )
+                .await;
+            }
+            send::interaction_edit(http, token, views::lyrics(&snap, track, &pages, page)).await
         }
         Action::Setting(name) => {
             if let Err(r) = guard::admin_for(identity, user, ic.member.as_ref()) {
-                return send::interaction_followup(http, token, r.view(&icons)).await;
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
             }
             let voice = player.voice_channel().await;
             let gs = player.settings().await;
@@ -265,7 +292,8 @@ pub async fn handle(
             };
             if let Some(what) = blocked {
                 let r = guard::Refusal::NotAllowed(what);
-                return send::interaction_followup(http, token, r.view(&icons)).await;
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
             }
             player
                 .update_settings(|s| match name.as_str() {

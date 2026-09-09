@@ -16,8 +16,8 @@
 use serde::Serialize;
 
 use chordia_contracts::discord_layout::{
-    BotLayouts, ContainerAccent, LayoutBlock, LayoutOverrides, LayoutView, SeparatorSpacing,
-    ViewLayout, LAYOUT_VERSION,
+    default_queued, BotLayouts, ContainerAccent, LayoutBlock, LayoutOverrides, LayoutView,
+    SeparatorSpacing, ViewLayout, LAYOUT_VERSION,
 };
 
 use crate::discord::emoji::{Icon, IconSet};
@@ -45,11 +45,24 @@ pub struct ArgInfo {
 }
 
 const ANY: &[&str] = &[];
-const TRACK: &[&str] = &["now_playing", "queued", "item"];
-const PLAYING: &[&str] = &["now_playing"];
-const QUEUED: &[&str] = &["queued"];
+const TRACK: &[&str] = &[
+    "now_playing",
+    "queued",
+    "queued_album",
+    "queued_artist",
+    "lyrics",
+    "done",
+    "notice",
+    "error",
+    "item",
+];
+/// Where the file facts and the player line apply: wherever a track can be playing.
+const PLAYING: &[&str] = &["now_playing", "lyrics", "done", "notice", "error"];
+const QUEUED: &[&str] = &["queued", "queued_album", "queued_artist"];
 const ITEM: &[&str] = &["item"];
-const PAGED: &[&str] = &["queue", "history"];
+const PAGED: &[&str] = &["queue", "history", "lyrics"];
+const REPLY: &[&str] = &["done", "notice", "error"];
+const LYRICS: &[&str] = &["lyrics"];
 const BAR: Option<ArgInfo> = Some(ArgInfo {
     label: "segments",
     min: 4,
@@ -85,6 +98,12 @@ pub fn variables() -> Vec<VariableInfo> {
             "heading",
             "This message's title, e.g. Now playing, Added to queue",
             ANY,
+            None,
+        ),
+        v(
+            "detail",
+            "What the reply says under its title, when anything",
+            REPLY,
             None,
         ),
         v(
@@ -285,6 +304,8 @@ pub fn variables() -> Vec<VariableInfo> {
         ),
         // why the bot left
         v("left.reason", "Why the bot left", &["left"], None),
+        // lyrics
+        v("lyrics", "This page of the lyrics", LYRICS, None),
         // list entries
         v("index", "The entry's number in the list", ITEM, None),
         v("eta", "How long until the entry plays", ITEM, None),
@@ -596,6 +617,12 @@ pub fn upgrade(layouts: &mut BotLayouts) {
     for view in LayoutView::ALL {
         upgrade_view(view, layouts.view_mut(view), from);
     }
+    // Before 5 one toast served tracks, albums and artists; a toast someone shaped carries over
+    // to the two new ones, so every add still looks as it did.
+    if from < 5 && layouts.queued != default_queued() {
+        layouts.queued_album = layouts.queued.clone();
+        layouts.queued_artist = layouts.queued.clone();
+    }
     layouts.version = LAYOUT_VERSION;
 }
 
@@ -615,6 +642,12 @@ pub fn upgrade_overrides(overrides: &mut LayoutOverrides) {
     ] {
         if let Some(l) = slot {
             upgrade_view(view, l, from);
+        }
+    }
+    if from < 5 {
+        if let Some(q) = overrides.queued.clone() {
+            overrides.queued_album.get_or_insert_with(|| q.clone());
+            overrides.queued_artist.get_or_insert(q);
         }
     }
     overrides.version = LAYOUT_VERSION;
@@ -818,6 +851,46 @@ mod tests {
         let kinds: Vec<&str> = blocks.iter().map(|b| b.kind()).collect();
         assert_eq!(kinds, ["list", "separator", "pager"]);
         o.validate().unwrap();
+    }
+
+    #[test]
+    fn a_shaped_toast_carries_over_to_albums_and_artists() {
+        let shaped = ViewLayout {
+            blocks: vec![LayoutBlock::Text {
+                content: "{added}".into(),
+            }],
+        };
+        let mut l = BotLayouts {
+            version: 4,
+            queued: shaped.clone(),
+            ..Default::default()
+        };
+        upgrade(&mut l);
+        assert_eq!(l.queued_album, shaped);
+        assert_eq!(l.queued_artist, shaped);
+        // A toast left at its default leaves the new ones at theirs.
+        let mut l = BotLayouts {
+            version: 4,
+            ..Default::default()
+        };
+        upgrade(&mut l);
+        assert_eq!(l, BotLayouts::default());
+        // A server's own toast carries over too, but never over a version it already has.
+        let own = ViewLayout {
+            blocks: vec![LayoutBlock::Text {
+                content: "{bot}".into(),
+            }],
+        };
+        let mut o = LayoutOverrides {
+            version: 4,
+            queued: Some(shaped.clone()),
+            queued_artist: Some(own.clone()),
+            ..Default::default()
+        };
+        upgrade_overrides(&mut o);
+        assert_eq!(o.queued_album, Some(shaped));
+        assert_eq!(o.queued_artist, Some(own));
+        assert_eq!(o.version, LAYOUT_VERSION);
     }
 
     #[test]

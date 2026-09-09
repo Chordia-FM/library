@@ -19,9 +19,8 @@ use std::sync::Arc;
 use serenity::all::{ChannelId, GuildId, Member, Permissions, RoleId, UserId};
 
 use super::Context;
-use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
-use crate::discord::player::GuildPlayer;
+use crate::discord::player::{GuildPlayer, PlayerSnapshot};
 use crate::discord::ui::{views, Message};
 
 #[derive(Debug)]
@@ -44,10 +43,11 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    pub fn view(&self, icons: &IconSet) -> Message {
+    /// The refusal as a reply, laid out by the server's notice / error layout.
+    pub fn view(&self, snap: &PlayerSnapshot) -> Message {
         match self {
             Refusal::NotInVoice => views::notice(
-                icons,
+                snap,
                 "Join a voice channel first",
                 "-# I play where you are. Hop into a voice channel and try again.",
             ),
@@ -56,7 +56,7 @@ impl Refusal {
                 channel,
                 listeners,
                 free,
-            } => views::busy(icons, bot_name, *channel, *listeners, free),
+            } => views::busy(snap, bot_name, *channel, *listeners, free),
             Refusal::NeedDj { roles } => {
                 let who = if roles.is_empty() {
                     "a DJ".to_string()
@@ -68,7 +68,7 @@ impl Refusal {
                         .join(", ")
                 };
                 views::notice(
-                    icons,
+                    snap,
                     "That's a DJ control",
                     &format!(
                         "Only {who} (or someone who manages the server) can change what everyone hears while others are listening.\n-# Alone in the channel? Then it's all yours."
@@ -76,17 +76,17 @@ impl Refusal {
                 )
             }
             Refusal::NeedAdmin => views::notice(
-                icons,
+                snap,
                 "That's a server setting",
                 "-# Someone with **Manage Server** (or a bot owner) can change it.",
             ),
             Refusal::NotAllowed(what) => views::notice(
-                icons,
+                snap,
                 "Not enabled here",
                 &format!("-# The library owner hasn't enabled {what} for this server."),
             ),
             Refusal::Offline => views::error(
-                icons,
+                snap,
                 "Not connected",
                 "-# This bot is reconnecting to Discord. Try again in a moment.",
             ),

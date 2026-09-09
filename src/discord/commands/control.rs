@@ -16,7 +16,7 @@ async fn controlled(ctx: Context<'_>) -> Result<Option<Arc<GuildPlayer>>, Error>
         send::respond(
             ctx,
             views::notice(
-                &super::icons(ctx),
+                &super::snap(ctx).await,
                 "Nothing is playing",
                 "-# `/play` something first.",
             ),
@@ -25,7 +25,7 @@ async fn controlled(ctx: Context<'_>) -> Result<Option<Arc<GuildPlayer>>, Error>
         return Ok(None);
     };
     if let Err(r) = guard::controller(ctx, &player).await {
-        send::respond(ctx, r.view(&super::icons(ctx))).await?;
+        send::respond(ctx, r.view(&super::snap(ctx).await)).await?;
         return Ok(None);
     }
     Ok(Some(player))
@@ -42,7 +42,7 @@ fn track_line(item: &crate::discord::player::QueueItem) -> String {
 async fn player_error(ctx: Context<'_>, title: &str, e: PlayerError) -> Result<(), Error> {
     send::respond(
         ctx,
-        views::error(&super::icons(ctx), title, &format!("-# {e}")),
+        views::error(&super::snap(ctx).await, title, &format!("-# {e}")),
     )
     .await
 }
@@ -58,7 +58,7 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
         Ok(item) => {
             send::respond(
                 ctx,
-                views::ok(&super::icons(ctx), "Skipped", &track_line(&item)),
+                views::ok(&super::snap(ctx).await, "Skipped", &track_line(&item)),
             )
             .await
         }
@@ -77,7 +77,7 @@ pub async fn back(ctx: Context<'_>) -> Result<(), Error> {
         Ok(item) => {
             send::respond(
                 ctx,
-                views::ok(&super::icons(ctx), "Going back to", &track_line(&item)),
+                views::ok(&super::snap(ctx).await, "Going back to", &track_line(&item)),
             )
             .await
         }
@@ -93,7 +93,7 @@ pub async fn pause(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     match player.pause().await {
-        Ok(()) => send::respond(ctx, views::ok(&super::icons(ctx), "Paused", "")).await,
+        Ok(()) => send::respond(ctx, views::ok(&super::snap(ctx).await, "Paused", "")).await,
         Err(e) => player_error(ctx, "Couldn't pause", e).await,
     }
 }
@@ -106,7 +106,7 @@ pub async fn resume(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     match player.resume().await {
-        Ok(()) => send::respond(ctx, views::ok(&super::icons(ctx), "Resumed", "")).await,
+        Ok(()) => send::respond(ctx, views::ok(&super::snap(ctx).await, "Resumed", "")).await,
         Err(e) => player_error(ctx, "Couldn't resume", e).await,
     }
 }
@@ -123,7 +123,7 @@ pub async fn stop(ctx: Context<'_>) -> Result<(), Error> {
             send::respond(
                 ctx,
                 views::ok(
-                    &super::icons(ctx),
+                    &super::snap(ctx).await,
                     "Stopped",
                     "-# Queue cleared. I'll stay in the channel for a bit.",
                 ),
@@ -170,7 +170,7 @@ pub async fn seek(
         return send::respond(
             ctx,
             views::error(
-                &super::icons(ctx),
+                &super::snap(ctx).await,
                 "That's not a time",
                 "-# Try `1:23`, `90`, `+30` or `-30`.",
             ),
@@ -182,7 +182,7 @@ pub async fn seek(
             send::respond(
                 ctx,
                 views::ok(
-                    &super::icons(ctx),
+                    &super::snap(ctx).await,
                     "Seeked",
                     &format!("-# now at {}", fmt::duration(got.as_millis() as u64)),
                 ),
@@ -211,7 +211,7 @@ pub async fn volume(
             send::respond(
                 ctx,
                 views::ok(
-                    &super::icons(ctx),
+                    &super::snap(ctx).await,
                     "Volume",
                     &format!("{} {v}%", fmt::glyph::VOLUME),
                 ),
@@ -250,7 +250,11 @@ pub async fn loop_mode(
     let set = player.set_loop(mode).await;
     send::respond(
         ctx,
-        views::ok(&super::icons(ctx), "Loop", &format!("-# {}", set.label())),
+        views::ok(
+            &super::snap(ctx).await,
+            "Loop",
+            &format!("-# {}", set.label()),
+        ),
     )
     .await
 }
@@ -261,13 +265,17 @@ pub async fn join(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     let (vc, player) = match guard::listener(ctx).await {
         Ok(x) => x,
-        Err(r) => return send::respond(ctx, r.view(&super::icons(ctx))).await,
+        Err(r) => return send::respond(ctx, r.view(&super::snap(ctx).await)).await,
     };
     match player.join(vc, ctx.channel_id()).await {
         Ok(()) => {
             send::respond(
                 ctx,
-                views::ok(&super::icons(ctx), "Joined", &format!("-# <#{}>", vc.get())),
+                views::ok(
+                    &super::snap(ctx).await,
+                    "Joined",
+                    &format!("-# <#{}>", vc.get()),
+                ),
             )
             .await
         }
@@ -283,7 +291,7 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
         return Ok(());
     };
     player.leave(LeaveReason::Command).await;
-    send::respond(ctx, views::ok(&super::icons(ctx), "Left", "")).await
+    send::respond(ctx, views::ok(&super::snap(ctx).await, "Left", "")).await
 }
 
 /// Keep the music going with similar tracks when the queue runs out
@@ -295,13 +303,13 @@ pub async fn radio(ctx: Context<'_>, #[description = "On or off"] on: bool) -> R
     };
     if on && !player.settings().await.can_autoplay {
         let r = super::guard::Refusal::NotAllowed("autoplay");
-        return send::respond(ctx, r.view(&super::icons(ctx))).await;
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
     }
     let on = player.set_autoplay(on).await;
     send::respond(
         ctx,
         views::ok(
-            &super::icons(ctx),
+            &super::snap(ctx).await,
             "Autoplay",
             &format!(
                 "-# {}",

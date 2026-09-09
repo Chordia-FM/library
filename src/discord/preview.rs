@@ -22,13 +22,15 @@ use crate::catalog::{self, TrackRow, TRACK_COLS_NO_LIB, TRACK_JOINS};
 use crate::discord::emoji::DEFAULT_HEX;
 use crate::discord::hub;
 use crate::discord::identity::Identity;
+use crate::discord::lyrics;
 use crate::discord::player::{
     Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem,
 };
 use crate::discord::settings::{self, PlayEntry};
 use crate::discord::source::TrackFacts;
-use crate::discord::ui::views;
+use crate::discord::ui::{fmt, views};
 use crate::http::AppState;
+use crate::search::HitKind;
 
 #[derive(Debug, Serialize)]
 pub struct Preview {
@@ -236,6 +238,14 @@ async fn sample(identity: &Identity, hex: &str) -> anyhow::Result<Sample> {
     })
 }
 
+/// Two pages of lyrics for a file that has none, so the pager has something to turn.
+fn stand_in_lyrics() -> Vec<String> {
+    vec![
+        "Verse one goes here, a line at a time,\nthe way the tags in the file keep it.\n\nA chorus follows when there is one,\nand a page turns when it runs long.".to_string(),
+        "The second page picks up the song;\nthe first and last buttons jump the ends.\n\n-# Real lyrics come from the file's own tags.".to_string(),
+    ]
+}
+
 /// Render `view` with `layout` in place of the bot's saved one, over the sample scene.
 pub async fn render(
     identity: &Identity,
@@ -329,10 +339,69 @@ pub async fn render(
                 position: 3,
                 count: 1,
             },
+            HitKind::Track,
             None,
             sample.cover.as_ref(),
             sample.artist_art.as_ref(),
             sample.artist_banner.as_ref(),
+        ),
+        // The whole sample as an album (its tracks are the current one's album, padded), and
+        // again as the artist's tracks, with their picture for the cover as `/play` would.
+        LayoutView::QueuedAlbum => views::queued(
+            &snap,
+            &queue,
+            &Enqueued {
+                position: 3,
+                count: queue.len(),
+            },
+            HitKind::Album,
+            current.album.as_deref(),
+            sample.cover.as_ref(),
+            sample.artist_art.as_ref(),
+            sample.artist_banner.as_ref(),
+        ),
+        LayoutView::QueuedArtist => views::queued(
+            &snap,
+            &queue,
+            &Enqueued {
+                position: 3,
+                count: queue.len(),
+            },
+            HitKind::Artist,
+            Some(&current.artist),
+            sample.artist_art.as_ref().or(sample.cover.as_ref()),
+            sample.artist_art.as_ref(),
+            sample.artist_banner.as_ref(),
+        ),
+        LayoutView::Lyrics => {
+            // The track's own lyrics when the file has them; else two pages of stand-in.
+            let raw = catalog::get_track_lyrics(&identity.state.db, &current.id)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let mut pages = lyrics::pages(&lyrics::lines(&raw), lyrics::PAGE_CHARS);
+            if pages.is_empty() {
+                pages = stand_in_lyrics();
+            }
+            views::lyrics(&snap, current, &pages, 0)
+        }
+        LayoutView::Done => views::ok(
+            &snap,
+            "Skipped",
+            &format!(
+                "**{}** · {}",
+                fmt::escape_md(&current.title),
+                fmt::escape_md(&current.artist)
+            ),
+        ),
+        LayoutView::Notice => {
+            views::notice(&snap, "Nothing is playing", "-# `/play` something first.")
+        }
+        LayoutView::Error => views::error(
+            &snap,
+            "Couldn't join",
+            "-# I'm not allowed to connect to that channel.",
         ),
         LayoutView::Queue => views::queue_page(&snap, 0),
         LayoutView::History => {

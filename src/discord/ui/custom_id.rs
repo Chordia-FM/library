@@ -50,6 +50,9 @@ pub enum Action {
     Lyrics,
     /// Show a lyrics page (0-based) in place.
     LyricsPage(u32),
+    /// Jump to the first / last lyrics page; separate so the edge buttons never repeat an id.
+    LyricsFirst,
+    LyricsLast,
     AutoplayToggle,
     /// A select menu; the arg names which picker it belongs to (`search`, `album`, `artist`, …).
     Select(String),
@@ -89,6 +92,8 @@ impl Action {
             Action::Refresh => "np".into(),
             Action::Lyrics => "ly".into(),
             Action::LyricsPage(p) => format!("lyp:{p}"),
+            Action::LyricsFirst => "lyf".into(),
+            Action::LyricsLast => "lyl".into(),
             Action::AutoplayToggle => "ap".into(),
             Action::Select(ctx) => format!("sel:{ctx}"),
             Action::Confirm(n) => format!("cf:{n}"),
@@ -124,6 +129,8 @@ impl Action {
             ("np", None) => Action::Refresh,
             ("ly", None) => Action::Lyrics,
             ("lyp", Some(p)) => Action::LyricsPage(p.parse().ok()?),
+            ("lyf", None) => Action::LyricsFirst,
+            ("lyl", None) => Action::LyricsLast,
             ("ap", None) => Action::AutoplayToggle,
             ("sel", Some(c)) => Action::Select(c.to_string()),
             ("cf", Some(n)) => Action::Confirm(n.to_string()),
@@ -203,6 +210,8 @@ mod tests {
             Action::Refresh,
             Action::Lyrics,
             Action::LyricsPage(2),
+            Action::LyricsFirst,
+            Action::LyricsLast,
             Action::AutoplayToggle,
             Action::Select("search".into()),
             Action::Confirm("ab12".into()),

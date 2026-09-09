@@ -17,6 +17,7 @@ use serenity::all::GuildId;
 
 use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
+use crate::discord::player::PlayerSnapshot;
 use crate::discord::ui::{send, views};
 
 pub type Data = Arc<Identity>;
@@ -62,6 +63,16 @@ pub fn icons(ctx: Context<'_>) -> Arc<IconSet> {
     ctx.data().icons()
 }
 
+/// A snapshot for a reply that has no player of its own to take one from: the server's player
+/// (made on the spot when the bot has not played there yet), so the reply is laid out by that
+/// server's layouts with the bot's facts filled in. Outside a server, the bot's own.
+pub async fn snap(ctx: Context<'_>) -> PlayerSnapshot {
+    match ctx.guild_id() {
+        Some(guild) => ctx.data().player(guild).await.snapshot().await,
+        None => PlayerSnapshot::bare(ctx.data()).await,
+    }
+}
+
 /// The guild a command ran in. Every command is `guild_only`, so this only fails for a DM that
 /// slipped through.
 pub fn guild_of(ctx: Context<'_>) -> anyhow::Result<GuildId> {
@@ -75,11 +86,7 @@ pub async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
     match error {
         poise::FrameworkError::Command { error, ctx, .. } => {
             tracing::warn!(command = %ctx.command().qualified_name, error = %error, "command failed");
-            let msg = views::error(
-                &ctx.data().icons(),
-                "Couldn't do that",
-                &format!("-# {error}"),
-            );
+            let msg = views::error(&snap(ctx).await, "Couldn't do that", &format!("-# {error}"));
             if let Err(e) = send::respond(ctx, msg).await {
                 tracing::debug!(error = %e, "reporting a command error");
             }
@@ -87,7 +94,7 @@ pub async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
         poise::FrameworkError::CommandPanic { payload, ctx, .. } => {
             tracing::error!(command = %ctx.command().qualified_name, payload = ?payload, "command panicked");
             let msg = views::error(
-                &ctx.data().icons(),
+                &snap(ctx).await,
                 "Something broke",
                 "-# The library logged it.",
             );

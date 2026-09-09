@@ -28,7 +28,7 @@ pub async fn stats(
     let identity = ctx.data();
     let icons = super::icons(ctx);
     let Some(app_id) = identity.app_id_sync() else {
-        return send::respond(ctx, guard::Refusal::Offline.view(&icons)).await;
+        return send::respond(ctx, guard::Refusal::Offline.view(&super::snap(ctx).await)).await;
     };
     let me = matches!(scope, Some(StatsScope::Me));
     let stats = settings::guild_stats(
@@ -43,7 +43,7 @@ pub async fn stats(
         return send::respond(
             ctx,
             views::notice(
-                &icons,
+                &super::snap(ctx).await,
                 "Nothing played yet",
                 "-# Stats cover the last 30 days in this server.",
             ),
@@ -109,7 +109,7 @@ pub async fn lyrics(ctx: Context<'_>) -> Result<(), Error> {
         return send::respond(
             ctx,
             views::notice(
-                &super::icons(ctx),
+                &super::snap(ctx).await,
                 "Nothing playing",
                 "-# Lyrics follow the current track.",
             ),
@@ -121,7 +121,7 @@ pub async fn lyrics(ctx: Context<'_>) -> Result<(), Error> {
         return send::respond(
             ctx,
             views::notice(
-                &super::icons(ctx),
+                &super::snap(ctx).await,
                 "Nothing playing",
                 "-# Lyrics follow the current track.",
             ),
@@ -133,11 +133,14 @@ pub async fn lyrics(ctx: Context<'_>) -> Result<(), Error> {
         .await?
         .unwrap_or_default();
     let pages = lyrics::pages(&lyrics::lines(&raw), lyrics::PAGE_CHARS);
-    send::respond(
-        ctx,
-        views::lyrics(&snap, &track.title, &track.artist, &pages, 0),
-    )
-    .await
+    if pages.is_empty() {
+        return send::respond(
+            ctx,
+            views::notice(&snap, "No lyrics", "-# This file's tags hold none."),
+        )
+        .await;
+    }
+    send::respond(ctx, views::lyrics(&snap, track, &pages, 0)).await
 }
 
 /// See every bot identity and which are free

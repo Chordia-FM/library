@@ -11,7 +11,7 @@ use crate::discord::ui::{send, views};
 pub async fn settings(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     if let Err(r) = guard::admin(ctx).await {
-        return send::respond(ctx, r.view(&super::icons(ctx))).await;
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
     }
     let guild = super::guild_of(ctx)?;
     let player = ctx.data().player(guild).await;
@@ -29,7 +29,7 @@ pub async fn dj(
 ) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     if let Err(r) = guard::admin(ctx).await {
-        return send::respond(ctx, r.view(&super::icons(ctx))).await;
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
     }
     let guild = super::guild_of(ctx)?;
     let player = ctx.data().player(guild).await;
@@ -66,7 +66,7 @@ pub async fn dj(
             "-# No DJ roles: anyone in the channel can control playback.".to_string()
         }
     };
-    send::respond(ctx, views::ok(&super::icons(ctx), "DJ roles", &detail)).await
+    send::respond(ctx, views::ok(&super::snap(ctx).await, "DJ roles", &detail)).await
 }
 
 /// Keep the bot in its voice channel around the clock
@@ -77,13 +77,13 @@ pub async fn always_on(
 ) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
     if let Err(r) = guard::admin(ctx).await {
-        return send::respond(ctx, r.view(&super::icons(ctx))).await;
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
     }
     let guild = super::guild_of(ctx)?;
     let player = ctx.data().player(guild).await;
     if on && !player.settings().await.can_always_on {
         let r = guard::Refusal::NotAllowed("24/7");
-        return send::respond(ctx, r.view(&super::icons(ctx))).await;
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
     }
     if on {
         // The channel to keep: the one the bot is in, else the caller's.
@@ -94,13 +94,17 @@ pub async fn always_on(
                     if let Err(e) = player.join(vc, ctx.channel_id()).await {
                         return send::respond(
                             ctx,
-                            views::error(&super::icons(ctx), "Couldn't join", &format!("-# {e}")),
+                            views::error(
+                                &super::snap(ctx).await,
+                                "Couldn't join",
+                                &format!("-# {e}"),
+                            ),
                         )
                         .await;
                     }
                     vc
                 }
-                Err(r) => return send::respond(ctx, r.view(&super::icons(ctx))).await,
+                Err(r) => return send::respond(ctx, r.view(&super::snap(ctx).await)).await,
             },
         };
         player
@@ -112,7 +116,7 @@ pub async fn always_on(
         send::respond(
             ctx,
             views::ok(
-                &super::icons(ctx),
+                &super::snap(ctx).await,
                 "24/7 on",
                 &format!(
                     "-# I'll stay in <#{}> and come back after restarts.",
@@ -132,6 +136,6 @@ pub async fn always_on(
         if !player.is_playing().await && !player.has_listeners().await {
             player.leave(LeaveReason::Idle).await;
         }
-        send::respond(ctx, views::ok(&super::icons(ctx), "24/7 off", "")).await
+        send::respond(ctx, views::ok(&super::snap(ctx).await, "24/7 off", "")).await
     }
 }

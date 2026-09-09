@@ -32,6 +32,8 @@ impl From<Option<PlayPosition>> for Position {
 /// What a query resolved to: the tracks to queue, and what to call the set when it is more than one.
 pub struct Resolved {
     pub tracks: Vec<Arc<TrackRow>>,
+    /// What the query was: a track, an album or an artist. The toast is laid out by it.
+    pub kind: HitKind,
     pub source: Option<String>,
     /// Set when the query was an artist, so the toast can show their picture rather than the
     /// first album's cover.
@@ -80,6 +82,7 @@ pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResu
                 .map(Arc::new)
                 .into_iter()
                 .collect(),
+            kind: HitKind::Track,
             source: None,
             artist: None,
         });
@@ -94,6 +97,7 @@ pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResu
     match hits.first() {
         None => Ok(Resolved {
             tracks: Vec::new(),
+            kind: HitKind::Track,
             source: None,
             artist: None,
         }),
@@ -109,6 +113,7 @@ pub async fn resolve_hit(db: &SqlitePool, hit: &SearchHit) -> AppResult<Resolved
                 .map(Arc::new)
                 .into_iter()
                 .collect(),
+            kind: HitKind::Track,
             source: None,
             artist: None,
         }),
@@ -122,6 +127,7 @@ async fn resolve_album(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
     let source = tracks.first().and_then(|t| t.album.clone());
     Ok(Resolved {
         tracks: tracks.into_iter().map(Arc::new).collect(),
+        kind: HitKind::Album,
         source,
         artist: None,
     })
@@ -147,6 +153,7 @@ async fn resolve_artist(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
     };
     Ok(Resolved {
         tracks: tracks.into_iter().map(Arc::new).collect(),
+        kind: HitKind::Artist,
         source,
         artist,
     })
@@ -207,7 +214,7 @@ async fn queue_resolved(
     let identity = ctx.data();
     let (vc, player) = match guard::listener(ctx).await {
         Ok(x) => x,
-        Err(r) => return send::respond(ctx, r.view(&super::icons(ctx))).await,
+        Err(r) => return send::respond(ctx, r.view(&super::snap(ctx).await)).await,
     };
     let resolved = resolve(&identity.state.db, query, kinds).await?;
     if resolved.tracks.is_empty() {
@@ -219,7 +226,7 @@ async fn queue_resolved(
         return send::respond(
             ctx,
             views::notice(
-                &super::icons(ctx),
+                &super::snap(ctx).await,
                 &format!("{what} in the library matches"),
                 &format!(
                     "-# “{}”. Try `/search` for a wider look.",
@@ -233,7 +240,7 @@ async fn queue_resolved(
         if let Err(e) = player.join(vc, ctx.channel_id()).await {
             return send::respond(
                 ctx,
-                views::error(&super::icons(ctx), "Couldn't join", &format!("-# {e}")),
+                views::error(&super::snap(ctx).await, "Couldn't join", &format!("-# {e}")),
             )
             .await;
         }
@@ -261,6 +268,7 @@ async fn queue_resolved(
             &snap,
             &items,
             &enq,
+            resolved.kind,
             resolved.source.as_deref(),
             cover.as_ref(),
             art.image.as_ref(),
