@@ -10,9 +10,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# POLYREPO: this crate path-depends on ../contracts. contracts is a public sibling repo, so the
-# default GITHUB_TOKEN can clone it; every job that builds checks it out next to library/ (both under
-# the runner workspace) so `path = "../contracts"` resolves.
+# POLYREPO: this crate path-depends on ../contracts and ../i18n. Both are public sibling repos, so
+# the default GITHUB_TOKEN can clone them; every job that builds checks them out next to library/
+# (all under the runner workspace) so the `path = "../contracts"` / `"../i18n"` deps resolve.
 
 jobs:
   test:
@@ -25,6 +25,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/i18n
+          path: i18n
       # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
       # rebuild spends its time on here — the compile is incremental, the link never is.
       # cmake builds libopus for the Discord bot (`opus2` → `libopus_sys`).
@@ -67,6 +71,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/i18n
+          path: i18n
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           manifest-path: library/Cargo.toml
@@ -87,6 +95,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/i18n
+          path: i18n
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
@@ -103,7 +115,7 @@ jobs:
             type=raw,value=latest
       - uses: useblacksmith/build-push-action@v2
         with:
-          # Workspace root holds library/ + contracts/; the Dockerfile copies both siblings.
+          # Workspace root holds library/ + contracts/ + i18n/; the Dockerfile copies the siblings.
           context: .
           file: library/Dockerfile
           push: true
@@ -126,6 +138,10 @@ jobs:
         with:
           repository: chordia-fm/contracts
           path: contracts
+      - uses: actions/checkout@v7
+        with:
+          repository: chordia-fm/i18n
+          path: i18n
       # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
       # rebuild spends its time on here — the compile is incremental, the link never is.
       # musl-tools rides along in the same step: it supplies musl-gcc for the bundled libsqlite3 in

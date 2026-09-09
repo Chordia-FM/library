@@ -2,10 +2,11 @@
 # Includes ffmpeg in the runtime image for the (opt-in) transcode tiers and the Discord bot's
 # fallback decoder.
 #
-# POLYREPO: this crate depends on the sibling crate `chordia-contracts` (../contracts) via a path
-# dependency, so build with the WORKSPACE ROOT as the context (the folder that holds library/ and
-# contracts/ side by side), not the library/ folder. The CI image job checks out contracts next to
-# library/ and builds with `context: .` / `file: library/Dockerfile`.
+# POLYREPO: this crate depends on the sibling crates `chordia-contracts` (../contracts) and
+# `chordia-i18n` (../i18n) via path dependencies, so build with the WORKSPACE ROOT as the context
+# (the folder that holds library/, contracts/ and i18n/ side by side), not the library/ folder. The
+# CI image job checks both out next to library/ and builds with `context: .` /
+# `file: library/Dockerfile`.
 
 FROM rust:1-bookworm AS builder
 # cmake: the Discord bot's Opus encoder (libopus, via `libopus_sys`) is built from source.
@@ -14,9 +15,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /build
 COPY contracts/ ./contracts/
+COPY i18n/ ./i18n/
 COPY library/ ./library/
 WORKDIR /build/library
-# No --locked: the contracts checkout floats in the sibling model.
+# No --locked: the contracts and i18n checkouts float in the sibling model.
 #
 # Cache the cargo registry + target dir across builds (BuildKit). Without this, the `COPY library/`
 # layer above invalidates on ANY source edit and every dependency recompiles from scratch — minutes
