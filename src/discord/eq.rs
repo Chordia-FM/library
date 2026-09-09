@@ -173,33 +173,33 @@ pub fn tidy(cfg: &EqConfig) -> EqConfig {
     }
 }
 
-/// The band gains as text, for a panel: one line of centres, one of gains.
-pub fn table(cfg: &EqConfig) -> String {
-    let heads: Vec<String> = FREQS
+/// A gain as text: `+3`, `0`, `-2.5`.
+pub fn gain_text(g: f32) -> String {
+    if g.abs() < 0.05 {
+        "0".to_string()
+    } else if (g - g.round()).abs() < 0.05 {
+        format!("{:+}", g.round() as i32)
+    } else {
+        format!("{g:+.1}")
+    }
+}
+
+/// A band centre as text: `31`, `1k`.
+pub fn freq_text(f: f32) -> String {
+    if f >= 1000.0 {
+        format!("{}k", (f / 1000.0) as u32)
+    } else {
+        format!("{}", f as u32)
+    }
+}
+
+/// Every band's gain in one line: `31 +6 · 62 +4 · …`.
+pub fn summary(cfg: &EqConfig) -> String {
+    cfg.bands
         .iter()
-        .map(|f| {
-            if *f >= 1000.0 {
-                format!("{:>4}", format!("{}k", *f as u32 / 1000))
-            } else {
-                format!("{:>4}", *f as u32)
-            }
-        })
-        .collect();
-    let gains: Vec<String> = cfg
-        .bands
-        .iter()
-        .map(|b| {
-            let g = b.gain;
-            if g.abs() < 0.05 {
-                format!("{:>4}", "0")
-            } else if (g - g.round()).abs() < 0.05 {
-                format!("{:>+4}", g.round() as i32)
-            } else {
-                format!("{:>+4.1}", g)
-            }
-        })
-        .collect();
-    format!("```\n{}\n{}\n```", heads.join(""), gains.join(""))
+        .map(|b| format!("{} {}", freq_text(b.freq), gain_text(b.gain)))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 // ---- the shared handle and the filters ---------------------------------------------------------------
@@ -416,12 +416,31 @@ fn response_db(cfg: &EqConfig, f: f32) -> f32 {
 }
 
 const W: f32 = 900.0;
-const H: f32 = 320.0;
-const PAD: (f32, f32, f32, f32) = (28.0, 28.0, 24.0, 24.0);
+const H: f32 = 360.0;
+/// Left, right, top, bottom: room for the dB axis, the title and the band labels.
+const PAD: (f32, f32, f32, f32) = (64.0, 28.0, 52.0, 52.0);
 const RANGE: f32 = 15.0;
+const OFF_HEX: &str = "#8a8f98";
 
-/// The response curve as an SVG in the bot's colour: a grid, the curve over a soft fill, a dot
-/// per band. No text, so it renders the same on any host.
+/// The fonts the picture's labels are set in: the bundled Manrope (the web client's face), with
+/// whatever the host has for anything it lacks.
+static FONTS: std::sync::LazyLock<Arc<resvg::usvg::fontdb::Database>> =
+    std::sync::LazyLock::new(|| {
+        let mut db = resvg::usvg::fontdb::Database::new();
+        db.load_font_data(include_bytes!("../../assets/fonts/Manrope.ttf").to_vec());
+        db.load_system_fonts();
+        Arc::new(db)
+    });
+
+fn esc(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The response curve as an SVG in the bot's colour (grey while off): the grid with its dB
+/// marks, the curve over a soft fill, a dot per band with its centre under it and its gain
+/// beside it, and the preset's name in the corner.
 pub fn svg(cfg: &EqConfig, accent_hex: &str) -> String {
     let (l, r, t, b) = PAD;
     let plot_w = W - l - r;
@@ -430,8 +449,10 @@ pub fn svg(cfg: &EqConfig, accent_hex: &str) -> String {
     let hf = 20_000f32.log10();
     let x_of = |f: f32| l + (f.log10() - lf) / (hf - lf) * plot_w;
     let y_of = |g: f32| t + (1.0 - (g.clamp(-RANGE, RANGE) + RANGE) / (2.0 * RANGE)) * plot_h;
+    let colour = if cfg.enabled { accent_hex } else { OFF_HEX };
+    let font = r##"font-family="Manrope, sans-serif""##;
     let mut out = format!(
-        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{accent_hex}" stop-opacity="0.45"/><stop offset="1" stop-color="{accent_hex}" stop-opacity="0.02"/></linearGradient></defs><rect width="{W}" height="{H}" rx="18" fill="#1e1f22"/>"##
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" viewBox="0 0 {W} {H}"><defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="{colour}" stop-opacity="0.45"/><stop offset="1" stop-color="{colour}" stop-opacity="0.02"/></linearGradient></defs><rect width="{W}" height="{H}" rx="18" fill="#1e1f22"/>"##
     );
     for f in [
         50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0, 20000.0,
@@ -442,18 +463,17 @@ pub fn svg(cfg: &EqConfig, accent_hex: &str) -> String {
             t + plot_h
         ));
     }
-    for db in [-12.0, -6.0, 6.0, 12.0] {
+    for db in [-12.0, -6.0, 0.0, 6.0, 12.0] {
         let y = y_of(db);
+        let opacity = if db == 0.0 { "0.3" } else { "0.08" };
         out.push_str(&format!(
-            r##"<line x1="{l}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="#ffffff" stroke-opacity="0.08"/>"##,
-            W - r
+            r##"<line x1="{l}" y1="{y:.1}" x2="{:.1}" y2="{y:.1}" stroke="#ffffff" stroke-opacity="{opacity}"/><text x="{:.1}" y="{:.1}" {font} font-size="14" fill="#949ba4" text-anchor="end">{}</text>"##,
+            W - r,
+            l - 10.0,
+            y + 5.0,
+            gain_text(db)
         ));
     }
-    let zero = y_of(0.0);
-    out.push_str(&format!(
-        r##"<line x1="{l}" y1="{zero:.1}" x2="{:.1}" y2="{zero:.1}" stroke="#ffffff" stroke-opacity="0.3"/>"##,
-        W - r
-    ));
     let points = 240;
     let mut line = String::new();
     for i in 0..points {
@@ -470,13 +490,34 @@ pub fn svg(cfg: &EqConfig, accent_hex: &str) -> String {
     );
     out.push_str(&format!(r##"<path d="{area}" fill="url(#g)"/>"##));
     out.push_str(&format!(
-        r##"<path d="{line}" fill="none" stroke="{accent_hex}" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>"##
+        r##"<path d="{line}" fill="none" stroke="{colour}" stroke-width="4" stroke-linejoin="round" stroke-linecap="round"/>"##
     ));
     for band in &cfg.bands {
         let x = x_of(band.freq);
         let y = y_of(band.gain);
+        // The gain sits above a boost and below a cut, so it never crosses the curve.
+        let label_y = if band.gain >= 0.0 { y - 16.0 } else { y + 28.0 };
         out.push_str(&format!(
-            r##"<circle cx="{x:.1}" cy="{y:.1}" r="7" fill="{accent_hex}" stroke="#ffffff" stroke-width="2"/>"##
+            r##"<circle cx="{x:.1}" cy="{y:.1}" r="7" fill="{colour}" stroke="#ffffff" stroke-width="2"/><text x="{x:.1}" y="{label_y:.1}" {font} font-size="17" font-weight="600" fill="#ffffff" text-anchor="middle">{}</text><text x="{x:.1}" y="{:.1}" {font} font-size="16" fill="#b5bac1" text-anchor="middle">{}</text>"##,
+            gain_text(band.gain),
+            H - 18.0,
+            freq_text(band.freq)
+        ));
+    }
+    let title = format!(
+        "{} · {}",
+        label(cfg),
+        if cfg.enabled { "on" } else { "off" }
+    );
+    out.push_str(&format!(
+        r##"<text x="{l}" y="34" {font} font-size="20" font-weight="700" fill="#ffffff" fill-opacity="0.9">{}</text>"##,
+        esc(&title)
+    ));
+    if cfg.preamp.abs() > 0.05 {
+        out.push_str(&format!(
+            r##"<text x="{:.1}" y="34" {font} font-size="16" fill="#b5bac1" text-anchor="end">preamp {} dB</text>"##,
+            W - r,
+            gain_text(cfg.preamp)
         ));
     }
     out.push_str("</svg>");
@@ -485,8 +526,12 @@ pub fn svg(cfg: &EqConfig, accent_hex: &str) -> String {
 
 /// The curve as a PNG, for a media gallery.
 pub fn picture(cfg: &EqConfig, accent_hex: &str) -> anyhow::Result<Vec<u8>> {
-    let tree =
-        resvg::usvg::Tree::from_str(&svg(cfg, accent_hex), &resvg::usvg::Options::default())?;
+    let options = resvg::usvg::Options {
+        fontdb: FONTS.clone(),
+        font_family: "Manrope".to_string(),
+        ..Default::default()
+    };
+    let tree = resvg::usvg::Tree::from_str(&svg(cfg, accent_hex), &options)?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(W as u32, H as u32)
         .ok_or_else(|| anyhow::anyhow!("pixmap allocation failed"))?;
     resvg::render(
@@ -495,6 +540,46 @@ pub fn picture(cfg: &EqConfig, accent_hex: &str) -> anyhow::Result<Vec<u8>> {
         &mut pixmap.as_mut(),
     );
     Ok(pixmap.encode_png()?)
+}
+
+/// Pictures already drawn, by everything that shapes one: the gains, the preamp, the switch and
+/// the colour. The same settings in the same colour hand back the same bytes.
+static PICTURES: Mutex<Vec<(String, Arc<Vec<u8>>)>> = Mutex::new(Vec::new());
+const PICTURES_KEPT: usize = 24;
+
+fn picture_key(cfg: &EqConfig, accent_hex: &str) -> String {
+    let mut key = format!("{accent_hex}|{}|{:.1}", cfg.enabled, cfg.preamp);
+    for b in &cfg.bands {
+        key.push_str(&format!("|{:.0}:{:.1}:{:.2}", b.freq, b.gain, b.q));
+    }
+    key
+}
+
+/// The picture for these settings, drawn once and remembered; `None` when drawing failed.
+pub fn picture_cached(cfg: &EqConfig, accent_hex: &str) -> Option<Arc<Vec<u8>>> {
+    let key = picture_key(cfg, accent_hex);
+    {
+        let mut kept = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = kept.iter().position(|(k, _)| *k == key) {
+            let hit = kept.remove(i);
+            let png = hit.1.clone();
+            kept.push(hit);
+            return Some(png);
+        }
+    }
+    let png = match picture(cfg, accent_hex) {
+        Ok(p) => Arc::new(p),
+        Err(e) => {
+            tracing::warn!(error = %e, "drawing the equalizer");
+            return None;
+        }
+    };
+    let mut kept = PICTURES.lock().unwrap_or_else(|e| e.into_inner());
+    kept.push((key, png.clone()));
+    if kept.len() > PICTURES_KEPT {
+        kept.remove(0);
+    }
+    Some(png)
 }
 
 #[cfg(test)]
@@ -569,11 +654,35 @@ mod tests {
     }
 
     #[test]
-    fn the_picture_is_a_png_of_the_declared_size() {
-        let png = picture(&preset_config(preset("Loudness").unwrap()), "#f2258c").unwrap();
+    fn the_picture_is_a_png_with_its_labels_and_is_drawn_once() {
+        let cfg = preset_config(preset("Loudness").unwrap());
+        let png = picture(&cfg, "#f2258c").unwrap();
         assert!(png.starts_with(b"\x89PNG"));
-        let table = table(&preset_config(preset("Loudness").unwrap()));
-        assert!(table.contains("  31  62 125"), "{table}");
-        assert!(table.contains("  +6  +4   0"), "{table}");
+        // The labels are in the drawing: every centre, the gains, the preset, the preamp.
+        let drawing = svg(&cfg, "#f2258c");
+        for want in [
+            ">31<",
+            ">16k<",
+            ">+6<",
+            ">-2<",
+            "Loudness · on",
+            "preamp -3 dB",
+        ] {
+            assert!(drawing.contains(want), "{want}");
+        }
+        let first = picture_cached(&cfg, "#f2258c").unwrap();
+        let again = picture_cached(&cfg, "#f2258c").unwrap();
+        assert!(Arc::ptr_eq(&first, &again));
+        // Another colour, or a nudge, is another picture; off is grey.
+        let other = picture_cached(&cfg, "#00ff00").unwrap();
+        assert!(!Arc::ptr_eq(&first, &other));
+        let mut off = cfg.clone();
+        off.enabled = false;
+        assert!(svg(&off, "#f2258c").contains(OFF_HEX));
+        assert!(!svg(&off, "#f2258c").contains("#f2258c"));
+        assert_eq!(
+            summary(&cfg),
+            "31 +6 · 62 +4 · 125 0 · 250 0 · 500 -2 · 1k 0 · 2k 0 · 4k +3 · 8k +6 · 16k +6"
+        );
     }
 }

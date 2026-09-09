@@ -21,6 +21,7 @@ use sqlx::AssertSqlSafe;
 
 use crate::catalog::{self, TrackRow, TRACK_COLS_NO_LIB, TRACK_JOINS};
 use crate::discord::emoji::DEFAULT_HEX;
+use crate::discord::eq;
 use crate::discord::hub;
 use crate::discord::identity::Identity;
 use crate::discord::lyrics;
@@ -327,7 +328,12 @@ pub async fn render(
         muted: false,
         normalize: true,
         listeners: 3,
-        eq: EqConfig::default(),
+        // The equalizer panel previews with something to look at.
+        eq: if view == LayoutView::Equalizer {
+            eq::preset_config(eq::preset("Rock").expect("a preset"))
+        } else {
+            EqConfig::default()
+        },
         layouts: Arc::new(layouts),
     };
     let message = match view {
@@ -450,6 +456,10 @@ pub async fn render(
             },
             UserId::new(listener),
         ),
+        LayoutView::Equalizer => {
+            let hex = format!("#{:06x}", snap.icons.accent());
+            views::equalizer(&snap, 2, eq::picture_cached(&snap.eq, &hex))
+        }
         LayoutView::Queue => views::queue_page(&snap, 0),
         LayoutView::History => {
             // The server's own log when it has one; else the evening, as if it had been heard.

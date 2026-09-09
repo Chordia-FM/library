@@ -38,6 +38,8 @@
 
 use serenity::all::UserId;
 
+use std::sync::Arc;
+
 use super::custom_id::{Action, CustomId, Origin};
 use super::fmt::{self, accent};
 use super::template;
@@ -384,6 +386,9 @@ struct Scene<'a> {
     voter: Option<UserId>,
     /// Which message this is when it is not the controller, for its controls to say so.
     origin: Option<Origin>,
+    /// On the equalizer panel: the band the nudge buttons act on, and the curve as an upload.
+    eq_band: usize,
+    eq_picture: Option<&'a Cover>,
     list: Vec<Entry>,
     /// The page shown (0-based, already clamped) and how many there are.
     page: usize,
@@ -411,6 +416,8 @@ impl<'a> Scene<'a> {
             vote: None,
             voter: None,
             origin: None,
+            eq_band: 0,
+            eq_picture: None,
             list: Vec::new(),
             page: 0,
             pages: 1,
@@ -598,6 +605,42 @@ impl<'a> Scene<'a> {
             "player.autoplay" => onoff(snap.autoplay),
             "player.muted" => onoff(snap.muted),
             "player.eq" => eq::label(&snap.eq),
+            // the equalizer
+            "eq.state" => onoff(snap.eq.enabled),
+            "eq.preset" => match eq::preset_of(&snap.eq) {
+                Some(p) => p.name.to_string(),
+                None => "custom".to_string(),
+            },
+            "eq.preamp" => eq::gain_text(snap.eq.preamp),
+            "eq.bands" => eq::summary(&snap.eq),
+            "eq.band" => snap
+                .eq
+                .bands
+                .get(self.eq_band)
+                .map(|b| {
+                    if b.freq >= 1000.0 {
+                        format!("{} kHz", b.freq / 1000.0)
+                    } else {
+                        format!("{} Hz", b.freq)
+                    }
+                })
+                .unwrap_or_default(),
+            "eq.band.gain" => snap
+                .eq
+                .bands
+                .get(self.eq_band)
+                .map(|b| eq::gain_text(b.gain))
+                .unwrap_or_default(),
+            "eq.31" | "eq.62" | "eq.125" | "eq.250" | "eq.500" | "eq.1k" | "eq.2k" | "eq.4k"
+            | "eq.8k" | "eq.16k" => {
+                let want = name.trim_start_matches("eq.");
+                snap.eq
+                    .bands
+                    .iter()
+                    .find(|b| eq::freq_text(b.freq) == want)
+                    .map(|b| eq::gain_text(b.gain))
+                    .unwrap_or_default()
+            }
             "player.meta" => of_cur(&|c| meta_line(snap, c)),
             "player.line" => now_playing_line(snap),
             // the queue
@@ -685,6 +728,7 @@ struct Rendered {
     cover: bool,
     artist: bool,
     banner: bool,
+    eq: bool,
 }
 
 fn media_for(scene: &Scene, source: &ImageSource, used: &mut Rendered) -> Option<Media> {
@@ -699,6 +743,10 @@ fn media_for(scene: &Scene, source: &ImageSource, used: &mut Rendered) -> Option
         }),
         ImageSource::ArtistBanner => scene.artist_banner.map(|c| {
             used.banner = true;
+            Media::attachment(&c.filename)
+        }),
+        ImageSource::Equalizer => scene.eq_picture.map(|c| {
+            used.eq = true;
             Media::attachment(&c.filename)
         }),
         ImageSource::BotAvatar => scene.snap.bot_avatar.as_deref().map(Media::url),
@@ -757,6 +805,7 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
         cover: false,
         artist: false,
         banner: false,
+        eq: false,
     };
     for block in blocks {
         match block {
@@ -766,6 +815,7 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
                 out.cover |= inner.cover;
                 out.artist |= inner.artist;
                 out.banner |= inner.banner;
+                out.eq |= inner.eq;
                 if inner.components.is_empty() {
                     continue;
                 }
@@ -848,6 +898,7 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
                         .push(paging_row(scene.snap, paging, scene.page, scene.pages));
                 }
             }
+            LayoutBlock::EqControls => out.components.extend(eq_controls(scene)),
         }
     }
     out
@@ -968,6 +1019,7 @@ fn finish(scene: &Scene, layout: &ViewLayout, reuse: bool) -> Message {
             r.cover.then_some(scene.cover).flatten(),
             r.artist.then_some(scene.artist_art).flatten(),
             r.banner.then_some(scene.artist_banner).flatten(),
+            r.eq.then_some(scene.eq_picture).flatten(),
         ],
         reuse,
     )
@@ -1592,22 +1644,27 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
     Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
-/// The equalizer panel: the curve as a picture, the bands as numbers, a preset to pick, a band
-/// to choose and nudge, and the switch. Every control edits the panel in place.
-pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Vec<u8>>) -> Message {
+/// The equalizer panel, laid out by the `equalizer` layout: the curve rides along as `eq.png`
+/// for a gallery to show, the `eq.*` variables say the rest, and the controls block edits the
+/// panel in place.
+pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Arc<Vec<u8>>>) -> Message {
+    let cover = picture.map(|bytes| Cover {
+        filename: "eq.png".to_string(),
+        bytes,
+        attachment_id: None,
+    });
+    let mut scene = Scene::new(snap, Icon::Equalizer, "Equalizer", snap.icons.accent());
+    scene.eq_band = band.min(eq::FREQS.len() - 1);
+    scene.eq_picture = cover.as_ref();
+    with_current(&mut scene, snap);
+    finish(&scene, &snap.layouts.equalizer, false).ephemeral()
+}
+
+/// The equalizer's controls: a preset menu, a band menu, the nudge buttons and the switch.
+fn eq_controls(scene: &Scene) -> Vec<Component> {
+    let snap = scene.snap;
     let icons = &snap.icons;
     let cfg = &snap.eq;
-    let state = if cfg.enabled { "on" } else { "off" };
-    let mut body = header(
-        &icons.get(Icon::Equalizer),
-        "Equalizer",
-        Some(&format!("{} · {state}", eq::label(cfg))),
-    );
-    if picture.is_some() {
-        body.push(gallery(vec![Media::attachment("eq.png")]));
-    }
-    body.push(text(eq::table(cfg)));
-    body.push(separator(false, Spacing::Large));
     let current = eq::preset_of(cfg).map(|p| p.name);
     let mut presets: Vec<SelectOption> = eq::PRESETS
         .iter()
@@ -1622,15 +1679,7 @@ pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Vec<u8>>) -
     if current.is_none() {
         presets.insert(0, SelectOption::new("Custom", "custom").default(true));
     }
-    body.push(row(vec![Component::StringSelect {
-        custom_id: id(snap, Action::Select("eq_preset".into())),
-        placeholder: Some("Preset".into()),
-        options: presets,
-        min: 1,
-        max: 1,
-        disabled: false,
-    }]));
-    let band = band.min(eq::FREQS.len() - 1);
+    let band = scene.eq_band.min(eq::FREQS.len() - 1);
     let bands: Vec<SelectOption> = cfg
         .bands
         .iter()
@@ -1641,45 +1690,50 @@ pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Vec<u8>>) -
             } else {
                 format!("{} Hz", b.freq)
             };
-            let mut o =
-                SelectOption::new(hz, format!("b:{i}")).description(format!("{:+.1} dB", b.gain));
+            let mut o = SelectOption::new(hz, format!("b:{i}"))
+                .description(format!("{} dB", eq::gain_text(b.gain)));
             if i == band {
                 o = o.default(true);
             }
             o
         })
         .collect();
-    body.push(row(vec![Component::StringSelect {
-        custom_id: id(snap, Action::Select("eq_band".into())),
-        placeholder: Some("Band to nudge".into()),
-        options: bands,
-        min: 1,
-        max: 1,
-        disabled: false,
-    }]));
     let step = |n: i8| {
         button(
             Button::new(ButtonStyle::Secondary, id(snap, Action::EqStep(n)))
                 .label(format!("{n:+} dB")),
         )
     };
-    body.push(row(vec![
-        step(-3),
-        step(-1),
-        step(1),
-        step(3),
-        button(Button::new(ButtonStyle::Secondary, id(snap, Action::EqFlat)).label("Flat")),
-    ]));
-    body.push(row(vec![button(
-        Button::new(ButtonStyle::Secondary, id(snap, Action::EqToggle))
-            .emoji(icons.get(Icon::Equalizer))
-            .label(if cfg.enabled { "Turn off" } else { "Turn on" }),
-    )]));
-    let msg = Message::new(vec![container(icons.accent(), body)]).ephemeral();
-    match picture {
-        Some(png) => msg.attach("eq.png", png),
-        None => msg,
-    }
+    vec![
+        row(vec![Component::StringSelect {
+            custom_id: id(snap, Action::Select("eq_preset".into())),
+            placeholder: Some("Preset".into()),
+            options: presets,
+            min: 1,
+            max: 1,
+            disabled: false,
+        }]),
+        row(vec![Component::StringSelect {
+            custom_id: id(snap, Action::Select("eq_band".into())),
+            placeholder: Some("Band to nudge".into()),
+            options: bands,
+            min: 1,
+            max: 1,
+            disabled: false,
+        }]),
+        row(vec![
+            step(-3),
+            step(-1),
+            step(1),
+            step(3),
+            button(Button::new(ButtonStyle::Secondary, id(snap, Action::EqFlat)).label("Flat")),
+        ]),
+        row(vec![button(
+            Button::new(ButtonStyle::Secondary, id(snap, Action::EqToggle))
+                .emoji(icons.get(Icon::Equalizer))
+                .label(if cfg.enabled { "Turn off" } else { "Turn on" }),
+        )]),
+    ]
 }
 
 /// One page of a track's lyrics, laid out by the `lyrics` layout; its page buttons turn the
@@ -2791,27 +2845,47 @@ mod tests {
     }
 
     #[test]
-    fn the_equalizer_panel_names_its_state_and_validates() {
+    fn the_equalizer_panel_is_a_layout_with_its_own_variables() {
         let mut s = snap(0, true, false);
+        // Without a picture the gallery is left out: header, divider, then the four rows.
         let m = equalizer(&s, 2, None);
         m.validate().unwrap();
         let k = kids(&m);
         assert!(k[0]["content"]
             .as_str()
             .unwrap()
-            .contains("Equalizer\n-# off · off"));
-        // Rows: the preset select, the band select (its third option chosen), the nudges, the switch.
-        assert_eq!(k[k.len() - 2]["components"].as_array().unwrap().len(), 5);
-        let band_select = &k[k.len() - 3]["components"][0];
+            .contains("Equalizer\n-# Flat · off"));
+        assert_eq!(k.len(), 6);
+        let band_select = &k[3]["components"][0];
         assert_eq!(band_select["options"][2]["default"], true);
         assert_eq!(band_select["options"][2]["label"], "125 Hz");
+        assert_eq!(k[4]["components"].as_array().unwrap().len(), 5);
+        // With one, the curve rides along as an upload the gallery shows.
         s.eq = eq::preset_config(eq::preset("Rock").unwrap());
-        let m = equalizer(&s, 0, Some(vec![0u8; 8]));
+        let m = equalizer(&s, 0, Some(Arc::new(vec![0u8; 8])));
         let k = kids(&m);
         assert!(k[0]["content"].as_str().unwrap().contains("Rock · on"));
         assert_eq!(k[2]["type"], 12);
+        assert_eq!(k[2]["items"][0]["media"]["url"], "attachment://eq.png");
         assert_eq!(m.body()["attachments"][0]["filename"], "eq.png");
-        assert!(m.body().to_string().contains("+5  +4  +3"));
+        // A layout of one's own reads every band through the variables.
+        s.layouts = Arc::new(BotLayouts {
+            equalizer: ViewLayout {
+                blocks: vec![
+                    LayoutBlock::Text {
+                        content: "{eq.preset} {eq.state} {eq.preamp} · {eq.31}/{eq.1k}/{eq.16k} · {eq.band} {eq.band.gain}\n{eq.bands}".into(),
+                    },
+                    LayoutBlock::EqControls,
+                ],
+            },
+            ..Default::default()
+        });
+        let body = equalizer(&s, 9, None).body();
+        assert_eq!(
+            body["components"][0]["content"],
+            "Rock on -2 · +5/-1/+4 · 16 kHz +4\n31 +5 · 62 +4 · 125 +3 · 250 +1 · 500 -1 · 1k -1 · 2k 0 · 4k +2 · 8k +3 · 16k +4"
+        );
+        assert_eq!(body["components"].as_array().unwrap().len(), 5);
     }
 
     #[test]

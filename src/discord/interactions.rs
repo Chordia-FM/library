@@ -378,10 +378,11 @@ pub async fn eq_panel(player: &GuildPlayer) -> Message {
     let band = player.eq_band().await;
     let hex = format!("#{:06x}", snap.icons.accent());
     let cfg = snap.eq.clone();
-    let picture = tokio::task::spawn_blocking(move || eq::picture(&cfg, &hex))
+    // Drawn once per settings and colour; a hit is a lookup.
+    let picture = tokio::task::spawn_blocking(move || eq::picture_cached(&cfg, &hex))
         .await
         .ok()
-        .and_then(|r| r.ok());
+        .flatten();
     views::equalizer(&snap, band, picture)
 }
 

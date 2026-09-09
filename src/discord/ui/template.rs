@@ -57,6 +57,7 @@ const TRACK: &[&str] = &[
     "error",
     "vote",
     "vote_passed",
+    "equalizer",
     "item",
 ];
 /// Where the file facts and the player line apply: wherever a track can be playing.
@@ -68,6 +69,7 @@ const PLAYING: &[&str] = &[
     "error",
     "vote",
     "vote_passed",
+    "equalizer",
 ];
 const QUEUED: &[&str] = &["queued", "queued_album", "queued_artist", "queued_playlist"];
 const ITEM: &[&str] = &["item"];
@@ -75,6 +77,7 @@ const PAGED: &[&str] = &["queue", "history", "lyrics"];
 const REPLY: &[&str] = &["done", "notice", "error"];
 const LYRICS: &[&str] = &["lyrics"];
 const VOTE: &[&str] = &["vote", "vote_passed"];
+const EQ_PANEL: &[&str] = &["equalizer"];
 const BAR: Option<ArgInfo> = Some(ArgInfo {
     label: "segments",
     min: 4,
@@ -252,6 +255,28 @@ pub fn variables() -> Vec<VariableInfo> {
             ANY,
             None,
         ),
+        // the equalizer
+        v("eq.state", "on or off", ANY, None),
+        v("eq.preset", "The preset's name, or custom", ANY, None),
+        v("eq.preamp", "The preamp in dB, e.g. -2", ANY, None),
+        v("eq.bands", "Every band's gain in one line", ANY, None),
+        v("eq.31", "The 31 Hz band's gain in dB", ANY, None),
+        v("eq.62", "The 62 Hz band's gain in dB", ANY, None),
+        v("eq.125", "The 125 Hz band's gain in dB", ANY, None),
+        v("eq.250", "The 250 Hz band's gain in dB", ANY, None),
+        v("eq.500", "The 500 Hz band's gain in dB", ANY, None),
+        v("eq.1k", "The 1 kHz band's gain in dB", ANY, None),
+        v("eq.2k", "The 2 kHz band's gain in dB", ANY, None),
+        v("eq.4k", "The 4 kHz band's gain in dB", ANY, None),
+        v("eq.8k", "The 8 kHz band's gain in dB", ANY, None),
+        v("eq.16k", "The 16 kHz band's gain in dB", ANY, None),
+        v(
+            "eq.band",
+            "The band the nudge buttons act on, e.g. 125 Hz",
+            EQ_PANEL,
+            None,
+        ),
+        v("eq.band.gain", "That band's gain in dB", EQ_PANEL, None),
         v(
             "player.meta",
             "Who asked, the queue, the volume and the modes, in one line",
@@ -590,7 +615,8 @@ fn modernize_block(view: LayoutView, block: &mut LayoutBlock) {
         LayoutBlock::Gallery { .. }
         | LayoutBlock::Separator { .. }
         | LayoutBlock::Row { .. }
-        | LayoutBlock::Pager => {}
+        | LayoutBlock::Pager
+        | LayoutBlock::EqControls => {}
     }
 }
 
