@@ -239,6 +239,26 @@ async fn sample(identity: &Identity, hex: &str) -> anyhow::Result<Sample> {
     })
 }
 
+/// The evening, as if it had been heard: the sample's tracks as plays, newest first.
+fn sample_plays(sample: &Sample, listener: u64) -> Vec<PlayEntry> {
+    let now = settings::now_ms();
+    sample
+        .tracks
+        .iter()
+        .take(12)
+        .enumerate()
+        .map(|(i, t)| PlayEntry {
+            title: t.title.clone(),
+            artist: t.artist.clone(),
+            requested_by: (i % 3 != 2).then(|| listener.to_string()),
+            started_at: now - (i as i64 + 1) * 300_000,
+            ms_played: if i % 4 == 3 { 0 } else { t.duration_ms },
+            scrobbled_for: if i % 2 == 0 { 2 } else { 0 },
+            listeners: 3,
+        })
+        .collect()
+}
+
 /// Two pages of lyrics for a file that has none, so the pager has something to turn.
 fn stand_in_lyrics() -> Vec<String> {
     vec![
@@ -481,25 +501,38 @@ pub async fn render(
                 None => Vec::new(),
             };
             let plays = if logged.is_empty() {
-                let now = settings::now_ms();
-                sample
-                    .tracks
-                    .iter()
-                    .take(12)
-                    .enumerate()
-                    .map(|(i, t)| PlayEntry {
-                        title: t.title.clone(),
-                        artist: t.artist.clone(),
-                        requested_by: (i % 3 != 2).then(|| listener.to_string()),
-                        started_at: now - (i as i64 + 1) * 300_000,
-                        ms_played: if i % 4 == 3 { 0 } else { t.duration_ms },
-                        scrobbled_for: if i % 2 == 0 { 2 } else { 0 },
-                    })
-                    .collect()
+                sample_plays(&sample, listener)
             } else {
                 logged
             };
             views::history(&snap, &plays, 0)
+        }
+        LayoutView::Session => {
+            // The last few hours of the server's log, else the evening as one session.
+            let app_id = identity.app_id_sync().unwrap_or(0).to_string();
+            let since = settings::now_ms() - 3 * 60 * 60 * 1000;
+            let logged = match guild {
+                Some(g) => settings::plays_since(
+                    &identity.state.db,
+                    &app_id,
+                    &g.get().to_string(),
+                    since,
+                    25,
+                )
+                .await
+                .unwrap_or_default(),
+                None => Vec::new(),
+            };
+            let plays = if logged.is_empty() {
+                let mut evening = sample_plays(&sample, listener);
+                evening.reverse();
+                evening
+            } else {
+                logged
+            };
+            let since = plays.first().map(|p| p.started_at).unwrap_or(since);
+            let facts = settings::SessionFacts::of(&plays, since);
+            views::session(&snap, &plays, &facts)
         }
     };
     message

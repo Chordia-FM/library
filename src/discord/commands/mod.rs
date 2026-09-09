@@ -53,6 +53,7 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         control::leave(),
         control::radio(),
         control::eq(),
+        control::crossfade(),
         info::bots(),
         info::lyrics(),
         info::stats(),

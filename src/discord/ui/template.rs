@@ -58,6 +58,7 @@ const TRACK: &[&str] = &[
     "vote",
     "vote_passed",
     "equalizer",
+    "session",
     "item",
 ];
 /// Where the file facts and the player line apply: wherever a track can be playing.
@@ -78,6 +79,7 @@ const REPLY: &[&str] = &["done", "notice", "error"];
 const LYRICS: &[&str] = &["lyrics"];
 const VOTE: &[&str] = &["vote", "vote_passed"];
 const EQ_PANEL: &[&str] = &["equalizer"];
+const SESSION: &[&str] = &["session"];
 const BAR: Option<ArgInfo> = Some(ArgInfo {
     label: "segments",
     min: 4,
@@ -371,8 +373,46 @@ pub fn variables() -> Vec<VariableInfo> {
             VOTE,
             None,
         ),
+        // the session, when the bot leaves
+        v("session.count", "How many tracks played", SESSION, None),
+        v(
+            "session.tracks",
+            "How many tracks played, in words: 12 tracks",
+            SESSION,
+            None,
+        ),
+        v(
+            "session.duration",
+            "How much music played, e.g. 1:02:15",
+            SESSION,
+            None,
+        ),
+        v(
+            "session.started",
+            "When the session began, as a relative time",
+            SESSION,
+            None,
+        ),
+        v(
+            "session.listeners",
+            "The most people listening at once",
+            SESSION,
+            None,
+        ),
+        v(
+            "session.requesters",
+            "How many different people asked for tracks",
+            SESSION,
+            None,
+        ),
         // list entries
         v("index", "The entry's number in the list", ITEM, None),
+        v(
+            "play.listeners",
+            "How many were listening when the entry started",
+            ITEM,
+            None,
+        ),
         v("eta", "How long until the entry plays", ITEM, None),
         v("play.at", "When it played, as a relative time", ITEM, None),
         v("play.length", "How much of it played", ITEM, None),
@@ -644,7 +684,7 @@ fn upgrade_view(view: LayoutView, layout: &mut ViewLayout, from: u32) {
         }
     }
     if from < 4
-        && view.is_list()
+        && view.is_paged()
         && !layout
             .flat()
             .iter()

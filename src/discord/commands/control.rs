@@ -1,5 +1,5 @@
 //! Transport: `/skip`, `/forceskip`, `/vote`, `/back`, `/pause`, `/resume`, `/stop`, `/seek`,
-//! `/volume`, `/loop`, `/join`, `/leave`, `/radio`, `/eq`.
+//! `/volume`, `/loop`, `/join`, `/leave`, `/radio`, `/eq`, `/crossfade`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -507,6 +507,41 @@ pub async fn eq(
             .await;
     }
     send::respond(ctx, crate::discord::interactions::eq_panel(&player).await).await
+}
+
+/// Blend each track into the next over a few seconds, or not at all
+#[poise::command(slash_command, guild_only)]
+pub async fn crossfade(
+    ctx: Context<'_>,
+    #[description = "Seconds of overlap, 0 to 12; 0 is off"]
+    #[min = 0]
+    #[max = 12]
+    seconds: u8,
+) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    let guild = super::guild_of(ctx)?;
+    let player = ctx.data().player(guild).await;
+    if let Err(r) = guard::controller(ctx, &player).await {
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
+    }
+    let updated = player
+        .update_settings(|s| {
+            s.crossfade_secs = seconds.min(crate::discord::settings::MAX_CROSSFADE_SECS)
+        })
+        .await;
+    let detail = if updated.crossfade_secs == 0 {
+        "-# Off: each track ends before the next begins.".to_string()
+    } else {
+        format!(
+            "-# Each track blends into the next over {}.",
+            fmt::count(updated.crossfade_secs as usize, "second")
+        )
+    };
+    send::respond(
+        ctx,
+        views::ok(&super::snap(ctx).await, "Crossfade", &detail),
+    )
+    .await
 }
 
 /// Keep the music going with similar tracks when the queue runs out

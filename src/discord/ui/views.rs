@@ -53,7 +53,7 @@ use crate::discord::eq;
 use crate::discord::player::{
     Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem, VoteTally,
 };
-use crate::discord::settings::{GuildSettings, PlayEntry};
+use crate::discord::settings::{GuildSettings, PlayEntry, SessionFacts};
 use crate::discord::source::TrackFacts;
 use crate::search::{HitKind, SearchHit};
 use chordia_contracts::discord::ResolvedTrack;
@@ -426,6 +426,8 @@ struct Scene<'a> {
     /// On the equalizer panel: the band the nudge buttons act on, and the curve as an upload.
     eq_band: usize,
     eq_picture: Option<&'a Cover>,
+    /// On the session summary: what the session came to.
+    session: Option<&'a SessionFacts>,
     list: Vec<Entry>,
     /// The page shown (0-based, already clamped) and how many there are.
     page: usize,
@@ -455,6 +457,7 @@ impl<'a> Scene<'a> {
             origin: None,
             eq_band: 0,
             eq_picture: None,
+            session: None,
             list: Vec::new(),
             page: 0,
             pages: 1,
@@ -514,6 +517,8 @@ impl<'a> Scene<'a> {
         let of_toast = |f: &dyn Fn(&Toast) -> String| toast.map(f).unwrap_or_default();
         let of_cur = |f: &dyn Fn(&CurrentSnapshot) -> String| cur.map(f).unwrap_or_default();
         let of_vote = |f: &dyn Fn(&VoteTally) -> String| self.vote.map(f).unwrap_or_default();
+        let of_session =
+            |f: &dyn Fn(&SessionFacts) -> String| self.session.map(f).unwrap_or_default();
         Some(match name {
             // the message
             "icon" => icons.get(self.icon).markup(),
@@ -724,6 +729,13 @@ impl<'a> Scene<'a> {
             "left.reason" => self.reason.unwrap_or("").to_string(),
             // lyrics
             "lyrics" => self.lyrics.map(fmt::escape_md).unwrap_or_default(),
+            // the session
+            "session.count" => of_session(&|f| f.count.to_string()),
+            "session.tracks" => of_session(&|f| fmt::count(f.count, "track")),
+            "session.duration" => of_session(&|f| fmt::duration(f.total_ms)),
+            "session.started" => of_session(&|f| format!("<t:{}:R>", f.since_ms / 1000)),
+            "session.listeners" => of_session(&|f| f.peak_listeners.to_string()),
+            "session.requesters" => of_session(&|f| f.requesters.to_string()),
             // a vote to skip
             "vote.by" => self.voter.map(mention).unwrap_or_default(),
             "vote.count" => of_vote(&|v| v.count.to_string()),
@@ -1313,69 +1325,83 @@ pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Messa
     let web = snap.web_base.as_deref();
     let icons = &snap.icons;
     let mut scene = Scene::new(snap, Icon::List, "History", icons.accent());
-    let list = plays
-        .iter()
-        .map(|p| {
-            let mut line = format!(
-                "**{}**",
-                linked(&p.title, web, &format!("{} {}", p.title, p.artist))
-            );
-            if !p.artist.is_empty() {
-                line.push_str(" · ");
-                line.push_str(&linked(&p.artist, web, &p.artist));
-            }
-            let requester_id = p
-                .requested_by
-                .as_deref()
-                .and_then(|u| u.parse::<u64>().ok());
-            let counted = if p.scrobbled_for > 0 {
-                format!(
-                    "{} counted for {}",
-                    icons.get(Icon::Check).markup(),
-                    fmt::count(p.scrobbled_for as usize, "listener")
-                )
-            } else {
-                "not counted".to_string()
-            };
-            Entry {
-                vars: vec![
-                    ("track.line", line.clone()),
-                    ("track", line),
-                    ("track.title", fmt::escape_md(&p.title)),
-                    ("track.artist", fmt::escape_md(&p.artist)),
-                    (
-                        "track.title_link",
-                        linked(&p.title, web, &format!("{} {}", p.title, p.artist)),
-                    ),
-                    ("track.artist_link", linked(&p.artist, web, &p.artist)),
-                    ("play.at", format!("<t:{}:R>", p.started_at / 1000)),
-                    (
-                        "play.length",
-                        if p.ms_played > 0 {
-                            fmt::duration(p.ms_played as u64)
-                        } else {
-                            String::new()
-                        },
-                    ),
-                    (
-                        "requester",
-                        requester_id
-                            .map(|u| mention(UserId::new(u)))
-                            .unwrap_or_default(),
-                    ),
-                    (
-                        "requester.id",
-                        requester_id.map(|u| u.to_string()).unwrap_or_default(),
-                    ),
-                    ("play.counted", counted),
-                    ("play.counted_for", p.scrobbled_for.to_string()),
-                ],
-            }
-        })
-        .collect();
+    let list = plays.iter().map(|p| play_entry(icons, web, p)).collect();
     scene.paged(list, page, &snap.layouts.history, Paging::History);
     scene.origin = Some(Origin::History(scene.page as u32));
     finish(&scene, &snap.layouts.history, false).ephemeral()
+}
+
+/// What the session was, posted when the bot leaves after playing, laid out by the `session`
+/// layout: the facts through `session.*`, the plays as the list, oldest first.
+pub fn session(snap: &PlayerSnapshot, plays: &[PlayEntry], facts: &SessionFacts) -> Message {
+    let web = snap.web_base.as_deref();
+    let icons = &snap.icons;
+    let mut scene = Scene::new(snap, Icon::History, "This session", icons.accent());
+    scene.session = Some(facts);
+    let list = plays.iter().map(|p| play_entry(icons, web, p)).collect();
+    scene.paged(list, 0, &snap.layouts.session, Paging::History);
+    finish(&scene, &snap.layouts.session, false)
+}
+
+/// One play of the log as a list entry: the track's names and links, when and how long it
+/// played, who asked, whether it counted.
+fn play_entry(icons: &IconSet, web: Option<&str>, p: &PlayEntry) -> Entry {
+    let mut line = format!(
+        "**{}**",
+        linked(&p.title, web, &format!("{} {}", p.title, p.artist))
+    );
+    if !p.artist.is_empty() {
+        line.push_str(" · ");
+        line.push_str(&linked(&p.artist, web, &p.artist));
+    }
+    let requester_id = p
+        .requested_by
+        .as_deref()
+        .and_then(|u| u.parse::<u64>().ok());
+    let counted = if p.scrobbled_for > 0 {
+        format!(
+            "{} counted for {}",
+            icons.get(Icon::Check).markup(),
+            fmt::count(p.scrobbled_for as usize, "listener")
+        )
+    } else {
+        "not counted".to_string()
+    };
+    Entry {
+        vars: vec![
+            ("track.line", line.clone()),
+            ("track", line),
+            ("track.title", fmt::escape_md(&p.title)),
+            ("track.artist", fmt::escape_md(&p.artist)),
+            (
+                "track.title_link",
+                linked(&p.title, web, &format!("{} {}", p.title, p.artist)),
+            ),
+            ("track.artist_link", linked(&p.artist, web, &p.artist)),
+            ("play.at", format!("<t:{}:R>", p.started_at / 1000)),
+            (
+                "play.length",
+                if p.ms_played > 0 {
+                    fmt::duration(p.ms_played as u64)
+                } else {
+                    String::new()
+                },
+            ),
+            (
+                "requester",
+                requester_id
+                    .map(|u| mention(UserId::new(u)))
+                    .unwrap_or_default(),
+            ),
+            (
+                "requester.id",
+                requester_id.map(|u| u.to_string()).unwrap_or_default(),
+            ),
+            ("play.counted", counted),
+            ("play.counted_for", p.scrobbled_for.to_string()),
+            ("play.listeners", p.listeners.max(0).to_string()),
+        ],
+    }
 }
 
 /// What a server has played through the bot: a few headed sections of text.
@@ -1632,13 +1658,19 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
         not_enabled
     };
     let skip = gs.skip_label();
+    let crossfade = if gs.crossfade_secs == 0 {
+        "off".to_string()
+    } else {
+        format!("{} seconds", gs.crossfade_secs)
+    };
+    let summary = onoff(gs.summary);
     let mut body = header(
         &icons.get(Icon::Gear),
         "Settings",
         Some(&format!("{} in this server", snap.bot_name)),
     );
     body.push(text(format!(
-        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Skipping** · {skip}\n**Re-post controller when it scrolls away** · {}",
+        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Skipping** · {skip}\n**Crossfade** · {crossfade}\n**Session summary** · {summary}\n**Re-post controller when it scrolls away** · {}",
         onoff(gs.normalize),
         onoff(gs.announce)
     )));
@@ -1949,6 +1981,7 @@ mod tests {
                 started_at: 1_700_000_000_000 + i as i64 * 1000,
                 ms_played: if i % 3 == 0 { 0 } else { 120_000 },
                 scrobbled_for: (i % 2) as i64,
+                listeners: 2 + (i % 3) as i64,
             })
             .collect()
     }
@@ -2970,6 +3003,34 @@ mod tests {
             1
         );
         assert_eq!(body["components"].as_array().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_session_summary_counts_the_plays_oldest_first() {
+        let s = snap(0, false, false);
+        let plays = plays(4);
+        let facts = SessionFacts::of(&plays, 1_700_000_000_000);
+        assert_eq!(facts.count, 4);
+        assert_eq!(facts.total_ms, 240_000);
+        assert_eq!(facts.peak_listeners, 4);
+        assert_eq!(facts.requesters, 1);
+        let m = session(&s, &plays, &facts);
+        m.validate().unwrap();
+        assert!(!m.ephemeral);
+        let k = kids(&m);
+        let head = k[0]["content"].as_str().unwrap();
+        assert!(
+            head.contains("4 tracks · 4:00 of music · up to 4 listening · since <t:1700000000:R>"),
+            "{head}"
+        );
+        let list = k[2]["content"].as_str().unwrap();
+        assert!(list.starts_with("**Play 0**"), "{list}");
+        assert!(
+            list.contains("**Play 2** · Daft Punk · 2:00 · <@42>"),
+            "{list}"
+        );
+        // Never a pager: it is posted once.
+        assert_eq!(k.len(), 3);
     }
 
     #[test]
