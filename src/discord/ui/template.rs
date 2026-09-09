@@ -214,6 +214,7 @@ pub fn variables() -> Vec<VariableInfo> {
         v("player.loop", "off, track or queue", ANY, None),
         v("player.shuffle", "on or off", ANY, None),
         v("player.autoplay", "on or off", ANY, None),
+        v("player.muted", "on or off", ANY, None),
         v(
             "player.meta",
             "Who asked, the queue, the volume and the modes, in one line",
@@ -511,7 +512,11 @@ pub fn modernize(view: LayoutView, text: &str) -> String {
 fn modernize_block(view: LayoutView, block: &mut LayoutBlock) {
     match block {
         LayoutBlock::Text { content } => *content = modernize(view, content),
-        LayoutBlock::Section { content, .. } => *content = modernize(view, content),
+        LayoutBlock::Section { texts, .. } => {
+            for t in texts {
+                *t = modernize(view, t);
+            }
+        }
         LayoutBlock::List { item, empty, .. } => {
             *item = modernize(view, item);
             *empty = modernize(view, empty);
@@ -659,10 +664,10 @@ mod tests {
             panic!()
         };
         assert_eq!(content, "### {icon} {heading}\n-# {channel.name}");
-        let LayoutBlock::Section { content, .. } = &blocks[1] else {
+        let LayoutBlock::Section { texts, .. } = &blocks[1] else {
             panic!()
         };
-        assert_eq!(content, "{track}\n-# {file}");
+        assert_eq!(texts, &["{track}\n-# {file}".to_string()]);
         let LayoutBlock::Text { content } = &blocks[2] else {
             panic!()
         };

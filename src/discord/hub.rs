@@ -17,6 +17,7 @@ use chordia_contracts::social::NowPlayingReport;
 use uuid::Uuid;
 
 use crate::catalog::TrackRow;
+use crate::discord::player::Cover;
 use crate::http::AppState;
 use crate::pairing::HubClient;
 
@@ -224,6 +225,30 @@ pub async fn resolve_track(state: &AppState, track: &TrackRow) -> Option<Resolve
     };
     remember(&rt.hub.tracks, track.id.clone(), value.clone());
     value
+}
+
+/// An artist's portrait and banner as uploads, whichever the Hub has.
+pub async fn artist_pictures(state: &AppState, art: &ArtistArt) -> (Option<Cover>, Option<Cover>) {
+    let mut out = (None, None);
+    if let Some(rel) = &art.image_url {
+        if let Some((mime, bytes)) = image(state, rel).await {
+            out.0 = Some(Cover::named(
+                &format!("artist-{}", art.artist_id),
+                &mime,
+                bytes,
+            ));
+        }
+    }
+    if let Some(rel) = &art.banner_url {
+        if let Some((mime, bytes)) = image(state, rel).await {
+            out.1 = Some(Cover::named(
+                &format!("banner-{}", art.artist_id),
+                &mime,
+                bytes,
+            ));
+        }
+    }
+    out
 }
 
 /// An artist's page and picture, by MusicBrainz id when the library has one, else by name.

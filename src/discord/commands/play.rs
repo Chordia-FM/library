@@ -44,18 +44,26 @@ pub struct ArtistRef {
     pub mbid: Option<String>,
 }
 
-/// The artist's picture from the Hub as an attachment, when the query was an artist the Hub
-/// knows and has a picture for.
-pub async fn art_for(state: &crate::http::AppState, resolved: &Resolved) -> Option<Cover> {
-    let a = resolved.artist.as_ref()?;
-    let art = crate::discord::hub::artist_art(state, &a.name_normalized, a.mbid.as_deref()).await?;
-    let rel = art.image_url?;
-    let (mime, bytes) = crate::discord::hub::image(state, &rel).await?;
-    Some(Cover::named(
-        &format!("artist-{}", art.artist_id),
-        &mime,
-        bytes,
-    ))
+/// An artist's pictures from the Hub as attachments: the portrait and the banner, either of
+/// which the Hub may not have.
+#[derive(Default)]
+pub struct ArtistPictures {
+    pub image: Option<Cover>,
+    pub banner: Option<Cover>,
+}
+
+/// The artist's pictures, when the query was an artist the Hub knows.
+pub async fn art_for(state: &crate::http::AppState, resolved: &Resolved) -> ArtistPictures {
+    let Some(a) = resolved.artist.as_ref() else {
+        return ArtistPictures::default();
+    };
+    let Some(art) =
+        crate::discord::hub::artist_art(state, &a.name_normalized, a.mbid.as_deref()).await
+    else {
+        return ArtistPictures::default();
+    };
+    let (image, banner) = crate::discord::hub::artist_pictures(state, &art).await;
+    ArtistPictures { image, banner }
 }
 
 /// How many tracks an artist hit queues at most.
@@ -241,8 +249,8 @@ async fn queue_resolved(
             autoplay: false,
         })
         .collect();
-    let cover = match &art {
-        Some(art) => Some(art.clone()),
+    let cover = match &art.image {
+        Some(a) => Some(a.clone()),
         None => Cover::load(&identity.state.db, &items[0].track).await,
     };
     let enq = player.enqueue(items.clone(), position).await?;
@@ -255,7 +263,8 @@ async fn queue_resolved(
             &enq,
             resolved.source.as_deref(),
             cover.as_ref(),
-            art.as_ref(),
+            art.image.as_ref(),
+            art.banner.as_ref(),
         ),
     )
     .await

@@ -21,6 +21,15 @@ pub enum Action {
     LoopCycle,
     VolumeUp,
     VolumeDown,
+    /// Silence, remembering the volume; press again to bring it back.
+    Mute,
+    /// Ten seconds back or forward.
+    SeekBack,
+    SeekForward,
+    /// Drop everything queued; the current track plays on.
+    Clear,
+    /// Leave the voice channel.
+    Leave,
     /// Open the queue as a new private message (the controller's Queue button).
     QueueOpen,
     /// Show a queue page (0-based) in place.
@@ -29,7 +38,9 @@ pub enum Action {
     /// share a custom id with their neighbours (Discord refuses duplicates in one message).
     QueueFirst,
     QueueLast,
-    /// `/history` pages, the same way.
+    /// Open the history as a new private message (the controller's History button).
+    HistoryOpen,
+    /// `/history` pages, the same way as the queue's.
     History(u32),
     HistoryFirst,
     HistoryLast,
@@ -62,10 +73,16 @@ impl Action {
             Action::LoopCycle => "lp".into(),
             Action::VolumeUp => "vu".into(),
             Action::VolumeDown => "vd".into(),
+            Action::Mute => "mu".into(),
+            Action::SeekBack => "sb".into(),
+            Action::SeekForward => "sf".into(),
+            Action::Clear => "cl".into(),
+            Action::Leave => "lv".into(),
             Action::QueueOpen => "qo".into(),
             Action::Queue(p) => format!("q:{p}"),
             Action::QueueFirst => "qf".into(),
             Action::QueueLast => "ql".into(),
+            Action::HistoryOpen => "ho".into(),
             Action::History(p) => format!("h:{p}"),
             Action::HistoryFirst => "hf".into(),
             Action::HistoryLast => "hl".into(),
@@ -91,10 +108,16 @@ impl Action {
             ("lp", None) => Action::LoopCycle,
             ("vu", None) => Action::VolumeUp,
             ("vd", None) => Action::VolumeDown,
+            ("mu", None) => Action::Mute,
+            ("sb", None) => Action::SeekBack,
+            ("sf", None) => Action::SeekForward,
+            ("cl", None) => Action::Clear,
+            ("lv", None) => Action::Leave,
             ("qo", None) => Action::QueueOpen,
             ("q", Some(p)) => Action::Queue(p.parse().ok()?),
             ("qf", None) => Action::QueueFirst,
             ("ql", None) => Action::QueueLast,
+            ("ho", None) => Action::HistoryOpen,
             ("h", Some(p)) => Action::History(p.parse().ok()?),
             ("hf", None) => Action::HistoryFirst,
             ("hl", None) => Action::HistoryLast,
@@ -164,7 +187,13 @@ mod tests {
             Action::LoopCycle,
             Action::VolumeUp,
             Action::VolumeDown,
+            Action::Mute,
+            Action::SeekBack,
+            Action::SeekForward,
+            Action::Clear,
+            Action::Leave,
             Action::QueueOpen,
+            Action::HistoryOpen,
             Action::Queue(3),
             Action::QueueFirst,
             Action::QueueLast,

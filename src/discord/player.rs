@@ -185,8 +185,9 @@ struct Playing {
     handle: TrackHandle,
     facts: TrackFacts,
     cover: Option<Cover>,
-    /// The artist's picture from the Hub, fetched only when a layout shows it.
+    /// The artist's pictures from the Hub, fetched only when a layout shows them.
     artist_art: Option<Cover>,
+    artist_banner: Option<Cover>,
     paused: bool,
     /// Row id in `discord_plays`, finalised with `ms_played` when the track ends.
     play_id: Option<i64>,
@@ -271,6 +272,8 @@ struct PlayerState {
     /// Play the queue in random order: each advance takes a random item rather than the head.
     shuffle: bool,
     volume: u8,
+    /// The volume before a mute, while muted.
+    muted_before: Option<u8>,
     normalize: bool,
     /// Non-bot users in the bot's voice channel.
     listeners: HashSet<UserId>,
@@ -302,8 +305,9 @@ pub struct CurrentSnapshot {
     pub position_ms: u64,
     pub paused: bool,
     pub cover: Option<Cover>,
-    /// The artist's picture, when a layout asked for it and the Hub had one.
+    /// The artist's pictures, when a layout asked for them and the Hub had them.
     pub artist_art: Option<Cover>,
+    pub artist_banner: Option<Cover>,
     /// The Hub's ids for the track, for deep links; absent until looked up, or without a Hub.
     pub links: Option<ResolvedTrack>,
 }
@@ -316,8 +320,9 @@ pub struct PlayerSnapshot {
     pub bot_avatar: Option<String>,
     /// The bot's own user id, for `{bot.mention}`.
     pub bot_user_id: Option<u64>,
-    /// The guild's name, for `{server}`.
+    /// The guild's name, for `{server}`, and its icon for layouts that show it.
     pub guild_name: Option<String>,
+    pub guild_icon: Option<String>,
     pub icons: Arc<IconSet>,
     /// The web client's origin when the library is paired to a Hub; views link into it.
     pub web_base: Option<String>,
@@ -331,6 +336,8 @@ pub struct PlayerSnapshot {
     pub autoplay: bool,
     pub shuffle: bool,
     pub volume: u8,
+    /// Silenced from the controller; the volume comes back on the next press.
+    pub muted: bool,
     pub normalize: bool,
     pub listeners: usize,
     /// How this guild's messages are laid out: the bot's layouts with the guild's own laid over.
@@ -398,6 +405,7 @@ impl GuildPlayer {
                 autoplay: settings.autoplay,
                 shuffle: false,
                 volume: settings.volume.unwrap_or(default_volume),
+                muted_before: None,
                 normalize: settings.normalize,
                 listeners: HashSet::new(),
                 idle_since: None,
@@ -721,8 +729,40 @@ impl GuildPlayer {
     }
 
     pub async fn set_volume(&self, pct: u8) -> PlayerResult<u8> {
+        self.set_volume_with(pct, true).await
+    }
+
+    /// Silence, or the volume from before the silence.
+    pub async fn toggle_mute(&self) -> PlayerResult<bool> {
+        let restore = {
+            let mut s = self.inner.lock().await;
+            match s.muted_before.take() {
+                Some(v) => Some(v),
+                None => {
+                    s.muted_before = Some(s.volume);
+                    None
+                }
+            }
+        };
+        match restore {
+            Some(v) => {
+                self.set_volume_with(v, true).await?;
+                Ok(false)
+            }
+            None => {
+                self.set_volume_with(0, false).await?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Any volume set on purpose ends a mute; the mute itself asks to keep its memory.
+    async fn set_volume_with(&self, pct: u8, unmute: bool) -> PlayerResult<u8> {
         let pct = pct.min(150);
         let mut s = self.inner.lock().await;
+        if unmute {
+            s.muted_before = None;
+        }
         s.volume = pct;
         s.settings.volume = Some(pct);
         if let Some(cur) = &s.current {
@@ -891,6 +931,9 @@ impl GuildPlayer {
                 .and_then(|p| p.avatar_url);
             let bot_user_id = identity.as_ref().and_then(|i| i.user_id()).map(|u| u.get());
             let guild_name = identity.as_ref().and_then(|i| i.guild_name(self.guild_id));
+            let guild_icon = identity
+                .as_ref()
+                .and_then(|i| i.guild_icon_url(self.guild_id));
             let layouts = s.settings.layouts(
                 &identity
                     .as_ref()
@@ -907,6 +950,7 @@ impl GuildPlayer {
                 bot_avatar,
                 bot_user_id,
                 guild_name,
+                guild_icon,
                 icons,
                 web_base,
                 guild_id: self.guild_id,
@@ -919,6 +963,7 @@ impl GuildPlayer {
                     paused: c.paused,
                     cover: c.cover.clone(),
                     artist_art: c.artist_art.clone(),
+                    artist_banner: c.artist_banner.clone(),
                     links: c.links.clone(),
                 }),
                 queue: s.queue.iter().cloned().collect(),
@@ -927,6 +972,7 @@ impl GuildPlayer {
                 autoplay: s.autoplay,
                 shuffle: s.shuffle,
                 volume: s.volume,
+                muted: s.muted_before.is_some(),
                 normalize: s.normalize,
                 listeners: s.listeners.len(),
                 layouts: Arc::new(layouts),
@@ -1216,6 +1262,7 @@ impl GuildPlayer {
                 facts,
                 cover,
                 artist_art: None,
+                artist_banner: None,
                 paused: false,
                 play_id: None,
                 epoch: s.epoch,
@@ -1289,14 +1336,14 @@ impl GuildPlayer {
                 let Some(art) = hub::artist_art(&state, &track.artist_norm, None).await else {
                     return;
                 };
-                let Some(rel) = art.image_url else { return };
-                let Some((mime, bytes)) = hub::image(&state, &rel).await else {
+                let (image, banner) = hub::artist_pictures(&state, &art).await;
+                if image.is_none() && banner.is_none() {
                     return;
-                };
-                let cover = Cover::named(&format!("artist-{}", art.artist_id), &mime, bytes);
+                }
                 let mut s = p.inner.lock().await;
                 if let Some(cur) = s.current.as_mut().filter(|c| c.epoch == epoch) {
-                    cur.artist_art = Some(cover);
+                    cur.artist_art = image;
+                    cur.artist_banner = banner;
                     drop(s);
                     p.controller_wake.notify_one();
                 }
@@ -1610,9 +1657,13 @@ impl GuildPlayer {
         let Some(cur) = s.current.as_mut() else {
             return;
         };
-        for cover in [cur.cover.as_mut(), cur.artist_art.as_mut()]
-            .into_iter()
-            .flatten()
+        for cover in [
+            cur.cover.as_mut(),
+            cur.artist_art.as_mut(),
+            cur.artist_banner.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if let Some(a) = sent
                 .attachments
@@ -1715,6 +1766,7 @@ mod tests {
             bot_avatar: None,
             bot_user_id: None,
             guild_name: None,
+            guild_icon: None,
             web_base: None,
             guild_id: GuildId::new(1),
             voice_channel: None,
@@ -1726,6 +1778,7 @@ mod tests {
                 paused: false,
                 cover: None,
                 artist_art: None,
+                artist_banner: None,
                 links: None,
             }),
             queue: vec![item("a", 10_000), item("b", 20_000)],
@@ -1736,6 +1789,7 @@ mod tests {
             normalize: true,
             listeners: 0,
             shuffle: false,
+            muted: false,
             layouts: Arc::new(BotLayouts::default()),
         };
         assert_eq!(snap.queue_duration_ms(), 30_000);
@@ -1758,6 +1812,7 @@ mod tests {
             autoplay: false,
             shuffle: false,
             volume,
+            muted_before: None,
             normalize,
             listeners: HashSet::new(),
             idle_since: None,

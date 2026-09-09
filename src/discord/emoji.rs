@@ -35,7 +35,7 @@ const SIZE: u32 = 128;
 const NAME_PREFIX: &str = "cd_";
 /// Bumped whenever an existing emoji name changes meaning (a redrawn segment, say). It is part of
 /// the applied stamp, so a set made by an older build is regenerated rather than reused by name.
-pub const SET_VERSION: u32 = 3;
+pub const SET_VERSION: u32 = 4;
 
 /// The colour of a stateful button's icon while it is off: white, so the accent colour reads as
 /// "on" without a word of label.
@@ -78,6 +78,14 @@ pub enum Icon {
     Artist,
     Listening,
     List,
+    Leave,
+    Clear,
+    /// Muted, in the accent; and the same glyph in white while sound is on.
+    Mute,
+    MuteOff,
+    SeekBack,
+    SeekForward,
+    History,
     /// Progress-bar segments: left cap, middle, right cap, five states each (see [`BarState`]).
     BarL0,
     BarL1,
@@ -149,6 +157,13 @@ phosphor! {
     Artist => "artist", "user", "👤";
     Listening => "listening", "headphones", "🎧";
     List => "list", "list-dashes", "📋";
+    Leave => "leave", "sign-out", "🚪";
+    Clear => "clear", "broom", "🧹";
+    Mute => "mute", "speaker-slash", "🔇";
+    MuteOff => "muteoff", "speaker-slash", "🔇";
+    SeekBack => "seekback", "rewind", "⏪";
+    SeekForward => "seekforward", "fast-forward", "⏩";
+    History => "history", "clock-counter-clockwise", "🕘";
 }
 
 /// Which end of the bar a segment is.
@@ -300,7 +315,10 @@ impl Icon {
 
     /// An icon that is drawn in white rather than the accent: the "off" state of a button.
     pub fn is_off(self) -> bool {
-        matches!(self, Icon::ShuffleOff | Icon::LoopOff | Icon::RadioOff)
+        matches!(
+            self,
+            Icon::ShuffleOff | Icon::LoopOff | Icon::RadioOff | Icon::MuteOff
+        )
     }
 
     /// The SVG for this icon in `hex`.
@@ -561,7 +579,7 @@ mod tests {
             );
             assert!(names.insert(name), "duplicate emoji name {name}");
         }
-        assert_eq!(names.len(), 44);
+        assert_eq!(names.len(), 51);
     }
 
     #[test]

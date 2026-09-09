@@ -59,6 +59,7 @@ struct Sample {
     tracks: Vec<Arc<TrackRow>>,
     cover: Option<Cover>,
     artist_art: Option<Cover>,
+    artist_banner: Option<Cover>,
 }
 
 /// The made-up evening, for a library with nothing in it (or nothing with a picture).
@@ -122,6 +123,11 @@ fn stand_in(hex: &str) -> anyhow::Result<Sample> {
         }),
         artist_art: Some(Cover {
             filename: "artist-preview.png".into(),
+            bytes: mark.clone(),
+            attachment_id: None,
+        }),
+        artist_banner: Some(Cover {
+            filename: "banner-preview.png".into(),
             bytes: mark,
             attachment_id: None,
         }),
@@ -216,14 +222,9 @@ async fn sample(identity: &Identity, hex: &str) -> anyhow::Result<Sample> {
         return stand_in(hex);
     };
     let cover = Cover::load(&state.db, &track).await;
-    let artist_art = match hub::artist_art(state, &track.artist_norm, None).await {
-        Some(art) => match art.image_url {
-            Some(rel) => hub::image(state, &rel).await.map(|(mime, bytes)| {
-                Cover::named(&format!("artist-{}", art.artist_id), &mime, bytes)
-            }),
-            None => None,
-        },
-        None => None,
+    let (artist_art, artist_banner) = match hub::artist_art(state, &track.artist_norm, None).await {
+        Some(art) => hub::artist_pictures(state, &art).await,
+        None => (None, None),
     };
     let mut tracks = vec![Arc::new(track.clone())];
     tracks.extend(queue_after(state, &track).await);
@@ -231,6 +232,7 @@ async fn sample(identity: &Identity, hex: &str) -> anyhow::Result<Sample> {
         tracks,
         cover,
         artist_art,
+        artist_banner,
     })
 }
 
@@ -289,6 +291,7 @@ pub async fn render(
         bot_avatar: identity.profile().and_then(|p| p.avatar_url),
         bot_user_id: identity.user_id().map(|u| u.get()),
         guild_name: guild.and_then(|g| identity.guild_name(g)),
+        guild_icon: guild.and_then(|g| identity.guild_icon_url(g)),
         icons: identity.icons(),
         web_base: identity.web_base().await,
         guild_id: guild.unwrap_or(GuildId::new(1)),
@@ -301,6 +304,7 @@ pub async fn render(
             paused: false,
             cover: sample.cover.clone(),
             artist_art: sample.artist_art.clone(),
+            artist_banner: sample.artist_banner.clone(),
             links: hub::resolve_track(&identity.state, current).await,
         }),
         queue: queue.clone(),
@@ -309,6 +313,7 @@ pub async fn render(
         autoplay: true,
         shuffle: false,
         volume: 80,
+        muted: false,
         normalize: true,
         listeners: 3,
         layouts: Arc::new(layouts),
@@ -327,6 +332,7 @@ pub async fn render(
             None,
             sample.cover.as_ref(),
             sample.artist_art.as_ref(),
+            sample.artist_banner.as_ref(),
         ),
         LayoutView::Queue => views::queue_page(&snap, 0),
         LayoutView::History => {

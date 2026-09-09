@@ -12,13 +12,14 @@
 //! - The Queue button opens a new private message: a deferred ephemeral response, then the edit.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serenity::all::{ComponentInteraction, ComponentInteractionDataKind, Context, GuildId};
 
 use crate::discord::commands::guard;
 use crate::discord::commands::play::resolve;
 use crate::discord::identity::Identity;
-use crate::discord::player::{Cover, GuildPlayer, PlayerError, Position, QueueItem};
+use crate::discord::player::{Cover, GuildPlayer, LeaveReason, PlayerError, Position, QueueItem};
 use crate::discord::ui::custom_id::{Action, CustomId};
 use crate::discord::ui::{send, views};
 use crate::search::HitKind;
@@ -43,7 +44,9 @@ pub async fn handle(
 
     // Acknowledge before anything that can take time.
     match cid.action {
-        Action::QueueOpen | Action::Lyrics => send::component_defer_ephemeral(http, ic).await?,
+        Action::QueueOpen | Action::HistoryOpen | Action::Lyrics => {
+            send::component_defer_ephemeral(http, ic).await?
+        }
         _ => send::component_ack(http, ic).await?,
     }
     let player = identity.player(guild).await;
@@ -57,6 +60,11 @@ pub async fn handle(
         | Action::LoopCycle
         | Action::VolumeUp
         | Action::VolumeDown
+        | Action::Mute
+        | Action::SeekBack
+        | Action::SeekForward
+        | Action::Clear
+        | Action::Leave
         | Action::AutoplayToggle => {
             if let Err(r) =
                 guard::controller_for(identity, &player, guild, user, ic.member.as_ref()).await
@@ -89,7 +97,7 @@ pub async fn handle(
             // The view clamps to the last page.
             send::interaction_edit(http, token, views::queue_page(&snap, usize::MAX)).await
         }
-        Action::History(_) | Action::HistoryFirst | Action::HistoryLast => {
+        Action::HistoryOpen | Action::History(_) | Action::HistoryFirst | Action::HistoryLast => {
             let page = match cid.action {
                 Action::History(p) => p as usize,
                 Action::HistoryLast => usize::MAX,
@@ -179,8 +187,8 @@ pub async fn handle(
                     autoplay: false,
                 })
                 .collect();
-            let cover = match &art {
-                Some(art) => Some(art.clone()),
+            let cover = match &art.image {
+                Some(a) => Some(a.clone()),
                 None => Cover::load(&identity.state.db, &items[0].track).await,
             };
             match player.enqueue(items.clone(), Position::Last).await {
@@ -193,7 +201,8 @@ pub async fn handle(
                         &enq,
                         resolved.source.as_deref(),
                         cover.as_ref(),
-                        art.as_ref(),
+                        art.image.as_ref(),
+                        art.banner.as_ref(),
                     )
                     .ephemeral();
                     send::interaction_edit(http, token, toast).await
@@ -312,6 +321,29 @@ async fn controlled_action(action: &Action, player: &Arc<GuildPlayer>) -> Result
         Action::AutoplayToggle => {
             let snap = player.snapshot().await;
             player.set_autoplay(!snap.autoplay).await;
+            Ok(())
+        }
+        Action::Mute => player.toggle_mute().await.map(|_| ()),
+        Action::SeekBack | Action::SeekForward => {
+            let snap = player.snapshot().await;
+            let at = snap
+                .current
+                .as_ref()
+                .map(|c| c.position_ms)
+                .ok_or(PlayerError::NothingPlaying)?;
+            let to = if matches!(action, Action::SeekBack) {
+                at.saturating_sub(10_000)
+            } else {
+                at + 10_000
+            };
+            player.seek(Duration::from_millis(to)).await.map(|_| ())
+        }
+        Action::Clear => {
+            player.clear().await;
+            Ok(())
+        }
+        Action::Leave => {
+            player.leave(LeaveReason::Command).await;
             Ok(())
         }
         _ => Ok(()),

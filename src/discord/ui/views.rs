@@ -296,6 +296,19 @@ fn control(snap: &PlayerSnapshot, cur: &CurrentSnapshot, which: ControlButton) -
             },
         ),
         ControlButton::Lyrics => (Action::Lyrics, Icon::Lyrics),
+        ControlButton::Mute => (
+            Action::Mute,
+            if snap.muted {
+                Icon::Mute
+            } else {
+                Icon::MuteOff
+            },
+        ),
+        ControlButton::SeekBack => (Action::SeekBack, Icon::SeekBack),
+        ControlButton::SeekForward => (Action::SeekForward, Icon::SeekForward),
+        ControlButton::Clear => (Action::Clear, Icon::Clear),
+        ControlButton::History => (Action::HistoryOpen, Icon::History),
+        ControlButton::Leave => (Action::Leave, Icon::Leave),
     };
     btn(snap, action, icon)
 }
@@ -344,6 +357,7 @@ struct Scene<'a> {
     /// The pictures a layout may show, as uploads.
     cover: Option<&'a Cover>,
     artist_art: Option<&'a Cover>,
+    artist_banner: Option<&'a Cover>,
     toast: Option<Toast<'a>>,
     reason: Option<&'static str>,
     list: Vec<Entry>,
@@ -365,6 +379,7 @@ impl<'a> Scene<'a> {
             cur: None,
             cover: None,
             artist_art: None,
+            artist_banner: None,
             toast: None,
             reason: None,
             list: Vec::new(),
@@ -532,6 +547,7 @@ impl<'a> Scene<'a> {
             "player.loop" => snap.loop_mode.label().to_string(),
             "player.shuffle" => onoff(snap.shuffle),
             "player.autoplay" => onoff(snap.autoplay),
+            "player.muted" => onoff(snap.muted),
             "player.meta" => of_cur(&|c| meta_line(snap, c)),
             "player.line" => now_playing_line(snap),
             // the queue
@@ -609,6 +625,7 @@ struct Rendered {
     components: Vec<Component>,
     cover: bool,
     artist: bool,
+    banner: bool,
 }
 
 fn media_for(scene: &Scene, source: &ImageSource, used: &mut Rendered) -> Option<Media> {
@@ -621,7 +638,12 @@ fn media_for(scene: &Scene, source: &ImageSource, used: &mut Rendered) -> Option
             used.artist = true;
             Media::attachment(&c.filename)
         }),
+        ImageSource::ArtistBanner => scene.artist_banner.map(|c| {
+            used.banner = true;
+            Media::attachment(&c.filename)
+        }),
         ImageSource::BotAvatar => scene.snap.bot_avatar.as_deref().map(Media::url),
+        ImageSource::ServerIcon => scene.snap.guild_icon.as_deref().map(Media::url),
         ImageSource::Url { url } => {
             let url = scene.render(url);
             let url = url.trim();
@@ -669,6 +691,7 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
         components: Vec::new(),
         cover: false,
         artist: false,
+        banner: false,
     };
     for block in blocks {
         match block {
@@ -677,6 +700,7 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
                 trim_trailing_separators(&mut inner.components);
                 out.cover |= inner.cover;
                 out.artist |= inner.artist;
+                out.banner |= inner.banner;
                 if inner.components.is_empty() {
                     continue;
                 }
@@ -695,26 +719,32 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
                     out.components.push(text(s));
                 }
             }
-            LayoutBlock::Section { content, accessory } => {
-                let s = scene.render(content);
-                let body = (!s.trim().is_empty()).then(|| text(s));
+            LayoutBlock::Section { texts, accessory } => {
+                let bodies: Vec<Component> = texts
+                    .iter()
+                    .map(|t| scene.render(t))
+                    .filter(|s| !s.trim().is_empty())
+                    .map(text)
+                    .collect();
                 match accessory {
                     Accessory::Image { source } => {
-                        match (media_for(scene, source, &mut out), body) {
-                            (Some(m), Some(b)) => {
-                                out.components.push(section(vec![b], thumbnail(m, None)))
+                        match (media_for(scene, source, &mut out), bodies.is_empty()) {
+                            (Some(m), false) => {
+                                out.components.push(section(bodies, thumbnail(m, None)))
                             }
-                            (Some(m), None) => out.components.push(gallery(vec![m])),
-                            (None, Some(b)) => out.components.push(b),
-                            (None, None) => {}
+                            (Some(m), true) => out.components.push(gallery(vec![m])),
+                            (None, false) => out.components.extend(bodies),
+                            (None, true) => {}
                         }
                     }
-                    Accessory::Button { button: spec } => match (button_for(scene, spec), body) {
-                        (Some(b), Some(t)) => out.components.push(section(vec![t], b)),
-                        (Some(b), None) => out.components.push(row(vec![b])),
-                        (None, Some(t)) => out.components.push(t),
-                        (None, None) => {}
-                    },
+                    Accessory::Button { button: spec } => {
+                        match (button_for(scene, spec), bodies.is_empty()) {
+                            (Some(b), false) => out.components.push(section(bodies, b)),
+                            (Some(b), true) => out.components.push(row(vec![b])),
+                            (None, false) => out.components.extend(bodies),
+                            (None, true) => {}
+                        }
+                    }
                 }
             }
             LayoutBlock::Gallery { images } => {
@@ -867,6 +897,7 @@ fn finish(scene: &Scene, layout: &ViewLayout, reuse: bool) -> Message {
         &[
             r.cover.then_some(scene.cover).flatten(),
             r.artist.then_some(scene.artist_art).flatten(),
+            r.banner.then_some(scene.artist_banner).flatten(),
         ],
         reuse,
     )
@@ -879,10 +910,10 @@ pub fn uses_artist_art(layouts: &BotLayouts) -> bool {
             LayoutBlock::Section {
                 accessory: Accessory::Image { source },
                 ..
-            } => matches!(source, ImageSource::Artist),
-            LayoutBlock::Gallery { images } => {
-                images.iter().any(|i| matches!(i, ImageSource::Artist))
-            }
+            } => matches!(source, ImageSource::Artist | ImageSource::ArtistBanner),
+            LayoutBlock::Gallery { images } => images
+                .iter()
+                .any(|i| matches!(i, ImageSource::Artist | ImageSource::ArtistBanner)),
             _ => false,
         })
     })
@@ -907,6 +938,7 @@ pub fn now_playing(snap: &PlayerSnapshot, reuse: bool) -> Message {
     scene.cur = Some(cur);
     scene.cover = cur.cover.as_ref();
     scene.artist_art = cur.artist_art.as_ref();
+    scene.artist_banner = cur.artist_banner.as_ref();
     finish(&scene, &snap.layouts.now_playing, reuse)
 }
 
@@ -943,6 +975,7 @@ pub fn queued(
     source: Option<&str>,
     cover: Option<&Cover>,
     artist_art: Option<&Cover>,
+    artist_banner: Option<&Cover>,
 ) -> Message {
     let Some(first) = items.first() else {
         return notice(&snap.icons, "Nothing added", "No tracks matched.");
@@ -996,6 +1029,7 @@ pub fn queued(
     scene.track = Some(&first.track);
     scene.cover = cover;
     scene.artist_art = artist_art;
+    scene.artist_banner = artist_banner;
     scene.toast = Some(Toast {
         added,
         added_meta,
@@ -1566,6 +1600,7 @@ mod tests {
             bot_avatar: Some("https://cdn.discordapp.com/avatars/1/a.png".into()),
             bot_user_id: Some(9),
             guild_name: Some("Test guild".into()),
+            guild_icon: None,
             icons: Arc::new(IconSet::default()),
             web_base: None,
             guild_id: GuildId::new(777),
@@ -1578,6 +1613,7 @@ mod tests {
                 paused: false,
                 cover: with_cover.then(cover),
                 artist_art: None,
+                artist_banner: None,
                 links: None,
             }),
             queue: (0..queue)
@@ -1590,6 +1626,7 @@ mod tests {
             normalize: true,
             listeners: 3,
             shuffle: false,
+            muted: false,
             layouts: Arc::new(BotLayouts::default()),
         }
     }
@@ -1636,6 +1673,7 @@ mod tests {
                 None,
                 Some(&c),
                 None,
+                None,
             ),
             queued(
                 &s,
@@ -1644,6 +1682,7 @@ mod tests {
                     position: 0,
                     count: 1,
                 },
+                None,
                 None,
                 None,
                 None,
@@ -1658,6 +1697,7 @@ mod tests {
                 Some("Discovery"),
                 Some(&c),
                 Some(&c),
+                None,
             ),
             queue_page(&s, 0),
             queue_page(&s, 99),
@@ -1729,42 +1769,37 @@ mod tests {
         assert_eq!(c["type"], 17);
         assert_eq!(c["accent_color"], accent::BRAND);
         let kids = c["components"].as_array().unwrap();
-        // header, divider, section (track and badges beside the art), gap, progress, gap, two rows
-        assert_eq!(kids.len(), 8);
+        // header, divider, the section (everything beside the art), gap, two rows
+        assert_eq!(kids.len(), 6);
         let head = kids[0]["content"].as_str().unwrap();
-        assert!(head.starts_with("### ▶ Now playing"), "{head}");
-        assert!(head.contains("in 🎧 <#555>"), "{head}");
+        assert_eq!(head, "### ▶ Now playing in <#555>");
         assert_eq!(kids[2]["type"], 9);
         assert_eq!(kids[2]["accessory"]["type"], 11);
         assert_eq!(
             kids[2]["accessory"]["media"]["url"],
             "attachment://cover-c.jpg"
         );
-        let track = kids[2]["components"][0]["content"].as_str().unwrap();
-        assert!(
-            track.starts_with("**One More Time**\nDaft Punk · *Discovery*\n-# FLAC · "),
-            "{track}"
-        );
-        assert!(track.contains("Opus 96k"));
-        let progress = kids[4]["content"].as_str().unwrap();
-        assert!(progress.contains("1:05 / 5:20"));
+        let body = kids[2]["components"][0]["content"].as_str().unwrap();
         // Without the emoji set the bar is its text fallback: 12 cells, playhead a fifth in.
-        assert!(progress.starts_with("━━●─────────"), "{progress}");
-        assert!(progress.contains("\n-# Requested by <@42> · 3 in queue · vol 80%"));
-        let row1 = kids[6]["components"].as_array().unwrap();
-        let row2 = kids[7]["components"].as_array().unwrap();
+        assert_eq!(
+            body,
+            "**One More Time**\nDaft Punk · *Discovery*\n-# Requested by <@42>\n━━●───────── 1:05 / 5:20\n-# 3 tracks in queue (16:00) · Volume: 80%"
+        );
+        let row1 = kids[4]["components"].as_array().unwrap();
+        let row2 = kids[5]["components"].as_array().unwrap();
         assert_eq!(row1.len(), 5);
-        assert_eq!(row2.len(), 5);
+        assert_eq!(row2.len(), 4);
         // Every button is the neutral style; state lives in the icons, never in a label.
         assert!(row1.iter().chain(row2.iter()).all(|b| b["style"] == 2));
         assert!(row1.iter().chain(row2.iter()).all(|b| b["label"].is_null()));
-        assert_eq!(row1[1]["custom_id"], "cd:1:1:777:pl");
+        assert_eq!(row1[2]["custom_id"], "cd:1:1:777:pl");
         // Playing, so the play/pause button offers pause.
-        assert_eq!(row1[1]["emoji"]["name"], "⏸");
-        // Without the emoji set the state icons fall back to glyphs; the meta line says it in words.
-        assert_eq!(row2[0]["emoji"]["name"], "🔁");
-        assert_eq!(row2[4]["emoji"]["name"], "📻");
-        assert!(progress.contains("loop: queue") && progress.contains("autoplay"));
+        assert_eq!(row1[2]["emoji"]["name"], "⏸");
+        // Without the emoji set the state icons fall back to glyphs.
+        assert_eq!(row1[0]["emoji"]["name"], "🔁");
+        assert_eq!(row2[1]["emoji"]["name"], "📻");
+        assert_eq!(row2[3]["custom_id"], "cd:1:1:777:lv");
+        assert_eq!(row2[3]["emoji"]["name"], "🚪");
         // The cover rides along as an upload.
         assert_eq!(b["attachments"][0]["filename"], "cover-c.jpg");
         assert!(!m.ephemeral);
@@ -1783,7 +1818,7 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("### ⏸ Paused"));
-        assert_eq!(kids[6]["components"][1]["emoji"]["name"], "▶");
+        assert_eq!(kids[4]["components"][2]["emoji"]["name"], "▶");
     }
 
     #[test]
@@ -1802,16 +1837,15 @@ mod tests {
             head.starts_with("### <:cd_play:1000> Now playing"),
             "{head}"
         );
-        assert!(head.contains("in <:cd_listening:"), "{head}");
-        // No art here, so the section is plain text and the first button row is the seventh child.
-        let pause = &kids[6]["components"][1]["emoji"];
+        // No art here, so the section is plain text and the first button row is the fifth child.
+        let pause = &kids[4]["components"][2]["emoji"];
         assert_eq!(pause["name"], "cd_pause");
         assert_eq!(pause["id"], "1001");
         assert!(!b.to_string().contains('⏸'));
         // The bar is emojis too: the left cap, ten middles, the right cap.
-        let progress = kids[4]["content"].as_str().unwrap();
+        let progress = kids[2]["content"].as_str().unwrap();
         // 65 s of 320 s: the first two segments full, the playhead mid-third.
-        assert!(progress.starts_with("<:cd_bar_l3:"), "{progress}");
+        assert!(progress.contains("<:cd_bar_l3:"), "{progress}");
         assert!(progress.contains("<:cd_bar_m2:"), "{progress}");
         assert_eq!(progress.matches("<:cd_bar_").count(), 12);
         assert!(progress.contains("<:cd_bar_r0:"), "{progress}");
@@ -1881,12 +1915,15 @@ mod tests {
         let m = now_playing(&snap(0, true, false), false);
         let b = m.body();
         let kids = kids(&m);
-        // header, divider, track text, gap, progress, gap, two rows
-        assert_eq!(kids.len(), 8);
+        // header, divider, the section's text on its own, gap, two rows
+        assert_eq!(kids.len(), 6);
         assert_eq!(kids[2]["type"], 10);
         assert!(b["attachments"].as_array().unwrap().is_empty());
-        // With nothing queued the meta line says so.
-        assert!(kids[4]["content"].as_str().unwrap().contains("queue empty"));
+        // With nothing queued the line says so.
+        assert!(kids[2]["content"]
+            .as_str()
+            .unwrap()
+            .contains("0 tracks in queue (0:00)"));
     }
 
     #[test]
@@ -2080,13 +2117,15 @@ mod tests {
             LayoutView::NowPlaying,
             vec![
                 LayoutBlock::Section {
-                    content: "{emoji:listening} {channel} · {emoji:nope} · {bot} · {server}".into(),
+                    texts: vec![
+                        "{emoji:listening} {channel} · {emoji:nope} · {bot} · {server}".into(),
+                    ],
                     accessory: Accessory::Image {
                         source: ImageSource::BotAvatar,
                     },
                 },
                 LayoutBlock::Section {
-                    content: "{track.line}".into(),
+                    texts: vec!["{track.line}".into()],
                     accessory: Accessory::Button {
                         button: ButtonSpec::Link {
                             label: "Open {track.album}".into(),
@@ -2095,7 +2134,7 @@ mod tests {
                     },
                 },
                 LayoutBlock::Section {
-                    content: "-# {file} · {file.codec} · {file.bitrate} · {file.gain}".into(),
+                    texts: vec!["-# {file} · {file.codec} · {file.bitrate} · {file.gain}".into()],
                     accessory: Accessory::Image {
                         source: ImageSource::Url {
                             url: "{nope}".into(),
@@ -2311,6 +2350,7 @@ mod tests {
                 position: 1,
                 count: 1,
             },
+            None,
             None,
             None,
             None,
