@@ -262,11 +262,14 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
             .unwrap_or(voice);
         let player = identity.player(guild).await;
         match player.join(voice, text).await {
-            Ok(()) => tracing::info!(
-                bot = identity.index,
-                guild = guild.get(),
-                "rejoined 24/7 channel"
-            ),
+            Ok(()) => {
+                tracing::info!(
+                    bot = identity.index,
+                    guild = guild.get(),
+                    "rejoined 24/7 channel"
+                );
+                player.restore_saved().await;
+            }
             Err(e) => {
                 tracing::warn!(bot = identity.index, guild = guild.get(), error = %e, "24/7 rejoin failed")
             }

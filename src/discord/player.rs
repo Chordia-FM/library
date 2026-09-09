@@ -14,6 +14,7 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use poise::async_trait;
+use serde::{Deserialize, Serialize};
 use serenity::all::{ChannelId, GuildId, MessageId, UserId};
 use songbird::driver::Bitrate;
 use songbird::events::{Event, EventContext, EventHandler, TrackEvent};
@@ -27,7 +28,7 @@ use chordia_contracts::social::NowPlayingReport;
 use chordia_contracts::user::EqConfig;
 use uuid::Uuid;
 
-use crate::catalog::TrackRow;
+use crate::catalog::{self, TrackRow};
 use crate::discord::emoji::IconSet;
 use crate::discord::identity::Identity;
 use crate::discord::presence;
@@ -284,6 +285,14 @@ struct PlayerState {
     votes: HashSet<UserId>,
     /// The band the equalizer panel's nudge buttons act on.
     eq_band: usize,
+    /// When this stay in the voice channel began, for the session summary.
+    session_started_at: Option<i64>,
+    /// The next track, decoded ahead and waiting silently (or already blending in).
+    prepared: Option<Prepared>,
+    /// When the blend into `prepared` began, while it runs.
+    fading: Option<Instant>,
+    /// Where the current track was at the last look, for the queue a 24/7 bot keeps.
+    last_position_ms: u64,
     /// Since when nothing has been playing.
     idle_since: Option<Instant>,
     /// Since when the bot has been playing to nobody.
@@ -387,6 +396,56 @@ pub struct Enqueued {
     pub count: usize,
 }
 
+/// The next track, made ready ahead of time: its input decoded and its handle in the mixer,
+/// paused and silent until it is its turn, or blending in during a crossfade.
+struct Prepared {
+    item: QueueItem,
+    handle: TrackHandle,
+    facts: TrackFacts,
+    cover: Option<Cover>,
+    seekable: bool,
+    epoch: u64,
+}
+
+/// The queue a 24/7 bot keeps across a restart.
+#[derive(Serialize, Deserialize)]
+struct SavedQueue {
+    current: Option<SavedItem>,
+    position_ms: u64,
+    queue: Vec<SavedItem>,
+    loop_mode: String,
+    shuffle: bool,
+    autoplay: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedItem {
+    track_id: String,
+    requested_by: u64,
+    autoplay: bool,
+}
+
+impl SavedItem {
+    fn of(item: &QueueItem) -> Self {
+        SavedItem {
+            track_id: item.track.id.clone(),
+            requested_by: item.requested_by.get(),
+            autoplay: item.autoplay,
+        }
+    }
+}
+
+fn same_item(a: &QueueItem, b: &QueueItem) -> bool {
+    a.track.id == b.track.id && a.requested_by == b.requested_by && a.autoplay == b.autoplay
+}
+
+/// How far ahead of a track's end the next one is made ready.
+const PRELOAD_SECS: u64 = 8;
+/// How often the fader looks at the clock.
+const FADER_TICK: Duration = Duration::from_millis(400);
+/// How many plays a session summary lists.
+const SESSION_LIMIT: i64 = 25;
+
 /// Where a vote to skip stands after one more vote.
 #[derive(Debug, Clone, Copy)]
 pub struct VoteTally {
@@ -470,6 +529,10 @@ impl GuildPlayer {
                 listeners: HashSet::new(),
                 votes: HashSet::new(),
                 eq_band: 0,
+                session_started_at: None,
+                prepared: None,
+                fading: None,
+                last_position_ms: 0,
                 idle_since: None,
                 alone_since: None,
                 controller: None,
@@ -488,6 +551,7 @@ impl GuildPlayer {
             eq: eq::Shared::new(eq_config),
         });
         player.spawn_controller_task();
+        player.spawn_fader_task();
         player
     }
 
@@ -553,6 +617,9 @@ impl GuildPlayer {
         s.voice_channel = Some(voice);
         s.text_channel = Some(text);
         s.bitrate_kbps = bitrate_kbps;
+        if s.session_started_at.is_none() {
+            s.session_started_at = Some(settings::now_ms());
+        }
         if s.current.is_none() && s.idle_since.is_none() {
             s.idle_since = Some(Instant::now());
         }
@@ -563,8 +630,17 @@ impl GuildPlayer {
 
     /// Leave the voice channel, stop everything, and say why.
     pub async fn leave(self: &Arc<Self>, reason: LeaveReason) {
-        let (had_channel, controller, text) = {
+        let (had_channel, controller, text, session_since, summary_on, kept) = {
             let mut s = self.inner.lock().await;
+            let session_since = s.session_started_at.take();
+            let summary_on = s.settings.summary;
+            // A restart keeps a 24/7 server's queue for the rejoin; any other leave ends it.
+            let kept = (reason == LeaveReason::Shutdown && s.settings.always_on)
+                .then(|| Self::saved_state(&s));
+            if let Some(p) = s.prepared.take() {
+                let _ = p.handle.stop();
+            }
+            s.fading = None;
             s.stopping = true;
             s.queue.clear();
             s.history.clear();
@@ -572,7 +648,14 @@ impl GuildPlayer {
             if let Some(cur) = &s.current {
                 let _ = cur.handle.stop();
             }
-            (s.voice_channel.take(), s.controller.take(), s.text_channel)
+            (
+                s.voice_channel.take(),
+                s.controller.take(),
+                s.text_channel,
+                session_since,
+                summary_on,
+                kept,
+            )
         };
         if let Ok(identity) = self.identity() {
             if let Some(sb) = identity.songbird() {
@@ -611,9 +694,155 @@ impl GuildPlayer {
                             }
                         }
                     }
+                    drop(_edit);
+                    // What the session was, for the channel, once it is over for good.
+                    if let (Some(since), Some(ch)) = (session_since, text) {
+                        if summary_on && reason != LeaveReason::Shutdown {
+                            self.post_summary(&identity, &http, ch, since).await;
+                        }
+                    }
                 }
             }
+            self.keep_or_forget_queue(&identity, kept).await;
         }
+    }
+
+    /// The session's plays, posted where the controller was.
+    async fn post_summary(
+        &self,
+        identity: &Identity,
+        http: &serenity::all::Http,
+        channel: ChannelId,
+        since: i64,
+    ) {
+        let Some(app_id) = identity.app_id_sync() else {
+            return;
+        };
+        let plays = settings::plays_since(
+            &identity.state.db,
+            &app_id.to_string(),
+            &self.guild_id.to_string(),
+            since,
+            SESSION_LIMIT,
+        )
+        .await
+        .unwrap_or_default();
+        if plays.is_empty() {
+            return;
+        }
+        let facts = settings::SessionFacts::of(&plays, since);
+        let snap = self.snapshot().await;
+        if let Err(e) = ui::send::post(http, channel, views::session(&snap, &plays, &facts)).await {
+            tracing::warn!(guild = %self.guild_id, error = %e, "posting the session summary");
+        }
+    }
+
+    /// What the queue would need to come back as: the current track and where it was, what is
+    /// behind it, and the modes.
+    fn saved_state(s: &PlayerState) -> SavedQueue {
+        SavedQueue {
+            current: s.current.as_ref().map(|c| SavedItem::of(&c.item)),
+            position_ms: s.last_position_ms,
+            queue: s.queue.iter().map(SavedItem::of).collect(),
+            loop_mode: s.loop_mode.label().to_string(),
+            shuffle: s.shuffle,
+            autoplay: s.autoplay,
+        }
+    }
+
+    /// Write the queue down for a restart, or forget it: a 24/7 bot going down keeps it, any
+    /// other leave is the end of it.
+    async fn keep_or_forget_queue(&self, identity: &Identity, kept: Option<SavedQueue>) {
+        let Some(app_id) = identity.app_id_sync() else {
+            return;
+        };
+        let (app_id, guild_id) = (app_id.to_string(), self.guild_id.to_string());
+        let db = &identity.state.db;
+        let result = match kept.and_then(|k| serde_json::to_string(&k).ok()) {
+            Some(json) => settings::save_queue(db, &app_id, &guild_id, &json).await,
+            None => settings::clear_queue(db, &app_id, &guild_id).await,
+        };
+        if let Err(e) = result {
+            tracing::warn!(guild = %self.guild_id, error = %e, "keeping the queue for a restart");
+        }
+    }
+
+    /// Write the queue down while a 24/7 bot plays, so a crash loses at most a moment.
+    async fn persist_queue(&self) {
+        let state = {
+            let s = self.inner.lock().await;
+            if !s.settings.always_on || s.voice_channel.is_none() {
+                return;
+            }
+            Self::saved_state(&s)
+        };
+        let Ok(identity) = self.identity() else {
+            return;
+        };
+        let Some(app_id) = identity.app_id_sync() else {
+            return;
+        };
+        if let Ok(json) = serde_json::to_string(&state) {
+            let _ = settings::save_queue(
+                &identity.state.db,
+                &app_id.to_string(),
+                &self.guild_id.to_string(),
+                &json,
+            )
+            .await;
+        }
+    }
+
+    /// Bring back the queue a 24/7 bot was playing before a restart: the tracks still in the
+    /// library, the modes, and the place in the track that was playing.
+    pub async fn restore_saved(self: &Arc<Self>) {
+        let Ok(identity) = self.identity() else {
+            return;
+        };
+        let Some(app_id) = identity.app_id_sync() else {
+            return;
+        };
+        let db = &identity.state.db;
+        let Ok(Some(json)) =
+            settings::load_queue(db, &app_id.to_string(), &self.guild_id.to_string()).await
+        else {
+            return;
+        };
+        let Ok(saved) = serde_json::from_str::<SavedQueue>(&json) else {
+            return;
+        };
+        let mut items = Vec::new();
+        for it in saved.current.iter().chain(saved.queue.iter()) {
+            if let Ok(Some(row)) = catalog::get_track_row(db, &it.track_id).await {
+                items.push(QueueItem {
+                    track: Arc::new(row),
+                    requested_by: UserId::new(it.requested_by.max(1)),
+                    autoplay: it.autoplay,
+                });
+            }
+        }
+        {
+            let mut s = self.inner.lock().await;
+            s.loop_mode = match saved.loop_mode.as_str() {
+                "track" => LoopMode::Track,
+                "queue" => LoopMode::Queue,
+                _ => LoopMode::Off,
+            };
+            s.shuffle = saved.shuffle;
+            s.autoplay = saved.autoplay && s.settings.can_autoplay;
+        }
+        if items.is_empty() {
+            return;
+        }
+        let count = items.len();
+        if let Err(e) = self.enqueue(items, Position::Last).await {
+            tracing::warn!(guild = %self.guild_id, error = %e, "restoring the queue");
+            return;
+        }
+        if saved.current.is_some() && saved.position_ms > 5_000 {
+            let _ = self.seek(Duration::from_millis(saved.position_ms)).await;
+        }
+        tracing::info!(guild = %self.guild_id, tracks = count, "restored the queue after a restart");
     }
 
     /// The gateway says the bot is no longer in a voice channel (kicked, channel deleted).
@@ -748,6 +977,11 @@ impl GuildPlayer {
                 cur.played += t.elapsed();
             }
         }
+        if s.fading.is_some() {
+            if let Some(p) = &s.prepared {
+                let _ = p.handle.pause();
+            }
+        }
         drop(s);
         self.after_change().await;
         Ok(())
@@ -760,6 +994,11 @@ impl GuildPlayer {
             let _ = cur.handle.play();
             cur.paused = false;
             cur.resumed_at = Some(Instant::now());
+        }
+        if s.fading.is_some() {
+            if let Some(p) = &s.prepared {
+                let _ = p.handle.play();
+            }
         }
         drop(s);
         self.after_change().await;
@@ -799,6 +1038,10 @@ impl GuildPlayer {
                 .handle
                 .clone();
             s.stopping = true;
+            s.fading = None;
+            if let Some(p) = s.prepared.take() {
+                let _ = p.handle.stop();
+            }
             handle
         };
         let _ = handle.stop();
@@ -1395,6 +1638,12 @@ impl GuildPlayer {
 
     /// The next queued item: the head, or any item when shuffle is on.
     fn take_next(s: &mut PlayerState) -> Option<QueueItem> {
+        // A track made ready ahead is the one to take, wherever the shuffle would have gone.
+        if let Some(p) = &s.prepared {
+            if let Some(i) = s.queue.iter().position(|q| same_item(q, &p.item)) {
+                return s.queue.remove(i);
+            }
+        }
         if s.shuffle && s.queue.len() > 1 {
             use rand::Rng;
             let i = rand::thread_rng().gen_range(0..s.queue.len());
@@ -1428,25 +1677,40 @@ impl GuildPlayer {
     }
 
     async fn start(&self, item: QueueItem) -> PlayerResult<()> {
+        self.start_with(item, None).await
+    }
+
+    /// Start `item`: from a track made ready ahead (its handle already in the mixer), or from a
+    /// fresh input.
+    async fn start_with(&self, item: QueueItem, ready: Option<Prepared>) -> PlayerResult<()> {
         let identity = self.identity()?;
         let songbird = identity.songbird().ok_or(PlayerError::Offline)?;
         let call = songbird.get(self.guild_id).ok_or(PlayerError::NotInVoice)?;
-        let (input, mut facts) =
-            source::input_for(&identity.state, &item.track, None, Some(self.eq.clone()))
-                .await
-                .map_err(|e| PlayerError::Source(e.to_string()))?;
-        let seekable = !matches!(input, songbird::input::Input::Live(..));
-        let cover = Cover::load(&identity.state.db, &item.track).await;
         // The channel's bitrate can be changed while the bot sits in it; every track starts at the
         // current value so the encoder (and the badge) follow it.
         let voice = self.inner.lock().await.voice_channel;
         let kbps = voice.and_then(|vc| identity.channel_bitrate_kbps(self.guild_id, vc));
-        let handle = {
-            let mut call = call.lock().await;
-            if let Some(k) = kbps {
-                call.set_bitrate(Bitrate::Bits((k * 1000) as i32));
+        let (handle, mut facts, cover, seekable, ready_epoch) = match ready {
+            Some(p) => {
+                let _ = p.handle.play();
+                (p.handle, p.facts, p.cover, p.seekable, Some(p.epoch))
             }
-            call.play_only_input(input)
+            None => {
+                let (input, facts) =
+                    source::input_for(&identity.state, &item.track, None, Some(self.eq.clone()))
+                        .await
+                        .map_err(|e| PlayerError::Source(e.to_string()))?;
+                let seekable = !matches!(input, songbird::input::Input::Live(..));
+                let cover = Cover::load(&identity.state.db, &item.track).await;
+                let handle = {
+                    let mut call = call.lock().await;
+                    if let Some(k) = kbps {
+                        call.set_bitrate(Bitrate::Bits((k * 1000) as i32));
+                    }
+                    call.play_only_input(input)
+                };
+                (handle, facts, cover, seekable, None)
+            }
         };
         let self_arc = self
             .identity
@@ -1454,29 +1718,31 @@ impl GuildPlayer {
             .and_then(|i| i.player_arc(self.guild_id));
         let (epoch, listeners, guild_id, app_id) = {
             let mut s = self.inner.lock().await;
-            s.epoch += 1;
+            let epoch = match ready_epoch {
+                Some(e) => e,
+                None => {
+                    s.epoch += 1;
+                    s.epoch
+                }
+            };
             if kbps.is_some() {
                 s.bitrate_kbps = kbps;
             }
             facts.opus_kbps = s.bitrate_kbps;
             let volume = effective_volume(&s, &facts);
             let _ = handle.set_volume(volume);
-            if let Some(p) = &self_arc {
-                let _ = handle.add_event(
-                    Event::Track(TrackEvent::End),
-                    TrackEnd {
-                        player: Arc::downgrade(p),
-                        epoch: s.epoch,
-                    },
-                );
-                let _ = handle.add_event(
-                    Event::Track(TrackEvent::Error),
-                    TrackEnd {
-                        player: Arc::downgrade(p),
-                        epoch: s.epoch,
-                    },
-                );
+            if let (Some(p), None) = (&self_arc, ready_epoch) {
+                for event in [TrackEvent::End, TrackEvent::Error] {
+                    let _ = handle.add_event(
+                        Event::Track(event),
+                        TrackEnd {
+                            player: Arc::downgrade(p),
+                            epoch,
+                        },
+                    );
+                }
             }
+            s.fading = None;
             s.votes.clear();
             s.current = Some(Playing {
                 item: item.clone(),
@@ -1487,7 +1753,7 @@ impl GuildPlayer {
                 artist_banner: None,
                 paused: false,
                 play_id: None,
-                epoch: s.epoch,
+                epoch,
                 seekable,
                 offset_ms: 0,
                 played: Duration::ZERO,
@@ -1505,7 +1771,7 @@ impl GuildPlayer {
                 None
             };
             (
-                s.epoch,
+                epoch,
                 s.listeners.len() as u32,
                 self.guild_id,
                 identity.app_id_sync(),
@@ -1710,14 +1976,194 @@ impl GuildPlayer {
         };
         match next {
             Some(item) => {
-                if let Err(e) = self.start(item.clone()).await {
+                let ready = self.take_prepared_for(&item).await;
+                let started = match ready {
+                    Some(p) => self.start_with(item.clone(), Some(p)).await,
+                    None => self.start(item.clone()).await,
+                };
+                if let Err(e) = started {
                     tracing::warn!(guild = %self.guild_id, track = %item.track.id, error = %e, "next track failed to start");
                     self.announce_error(&item, &e).await;
                     self.advance().await;
                 }
             }
-            None => self.became_idle().await,
+            None => {
+                self.drop_prepared().await;
+                self.became_idle().await
+            }
         }
+    }
+
+    /// The track made ready ahead, when it is `item`; anything else made ready is let go.
+    async fn take_prepared_for(&self, item: &QueueItem) -> Option<Prepared> {
+        let mut s = self.inner.lock().await;
+        s.fading = None;
+        let p = s.prepared.take()?;
+        if same_item(&p.item, item) {
+            Some(p)
+        } else {
+            let _ = p.handle.stop();
+            None
+        }
+    }
+
+    async fn drop_prepared(&self) {
+        let mut s = self.inner.lock().await;
+        s.fading = None;
+        if let Some(p) = s.prepared.take() {
+            let _ = p.handle.stop();
+        }
+    }
+
+    // ---- the fader: the next track ready ahead, and the blend into it ----------------------------
+
+    fn spawn_fader_task(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(FADER_TICK).await;
+                let Some(player) = weak.upgrade() else { break };
+                let Ok(identity) = player.identity() else {
+                    break;
+                };
+                if identity.cancel.is_cancelled() {
+                    break;
+                }
+                player.fader_tick().await;
+            }
+        });
+    }
+
+    /// Every few hundred milliseconds while a track plays: note where it is, make the next one
+    /// ready as the end nears, and, with a crossfade set, blend the two.
+    async fn fader_tick(self: &Arc<Self>) {
+        let (handle, offset, duration, paused, fade_secs, fading, has_prepared) = {
+            let s = self.inner.lock().await;
+            let Some(cur) = s.current.as_ref() else {
+                return;
+            };
+            (
+                cur.handle.clone(),
+                cur.offset_ms,
+                cur.item.track.duration_ms.max(0) as u64,
+                cur.paused,
+                s.settings.crossfade_secs,
+                s.fading,
+                s.prepared.is_some(),
+            )
+        };
+        if paused {
+            return;
+        }
+        let Ok(info) = handle.get_info().await else {
+            return;
+        };
+        let position = offset + info.position.as_millis() as u64;
+        {
+            let mut s = self.inner.lock().await;
+            s.last_position_ms = position;
+        }
+        if let Some(started) = fading {
+            let fade = Duration::from_secs(u64::from(fade_secs.max(1)));
+            let t = (started.elapsed().as_secs_f32() / fade.as_secs_f32()).clamp(0.0, 1.0);
+            let s = self.inner.lock().await;
+            if let (Some(cur), Some(p)) = (s.current.as_ref(), s.prepared.as_ref()) {
+                let _ = cur
+                    .handle
+                    .set_volume(effective_volume(&s, &cur.facts) * (1.0 - t));
+                let _ = p.handle.set_volume(effective_volume(&s, &p.facts) * t);
+            }
+            return;
+        }
+        if duration == 0 {
+            return;
+        }
+        let remaining = duration.saturating_sub(position);
+        let ahead = u64::from(fade_secs).max(PRELOAD_SECS) * 1000;
+        if !has_prepared && remaining <= ahead {
+            self.prepare_next().await;
+        }
+        if fade_secs > 0 && remaining <= u64::from(fade_secs) * 1000 {
+            let mut s = self.inner.lock().await;
+            if let Some(p) = s.prepared.as_ref() {
+                let _ = p.handle.set_volume(0.0);
+                let _ = p.handle.play();
+                s.fading = Some(Instant::now());
+            }
+        }
+    }
+
+    /// Decode the next track ahead of time and put it in the mixer, paused and silent, so the
+    /// change is instant (and, with a crossfade, so it can blend in).
+    async fn prepare_next(self: &Arc<Self>) {
+        let item = {
+            let s = self.inner.lock().await;
+            if s.prepared.is_some() || s.stopping || s.current.is_none() {
+                return;
+            }
+            let repeat =
+                s.loop_mode == LoopMode::Track && !s.skip_requested && s.next_override.is_none();
+            if repeat {
+                s.current.as_ref().map(|c| c.item.clone())
+            } else if let Some(o) = &s.next_override {
+                Some(o.clone())
+            } else if s.shuffle && s.queue.len() > 1 {
+                use rand::Rng;
+                let i = rand::thread_rng().gen_range(0..s.queue.len());
+                s.queue.get(i).cloned()
+            } else {
+                s.queue.front().cloned()
+            }
+        };
+        let Some(item) = item else { return };
+        let Ok(identity) = self.identity() else {
+            return;
+        };
+        let Some(call) = identity.songbird().and_then(|sb| sb.get(self.guild_id)) else {
+            return;
+        };
+        let Ok((input, mut facts)) =
+            source::input_for(&identity.state, &item.track, None, Some(self.eq.clone())).await
+        else {
+            return;
+        };
+        let seekable = !matches!(input, songbird::input::Input::Live(..));
+        let cover = Cover::load(&identity.state.db, &item.track).await;
+        let handle = call.lock().await.play_input(input);
+        let _ = handle.pause();
+        let _ = handle.set_volume(0.0);
+        let _ = handle.make_playable_async().await;
+        let self_arc = self
+            .identity
+            .upgrade()
+            .and_then(|i| i.player_arc(self.guild_id));
+        let mut s = self.inner.lock().await;
+        if s.prepared.is_some() || s.current.is_none() || s.stopping {
+            let _ = handle.stop();
+            return;
+        }
+        s.epoch += 1;
+        let epoch = s.epoch;
+        facts.opus_kbps = s.bitrate_kbps;
+        if let Some(p) = &self_arc {
+            for event in [TrackEvent::End, TrackEvent::Error] {
+                let _ = handle.add_event(
+                    Event::Track(event),
+                    TrackEnd {
+                        player: Arc::downgrade(p),
+                        epoch,
+                    },
+                );
+            }
+        }
+        s.prepared = Some(Prepared {
+            item,
+            handle,
+            facts,
+            cover,
+            seekable,
+            epoch,
+        });
     }
 
     async fn became_idle(self: &Arc<Self>) {
@@ -1797,6 +2243,7 @@ impl GuildPlayer {
                 }
                 tokio::time::sleep(CONTROLLER_COALESCE).await;
                 player.render_controller().await;
+                player.persist_queue().await;
             }
         });
     }
@@ -2035,6 +2482,10 @@ mod tests {
             current: None,
             votes: HashSet::new(),
             eq_band: 0,
+            session_started_at: None,
+            prepared: None,
+            fading: None,
+            last_position_ms: 0,
             loop_mode: LoopMode::Off,
             autoplay: false,
             shuffle: false,

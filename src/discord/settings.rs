@@ -416,6 +416,10 @@ pub struct GuildSettings {
     pub vote_percent: u8,
     /// The server's equalizer: the web client's model, applied to what the bot plays.
     pub eq: EqConfig,
+    /// Post what the session was when the bot leaves after playing.
+    pub summary: bool,
+    /// Seconds each track blends into the next; 0 is none.
+    pub crossfade_secs: u8,
     /// This server's own versions of some of the bot's messages, over the bot's layouts.
     pub layout_overrides: LayoutOverrides,
 }
@@ -475,6 +479,8 @@ impl GuildSettings {
             skip_mode: SkipMode::Single,
             vote_percent: 50,
             eq: eq::default_config(),
+            summary: true,
+            crossfade_secs: 0,
             layout_overrides: LayoutOverrides::default(),
         }
     }
@@ -510,6 +516,9 @@ pub struct GuildSettingsPatch {
     pub vote_percent: Option<u8>,
     /// Kept to the ten bands and the range on the way in.
     pub eq: Option<EqConfig>,
+    pub summary: Option<bool>,
+    /// Kept to twelve seconds at most.
+    pub crossfade_secs: Option<u8>,
     /// Checked against the layout rules by the API before it gets here.
     pub layout_overrides: Option<LayoutOverrides>,
 }
@@ -560,6 +569,12 @@ impl GuildSettingsPatch {
         if let Some(v) = self.eq {
             s.eq = eq::tidy(&v);
         }
+        if let Some(v) = self.summary {
+            s.summary = v;
+        }
+        if let Some(v) = self.crossfade_secs {
+            s.crossfade_secs = v.min(MAX_CROSSFADE_SECS);
+        }
         if let Some(v) = self.layout_overrides {
             s.layout_overrides = v;
         }
@@ -585,6 +600,8 @@ struct GuildRow {
     skip_mode: String,
     vote_percent: i64,
     eq: Option<String>,
+    summary: i64,
+    crossfade_secs: i64,
     layout_overrides: Option<String>,
 }
 
@@ -617,6 +634,8 @@ impl From<GuildRow> for GuildSettings {
                 .and_then(|j| serde_json::from_str::<EqConfig>(j).ok())
                 .map(|c| eq::tidy(&c))
                 .unwrap_or_else(eq::default_config),
+            summary: r.summary != 0,
+            crossfade_secs: r.crossfade_secs.clamp(0, MAX_CROSSFADE_SECS as i64) as u8,
             layout_overrides: r
                 .layout_overrides
                 .as_deref()
@@ -632,7 +651,8 @@ impl From<GuildRow> for GuildSettings {
 
 const GUILD_COLS: &str = "app_id, guild_id, dj_role_ids, controller_channel_id, \
      controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce, \
-     can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, eq, layout_overrides";
+     can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, eq, summary, \
+     crossfade_secs, layout_overrides";
 
 pub async fn load_guild(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<GuildSettings> {
     let row = sqlx::query_as::<_, GuildRow>(AssertSqlSafe(format!(
@@ -667,8 +687,8 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
         "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_ids, controller_channel_id, \
              controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, \
              announce, can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, \
-             eq, layout_overrides, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             eq, summary, crossfade_secs, layout_overrides, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id, guild_id) DO UPDATE SET \
              dj_role_ids = excluded.dj_role_ids, \
              controller_channel_id = excluded.controller_channel_id, \
@@ -678,8 +698,9 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
              announce = excluded.announce, can_always_on = excluded.can_always_on, \
              can_autoplay = excluded.can_autoplay, announce_after = excluded.announce_after, \
              skip_mode = excluded.skip_mode, vote_percent = excluded.vote_percent, \
-             eq = excluded.eq, layout_overrides = excluded.layout_overrides, \
-             updated_at = excluded.updated_at",
+             eq = excluded.eq, summary = excluded.summary, \
+             crossfade_secs = excluded.crossfade_secs, \
+             layout_overrides = excluded.layout_overrides, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
     .bind(&s.guild_id)
@@ -698,6 +719,8 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(s.skip_mode.as_str())
     .bind(s.vote_percent as i64)
     .bind(serde_json::to_string(&s.eq).ok())
+    .bind(s.summary as i64)
+    .bind(s.crossfade_secs as i64)
     .bind(overrides)
     .bind(now_ms())
     .execute(db)
@@ -812,6 +835,111 @@ pub struct PlayEntry {
     pub started_at: i64,
     pub ms_played: i64,
     pub scrobbled_for: i64,
+    /// How many were in the channel when it started.
+    pub listeners: i64,
+}
+
+/// What a session came to, from its plays.
+#[derive(Debug, Clone, Default)]
+pub struct SessionFacts {
+    pub count: usize,
+    pub total_ms: u64,
+    pub peak_listeners: u32,
+    pub requesters: usize,
+    pub since_ms: i64,
+}
+
+impl SessionFacts {
+    pub fn of(plays: &[PlayEntry], since_ms: i64) -> Self {
+        let mut requesters: Vec<&str> = plays
+            .iter()
+            .filter_map(|p| p.requested_by.as_deref())
+            .collect();
+        requesters.sort_unstable();
+        requesters.dedup();
+        SessionFacts {
+            count: plays.len(),
+            total_ms: plays.iter().map(|p| p.ms_played.max(0) as u64).sum(),
+            peak_listeners: plays
+                .iter()
+                .map(|p| p.listeners.max(0) as u32)
+                .max()
+                .unwrap_or(0),
+            requesters: requesters.len(),
+            since_ms,
+        }
+    }
+}
+
+/// The most a crossfade may overlap, in seconds.
+pub const MAX_CROSSFADE_SECS: u8 = 12;
+
+/// The plays of a session, oldest first: everything since `since_ms`, up to `limit`.
+pub async fn plays_since(
+    db: &SqlitePool,
+    app_id: &str,
+    guild_id: &str,
+    since_ms: i64,
+    limit: i64,
+) -> AppResult<Vec<PlayEntry>> {
+    Ok(sqlx::query_as::<_, PlayEntry>(
+        "SELECT COALESCE(t.title, '?') AS title, COALESCE(ar.name, '') AS artist, \
+                p.requested_by, p.started_at, p.ms_played, p.scrobbled_for, p.listeners \
+         FROM discord_plays p \
+         LEFT JOIN tracks t ON t.id = p.track_id \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         WHERE p.app_id = ? AND p.guild_id = ? AND p.started_at >= ? \
+         ORDER BY p.started_at ASC LIMIT ?",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .bind(since_ms)
+    .bind(limit)
+    .fetch_all(db)
+    .await?)
+}
+
+/// The queue a 24/7 bot was playing when it went down, as JSON, for the rejoin.
+pub async fn save_queue(
+    db: &SqlitePool,
+    app_id: &str,
+    guild_id: &str,
+    state: &str,
+) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO discord_saved_queue (app_id, guild_id, state, saved_at) VALUES (?, ?, ?, ?) \
+         ON CONFLICT(app_id, guild_id) DO UPDATE SET state = excluded.state, saved_at = excluded.saved_at",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .bind(state)
+    .bind(now_ms())
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+pub async fn load_queue(
+    db: &SqlitePool,
+    app_id: &str,
+    guild_id: &str,
+) -> AppResult<Option<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT state FROM discord_saved_queue WHERE app_id = ? AND guild_id = ?",
+    )
+    .bind(app_id)
+    .bind(guild_id)
+    .fetch_optional(db)
+    .await?)
+}
+
+pub async fn clear_queue(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<()> {
+    sqlx::query("DELETE FROM discord_saved_queue WHERE app_id = ? AND guild_id = ?")
+        .bind(app_id)
+        .bind(guild_id)
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// The last `limit` plays in a guild, newest first, from the persistent log rather than the
@@ -824,7 +952,7 @@ pub async fn recent_plays(
 ) -> AppResult<Vec<PlayEntry>> {
     Ok(sqlx::query_as::<_, PlayEntry>(
         "SELECT COALESCE(t.title, '?') AS title, COALESCE(ar.name, '') AS artist, \
-                p.requested_by, p.started_at, p.ms_played, p.scrobbled_for \
+                p.requested_by, p.started_at, p.ms_played, p.scrobbled_for, p.listeners \
          FROM discord_plays p \
          LEFT JOIN tracks t ON t.id = p.track_id \
          LEFT JOIN artists ar ON ar.id = t.artist_id \
