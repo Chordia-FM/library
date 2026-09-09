@@ -429,6 +429,9 @@ pub struct GuildPlayer {
     identity: Weak<Identity>,
     inner: Mutex<PlayerState>,
     controller_wake: Notify,
+    /// One controller edit at a time, so a redraw already in flight cannot land over the
+    /// goodbye the bot leaves behind.
+    controller_edit: Mutex<()>,
 }
 
 impl GuildPlayer {
@@ -469,6 +472,7 @@ impl GuildPlayer {
                 settings,
             }),
             controller_wake: Notify::new(),
+            controller_edit: Mutex::new(()),
         });
         player.spawn_controller_task();
         player
@@ -577,12 +581,16 @@ impl GuildPlayer {
             self.push_now_playing().await;
             presence::update(&identity).await;
             if had_channel.is_some() {
+                // After any redraw in flight, so the goodbye is the last word on the message.
+                let _edit = self.controller_edit.lock().await;
                 let snap = self.snapshot().await;
                 let msg = views::left(&snap, reason);
                 if let Some(http) = identity.http() {
                     match controller {
                         Some((ch, id)) => {
-                            let _ = ui::send::edit(&http, ch, id, msg).await;
+                            if let Err(e) = ui::send::edit(&http, ch, id, msg).await {
+                                tracing::warn!(guild = %self.guild_id, error = %e, "editing the controller into the goodbye");
+                            }
                         }
                         None => {
                             if let Some(ch) = text {
@@ -1663,6 +1671,7 @@ impl GuildPlayer {
             return;
         };
         let Some(http) = identity.http() else { return };
+        let _edit = self.controller_edit.lock().await;
         let (text, controller, repost) = {
             let s = self.inner.lock().await;
             if s.voice_channel.is_none() {
