@@ -10,6 +10,8 @@ repository = "https://github.com/chordia-fm/library"
 [dependencies]
 # Local dev path dep; switch to the published crate once `contracts` ships.
 chordia-contracts = { path = "../contracts" }
+# The Discord bot's command descriptions in the locales the catalogs cover (embedded at build time).
+chordia-i18n = { path = "../i18n", optional = true }
 
 # Web / async
 axum = { version = "0.8", features = ["macros"] }
@@ -105,7 +107,7 @@ resvg = { version = "0.48.1", default-features = false, features = [
 
 [features]
 default = ["discord"]
-discord = ["dep:serenity", "dep:poise", "dep:songbird", "dep:resvg"]
+discord = ["dep:serenity", "dep:poise", "dep:songbird", "dep:resvg", "dep:chordia-i18n"]
 
 [dev-dependencies]
 # Generate self-signed certs in tests (no external openssl needed).

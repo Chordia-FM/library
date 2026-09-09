@@ -105,7 +105,7 @@ async fn run_once(identity: &Arc<Identity>) -> anyhow::Result<Exit> {
     let setup_data = data.clone();
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
-            commands: commands::all(),
+            commands: commands::localized(commands::all()),
             event_handler: |ctx, event, fw, data| Box::pin(on_event(ctx, event, fw, data)),
             on_error: |e| Box::pin(commands::on_error(e)),
             ..Default::default()
@@ -225,18 +225,31 @@ async fn on_ready(
     rejoin_always_on(identity).await;
 }
 
-/// 24/7 guilds get their bot back after a restart, in the channel it was keeping, announcing in
-/// the controller's channel (or the voice channel's own chat when none is known).
+/// After a restart, every server the bot was busy in gets it back as it was (its restart
+/// record), and 24/7 servers with nothing recorded get it back in the channel they keep.
 async fn rejoin_always_on(identity: &Arc<Identity>) {
     let Some(app_id) = identity.app_id_sync() else {
         return;
     };
-    let guilds = match crate::discord::settings::load_guilds(
-        &identity.state.db,
-        &app_id.to_string(),
-    )
-    .await
+    let db = &identity.state.db;
+    let app = app_id.to_string();
+    let mut restored = std::collections::HashSet::new();
+    for (guild_id, json) in crate::discord::settings::load_queues(db, &app)
+        .await
+        .unwrap_or_default()
     {
+        let Some(guild) = guild_id.parse::<u64>().ok().map(GuildId::new) else {
+            continue;
+        };
+        let player = identity.player(guild).await;
+        if player.restore(&json).await {
+            restored.insert(guild);
+        } else {
+            // A channel that is gone stays gone; the record would only fail again.
+            let _ = crate::discord::settings::clear_queue(db, &app, &guild_id).await;
+        }
+    }
+    let guilds = match crate::discord::settings::load_guilds(db, &app).await {
         Ok(g) => g,
         Err(e) => {
             tracing::warn!(error = %e, "loading guild settings for 24/7 rejoin");
@@ -253,6 +266,9 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
             continue;
         };
         let guild = GuildId::new(guild);
+        if restored.contains(&guild) {
+            continue;
+        }
         let voice = serenity::all::ChannelId::new(voice);
         let text = gs
             .controller_channel_id
@@ -262,14 +278,11 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
             .unwrap_or(voice);
         let player = identity.player(guild).await;
         match player.join(voice, text).await {
-            Ok(()) => {
-                tracing::info!(
-                    bot = identity.index,
-                    guild = guild.get(),
-                    "rejoined 24/7 channel"
-                );
-                player.restore_saved().await;
-            }
+            Ok(()) => tracing::info!(
+                bot = identity.index,
+                guild = guild.get(),
+                "rejoined 24/7 channel"
+            ),
             Err(e) => {
                 tracing::warn!(bot = identity.index, guild = guild.get(), error = %e, "24/7 rejoin failed")
             }

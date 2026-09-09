@@ -60,8 +60,58 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         settings::settings(),
         settings::dj(),
         settings::skipmode(),
+        settings::pickup(),
         settings::always_on(),
     ]
+}
+
+/// Discord's interface languages, as Discord names them. Each gets the command descriptions in
+/// its language where the `discord` catalog has them (the catalog crate maps `de` to `de-DE`,
+/// `ja` to `ja-JP`, and so on); the rest read the English.
+const DISCORD_LOCALES: &[&str] = &[
+    "id", "da", "de", "en-GB", "en-US", "es-ES", "es-419", "fr", "hr", "it", "lt", "hu", "nl",
+    "no", "pl", "pt-BR", "ro", "fi", "sv-SE", "vi", "tr", "cs", "el", "bg", "ru", "uk", "hi", "th",
+    "zh-CN", "ja", "zh-TW", "ko",
+];
+
+/// Discord's ceiling on a description, in characters.
+const DESCRIPTION_MAX: usize = 100;
+
+/// The commands with their descriptions localized from the `discord` catalog: a command's
+/// description at `discord:commands.<name>.description`, a parameter's at
+/// `discord:commands.<name>.params.<param>`. Names stay English so `/play` is `/play` everywhere.
+pub fn localized(
+    mut commands: Vec<poise::Command<Data, Error>>,
+) -> Vec<poise::Command<Data, Error>> {
+    for c in &mut commands {
+        let base = format!("discord:commands.{}", c.name);
+        fill(
+            &mut c.description_localizations,
+            &format!("{base}.description"),
+        );
+        for p in &mut c.parameters {
+            fill(
+                &mut p.description_localizations,
+                &format!("{base}.params.{}", p.name),
+            );
+        }
+    }
+    commands
+}
+
+/// Every Discord locale's rendering of `key` that differs from the English, kept to Discord's
+/// length. A key the catalog lacks, or a locale that falls back to English, adds nothing.
+fn fill(into: &mut std::collections::HashMap<String, String>, key: &str) {
+    let english = chordia_i18n::t0("en", key);
+    if english == key {
+        return;
+    }
+    for locale in DISCORD_LOCALES {
+        let text = chordia_i18n::t0(locale, key);
+        if text != key && text != english && text.chars().count() <= DESCRIPTION_MAX {
+            into.insert((*locale).to_string(), text);
+        }
+    }
 }
 
 /// The bot's icon set, for views that have no player snapshot to take it from.
@@ -111,5 +161,83 @@ pub async fn on_error(error: poise::FrameworkError<'_, Data, Error>) {
                 tracing::warn!(error = %e, "poise error handler failed");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The catalog's English is the code's: a description edited in one place and not the
+    /// other would hand translators a stale source.
+    #[test]
+    fn the_catalog_mirrors_every_description_in_the_code() {
+        for c in all() {
+            let key = format!("discord:commands.{}.description", c.name);
+            assert_eq!(
+                chordia_i18n::t0("en", &key),
+                c.description.clone().unwrap_or_default(),
+                "{key}"
+            );
+            for p in &c.parameters {
+                let key = format!("discord:commands.{}.params.{}", c.name, p.name);
+                assert_eq!(
+                    chordia_i18n::t0("en", &key),
+                    p.description.clone().unwrap_or_default(),
+                    "{key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_command_reads_in_the_translated_languages_and_within_discords_limit() {
+        let commands = localized(all());
+        for c in &commands {
+            for locale in ["de", "fr", "es-ES", "pt-BR", "ja", "ko"] {
+                let d = c
+                    .description_localizations
+                    .get(locale)
+                    .unwrap_or_else(|| panic!("/{} has no {locale} description", c.name));
+                assert!(
+                    d.chars().count() <= DESCRIPTION_MAX,
+                    "/{} {locale}: {d}",
+                    c.name
+                );
+                // A parameter that is only a range ("0–150") reads the same in every language and
+                // carries nothing; the rest are translated and within the limit.
+                for p in &c.parameters {
+                    if let Some(d) = p.description_localizations.get(locale) {
+                        assert!(
+                            d.chars().count() <= DESCRIPTION_MAX,
+                            "/{} {}",
+                            c.name,
+                            p.name
+                        );
+                    } else {
+                        assert!(
+                            p.description
+                                .as_deref()
+                                .unwrap_or("")
+                                .starts_with(char::is_numeric),
+                            "/{} {} has no {locale} text",
+                            c.name,
+                            p.name
+                        );
+                    }
+                }
+            }
+            // English-speaking regions read the source and carry nothing extra.
+            assert!(!c.description_localizations.contains_key("en-GB"));
+            assert!(!c.description_localizations.contains_key("en-US"));
+            // Names stay English everywhere.
+            assert!(c.name_localizations.is_empty());
+        }
+        // The registered set's hash covers the localizations, so a new translation re-registers.
+        let plain =
+            serde_json::to_string(&poise::builtins::create_application_commands(&all())).unwrap();
+        let local = serde_json::to_string(&poise::builtins::create_application_commands(&commands))
+            .unwrap();
+        assert_ne!(plain, local);
     }
 }
