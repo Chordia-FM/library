@@ -1,11 +1,12 @@
-//! Transport: `/skip`, `/back`, `/pause`, `/resume`, `/stop`, `/seek`, `/volume`, `/loop`,
-//! `/join`, `/leave`, `/radio`.
+//! Transport: `/skip`, `/forceskip`, `/vote`, `/back`, `/pause`, `/resume`, `/stop`, `/seek`,
+//! `/volume`, `/loop`, `/join`, `/leave`, `/radio`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::{guard, Context, Error};
 use crate::discord::player::{GuildPlayer, LeaveReason, LoopMode, PlayerError};
+use crate::discord::settings::SkipMode;
 use crate::discord::ui::{fmt, send, views};
 
 /// Fetch the guild's player and run the controller guard; answers the refusal itself.
@@ -47,13 +48,45 @@ async fn player_error(ctx: Context<'_>, title: &str, e: PlayerError) -> Result<(
     .await
 }
 
-/// Skip the current track
+/// Skip the current track, or vote to when this server skips by vote
 #[poise::command(slash_command, guild_only)]
 pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
+    let guild = super::guild_of(ctx)?;
+    let voting = match ctx.data().player_arc(guild) {
+        Some(p) => p.settings().await.skip_mode == SkipMode::Vote,
+        None => false,
+    };
+    if voting {
+        return cast_vote(ctx).await;
+    }
     ctx.defer_ephemeral().await?;
     let Some(player) = controlled(ctx).await? else {
         return Ok(());
     };
+    skip_now(ctx, &player).await
+}
+
+/// Skip the current track at once: DJs, or server managers where there are no DJ roles
+#[poise::command(slash_command, guild_only)]
+pub async fn forceskip(ctx: Context<'_>) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    let guild = super::guild_of(ctx)?;
+    let Some(player) = ctx.data().player_arc(guild) else {
+        return nothing_playing(ctx).await;
+    };
+    if let Err(r) = guard::dj(ctx, &player).await {
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
+    }
+    skip_now(ctx, &player).await
+}
+
+/// Vote to skip the current track
+#[poise::command(slash_command, guild_only)]
+pub async fn vote(ctx: Context<'_>) -> Result<(), Error> {
+    cast_vote(ctx).await
+}
+
+async fn skip_now(ctx: Context<'_>, player: &GuildPlayer) -> Result<(), Error> {
     match player.skip().await {
         Ok(item) => {
             send::respond(
@@ -63,6 +96,59 @@ pub async fn skip(ctx: Context<'_>) -> Result<(), Error> {
             .await
         }
         Err(e) => player_error(ctx, "Couldn't skip", e).await,
+    }
+}
+
+async fn nothing_playing(ctx: Context<'_>) -> Result<(), Error> {
+    send::respond(
+        ctx,
+        views::notice(
+            &super::snap(ctx).await,
+            "Nothing is playing",
+            "-# `/play` something first.",
+        ),
+    )
+    .await
+}
+
+/// One vote to skip. Refused privately when the caller is not listening or the server does not
+/// skip by vote; otherwise counted and told to the channel, so everyone sees how far along it is.
+async fn cast_vote(ctx: Context<'_>) -> Result<(), Error> {
+    let guild = super::guild_of(ctx)?;
+    let Some(player) = ctx.data().player_arc(guild) else {
+        ctx.defer_ephemeral().await?;
+        return nothing_playing(ctx).await;
+    };
+    if player.settings().await.skip_mode != SkipMode::Vote {
+        ctx.defer_ephemeral().await?;
+        return send::respond(
+            ctx,
+            views::notice(
+                &super::snap(ctx).await,
+                "No vote needed here",
+                "-# This server skips with `/skip`. A vote is only taken when it is set to.",
+            ),
+        )
+        .await;
+    }
+    let user = ctx.author().id;
+    if !player.is_listener(user).await {
+        ctx.defer_ephemeral().await?;
+        return send::respond(
+            ctx,
+            views::notice(
+                &super::snap(ctx).await,
+                "Join the voice channel to vote",
+                "-# Only listeners vote.",
+            ),
+        )
+        .await;
+    }
+    // Votes are public: the channel sees the tally.
+    ctx.defer().await?;
+    match player.vote_skip(user).await {
+        Ok(tally) => send::respond(ctx, views::vote(&player.snapshot().await, &tally, user)).await,
+        Err(e) => player_error(ctx, "Couldn't vote", e).await,
     }
 }
 

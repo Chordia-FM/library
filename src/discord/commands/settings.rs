@@ -1,10 +1,57 @@
-//! `/settings`, `/dj`, `/247`: what a server admin sets for this bot in this guild.
+//! `/settings`, `/dj`, `/247`, `/skipmode`: what a server admin sets for this bot in this guild.
 
 use serenity::all::Role;
 
 use super::{guard, Context, Error};
 use crate::discord::player::LeaveReason;
+use crate::discord::settings::SkipMode;
 use crate::discord::ui::{send, views};
+
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+pub enum SkipChoice {
+    #[name = "single"]
+    Single,
+    #[name = "vote"]
+    Vote,
+}
+
+/// How a track gets skipped: by one person, or by a vote among the listeners
+#[poise::command(slash_command, guild_only)]
+pub async fn skipmode(
+    ctx: Context<'_>,
+    #[description = "Single: whoever may control playback skips at once. Vote: listeners vote"]
+    mode: SkipChoice,
+    #[description = "Share of the listeners a vote needs, 1 to 100 (default 50)"]
+    #[min = 1]
+    #[max = 100]
+    percent: Option<u8>,
+) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    if let Err(r) = guard::admin(ctx).await {
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
+    }
+    let guild = super::guild_of(ctx)?;
+    let player = ctx.data().player(guild).await;
+    let updated = player
+        .update_settings(|s| {
+            s.skip_mode = match mode {
+                SkipChoice::Single => SkipMode::Single,
+                SkipChoice::Vote => SkipMode::Vote,
+            };
+            if let Some(p) = percent {
+                s.vote_percent = p.clamp(1, 100);
+            }
+        })
+        .await;
+    let detail = match updated.skip_mode {
+        SkipMode::Single => "-# Whoever may control playback skips at once; `/forceskip` is for DJs.".to_string(),
+        SkipMode::Vote => format!(
+            "-# `/skip` or `/vote` casts a vote; the track goes at {}% of the listeners. DJs can still `/forceskip`.",
+            updated.vote_percent
+        ),
+    };
+    send::respond(ctx, views::ok(&super::snap(ctx).await, "Skipping", &detail)).await
+}
 
 /// This server's settings for the bot
 #[poise::command(slash_command, guild_only)]

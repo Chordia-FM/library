@@ -39,6 +39,8 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         queue::clear(),
         queue::shuffle(),
         control::skip(),
+        control::forceskip(),
+        control::vote(),
         control::back(),
         control::pause(),
         control::resume(),
@@ -54,6 +56,7 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         info::stats(),
         settings::settings(),
         settings::dj(),
+        settings::skipmode(),
         settings::always_on(),
     ]
 }

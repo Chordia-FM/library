@@ -277,6 +277,8 @@ struct PlayerState {
     normalize: bool,
     /// Non-bot users in the bot's voice channel.
     listeners: HashSet<UserId>,
+    /// Who has voted to skip the current track.
+    votes: HashSet<UserId>,
     /// Since when nothing has been playing.
     idle_since: Option<Instant>,
     /// Since when the bot has been playing to nobody.
@@ -378,6 +380,18 @@ pub struct Enqueued {
     pub count: usize,
 }
 
+/// Where a vote to skip stands after one more vote.
+#[derive(Debug, Clone, Copy)]
+pub struct VoteTally {
+    pub count: usize,
+    pub needed: usize,
+    /// People in the voice channel, bots aside.
+    pub listeners: usize,
+    pub percent: u8,
+    /// Enough: the track was skipped.
+    pub passed: bool,
+}
+
 impl PlayerSnapshot {
     /// The bot's facts with no player at hand, for a reply outside any server: nothing plays,
     /// nothing is queued, and the layouts are the bot's own.
@@ -440,6 +454,7 @@ impl GuildPlayer {
                 muted_before: None,
                 normalize: settings.normalize,
                 listeners: HashSet::new(),
+                votes: HashSet::new(),
                 idle_since: None,
                 alone_since: None,
                 controller: None,
@@ -553,6 +568,7 @@ impl GuildPlayer {
             {
                 let mut s = self.inner.lock().await;
                 s.current = None;
+                s.votes.clear();
                 s.stopping = false;
                 s.idle_since = None;
                 s.alone_since = None;
@@ -637,6 +653,36 @@ impl GuildPlayer {
         s.skip_requested = true;
         let _ = handle.stop();
         Ok(item)
+    }
+
+    /// One more vote to skip the current track, from `user`; the track goes when the tally
+    /// reaches what the server's rule asks for. Voting twice counts once.
+    pub async fn vote_skip(&self, user: UserId) -> PlayerResult<VoteTally> {
+        let mut s = self.inner.lock().await;
+        let cur = s.current.as_ref().ok_or(PlayerError::NothingPlaying)?;
+        let handle = cur.handle.clone();
+        s.votes.insert(user);
+        let listeners = s.listeners.len().max(1);
+        let needed = s.settings.votes_needed(listeners);
+        let count = s.votes.len();
+        let passed = count >= needed;
+        if passed {
+            s.votes.clear();
+            s.skip_requested = true;
+            let _ = handle.stop();
+        }
+        Ok(VoteTally {
+            count,
+            needed,
+            listeners,
+            percent: s.settings.vote_percent,
+            passed,
+        })
+    }
+
+    /// Whether `user` is in the bot's voice channel.
+    pub async fn is_listener(&self, user: UserId) -> bool {
+        self.inner.lock().await.listeners.contains(&user)
     }
 
     /// Go back to the previous track; the current one returns to the front of the queue.
@@ -1288,6 +1334,7 @@ impl GuildPlayer {
                     },
                 );
             }
+            s.votes.clear();
             s.current = Some(Playing {
                 item: item.clone(),
                 handle,
@@ -1840,6 +1887,7 @@ mod tests {
             queue: VecDeque::new(),
             history: VecDeque::new(),
             current: None,
+            votes: HashSet::new(),
             loop_mode: LoopMode::Off,
             autoplay: false,
             shuffle: false,

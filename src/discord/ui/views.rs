@@ -38,7 +38,7 @@
 
 use serenity::all::UserId;
 
-use super::custom_id::{Action, CustomId};
+use super::custom_id::{Action, CustomId, Origin};
 use super::fmt::{self, accent};
 use super::template;
 use super::v2::{
@@ -48,7 +48,7 @@ use super::v2::{
 use crate::catalog::TrackRow;
 use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
 use crate::discord::player::{
-    Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem,
+    Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem, VoteTally,
 };
 use crate::discord::settings::{GuildSettings, PlayEntry};
 use crate::discord::source::TrackFacts;
@@ -177,8 +177,11 @@ fn id(snap: &PlayerSnapshot, action: Action) -> String {
     CustomId::new(snap.bot_index, snap.guild_id.get(), action).to_string()
 }
 
-fn btn(snap: &PlayerSnapshot, action: Action, icon: Icon) -> Component {
-    button(Button::new(ButtonStyle::Secondary, id(snap, action)).emoji(snap.icons.get(icon)))
+/// A control's button, noting which message it sits on when that is not the controller.
+fn btn(scene: &Scene, action: Action, icon: Icon) -> Component {
+    let snap = scene.snap;
+    let cid = CustomId::new(snap.bot_index, snap.guild_id.get(), action).on(scene.origin);
+    button(Button::new(ButtonStyle::Secondary, cid.to_string()).emoji(snap.icons.get(icon)))
 }
 
 /// A bar of `cells` segment emojis (or their text fallbacks) filled to `position` of `total`.
@@ -258,7 +261,8 @@ fn now_playing_line(snap: &PlayerSnapshot) -> String {
 
 /// One control as a button. Stateful ones carry their state in the icon's colour: white off,
 /// accent on, and the loop's "1" for one track. No labels; the icons are their own explanation.
-fn control(snap: &PlayerSnapshot, cur: &CurrentSnapshot, which: ControlButton) -> Component {
+fn control(scene: &Scene, cur: &CurrentSnapshot, which: ControlButton) -> Component {
+    let snap = scene.snap;
     let (action, icon) = match which {
         ControlButton::Previous => (Action::Previous, Icon::Prev),
         // The play/pause button shows what pressing it will do.
@@ -310,7 +314,7 @@ fn control(snap: &PlayerSnapshot, cur: &CurrentSnapshot, which: ControlButton) -
         ControlButton::History => (Action::HistoryOpen, Icon::History),
         ControlButton::Leave => (Action::Leave, Icon::Leave),
     };
-    btn(snap, action, icon)
+    btn(scene, action, icon)
 }
 
 // ---- the layout interpreter ----------------------------------------------------------------------
@@ -373,6 +377,11 @@ struct Scene<'a> {
     detail: Option<&'a str>,
     /// The page of lyrics shown.
     lyrics: Option<&'a str>,
+    /// A vote to skip, and who just cast one.
+    vote: Option<&'a VoteTally>,
+    voter: Option<UserId>,
+    /// Which message this is when it is not the controller, for its controls to say so.
+    origin: Option<Origin>,
     list: Vec<Entry>,
     /// The page shown (0-based, already clamped) and how many there are.
     page: usize,
@@ -397,6 +406,9 @@ impl<'a> Scene<'a> {
             reason: None,
             detail: None,
             lyrics: None,
+            vote: None,
+            voter: None,
+            origin: None,
             list: Vec::new(),
             page: 0,
             pages: 1,
@@ -455,6 +467,7 @@ impl<'a> Scene<'a> {
         let of_facts = |f: &dyn Fn(&TrackFacts) -> String| facts.map(f).unwrap_or_default();
         let of_toast = |f: &dyn Fn(&Toast) -> String| toast.map(f).unwrap_or_default();
         let of_cur = |f: &dyn Fn(&CurrentSnapshot) -> String| cur.map(f).unwrap_or_default();
+        let of_vote = |f: &dyn Fn(&VoteTally) -> String| self.vote.map(f).unwrap_or_default();
         Some(match name {
             // the message
             "icon" => icons.get(self.icon).markup(),
@@ -628,6 +641,13 @@ impl<'a> Scene<'a> {
             "left.reason" => self.reason.unwrap_or("").to_string(),
             // lyrics
             "lyrics" => self.lyrics.map(fmt::escape_md).unwrap_or_default(),
+            // a vote to skip
+            "vote.by" => self.voter.map(mention).unwrap_or_default(),
+            "vote.count" => of_vote(&|v| v.count.to_string()),
+            "vote.needed" => of_vote(&|v| v.needed.to_string()),
+            "vote.remaining" => of_vote(&|v| v.needed.saturating_sub(v.count).to_string()),
+            "vote.listeners" => of_vote(&|v| v.listeners.to_string()),
+            "vote.percent" => of_vote(&|v| v.percent.to_string()),
             // pages
             "page" => format!("{}/{}", self.page + 1, self.pages),
             "page.number" => (self.page + 1).to_string(),
@@ -690,7 +710,13 @@ fn media_for(scene: &Scene, source: &ImageSource, used: &mut Rendered) -> Option
 
 fn button_for(scene: &Scene, spec: &ButtonSpec) -> Option<Component> {
     match spec {
-        ButtonSpec::Control { control: which } => scene.cur.map(|c| control(scene.snap, c, *which)),
+        // A control needs something playing (the play/pause button shows its state); it goes on
+        // any message, not only ones about the current track.
+        ButtonSpec::Control { control: which } => scene
+            .snap
+            .current
+            .as_ref()
+            .map(|c| control(scene, c, *which)),
         ButtonSpec::Link { label, url } => {
             let url = scene.render(url);
             let url = url.trim();
@@ -1161,6 +1187,7 @@ pub fn queue_page(snap: &PlayerSnapshot, page: usize) -> Message {
         })
         .collect();
     scene.paged(list, page, &snap.layouts.queue, Paging::Queue);
+    scene.origin = Some(Origin::Queue(scene.page as u32));
     finish(&scene, &snap.layouts.queue, false).ephemeral()
 }
 
@@ -1231,6 +1258,7 @@ pub fn history(snap: &PlayerSnapshot, plays: &[PlayEntry], page: usize) -> Messa
         })
         .collect();
     scene.paged(list, page, &snap.layouts.history, Paging::History);
+    scene.origin = Some(Origin::History(scene.page as u32));
     finish(&scene, &snap.layouts.history, false).ephemeral()
 }
 
@@ -1365,6 +1393,12 @@ fn reply(snap: &PlayerSnapshot, kind: Reply, title: &str, detail: &str) -> Messa
     };
     let mut scene = Scene::new(snap, icon, title, accent);
     scene.detail = Some(detail);
+    with_current(&mut scene, snap);
+    finish(&scene, layout, false).ephemeral()
+}
+
+/// Whatever is playing, for a message that is not about it but may mention it.
+fn with_current<'a>(scene: &mut Scene<'a>, snap: &'a PlayerSnapshot) {
     if let Some(cur) = &snap.current {
         scene.track = Some(&cur.item.track);
         scene.links = cur.links.as_ref();
@@ -1373,7 +1407,21 @@ fn reply(snap: &PlayerSnapshot, kind: Reply, title: &str, detail: &str) -> Messa
         scene.artist_art = cur.artist_art.as_ref();
         scene.artist_banner = cur.artist_banner.as_ref();
     }
-    finish(&scene, layout, false).ephemeral()
+}
+
+/// A listener's vote to skip with the tally, laid out by the `vote` layout; public, so the
+/// channel sees how far along it is. Once it passed, the `vote_passed` layout instead.
+pub fn vote(snap: &PlayerSnapshot, tally: &VoteTally, by: UserId) -> Message {
+    let (icon, heading, layout) = if tally.passed {
+        (Icon::Next, "Skipped by vote", &snap.layouts.vote_passed)
+    } else {
+        (Icon::Vote, "Vote to skip", &snap.layouts.vote)
+    };
+    let mut scene = Scene::new(snap, icon, heading, snap.icons.accent());
+    scene.vote = Some(tally);
+    scene.voter = Some(by);
+    with_current(&mut scene, snap);
+    finish(&scene, layout, false)
 }
 
 /// Something went wrong: red, laid out by the `error` layout.
@@ -1459,13 +1507,14 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
     } else {
         not_enabled
     };
+    let skip = gs.skip_label();
     let mut body = header(
         &icons.get(Icon::Gear),
         "Settings",
         Some(&format!("{} in this server", snap.bot_name)),
     );
     body.push(text(format!(
-        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Re-post controller when it scrolls away** · {}",
+        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Skipping** · {skip}\n**Re-post controller when it scrolls away** · {}",
         onoff(gs.normalize),
         onoff(gs.announce)
     )));
@@ -1529,6 +1578,7 @@ pub fn lyrics(snap: &PlayerSnapshot, track: &TrackRow, pages: &[String], page: u
         scene.artist_banner = cur.artist_banner.as_ref();
     }
     scene.paged_text(pages, page, &snap.layouts.lyrics, Paging::Lyrics);
+    scene.origin = Some(Origin::Lyrics(scene.page as u32));
     finish(&scene, &snap.layouts.lyrics, false).ephemeral()
 }
 
@@ -2480,6 +2530,72 @@ mod tests {
         let top = m.body()["components"].as_array().unwrap().clone();
         assert_eq!(top.len(), 1);
         assert!(top[0]["content"].as_str().unwrap().starts_with(" 1. "));
+    }
+
+    #[test]
+    fn a_vote_reads_its_tally_and_a_control_on_a_page_says_where_it_sits() {
+        let s = snap(2, true, false);
+        let tally = VoteTally {
+            count: 1,
+            needed: 2,
+            listeners: 3,
+            percent: 50,
+            passed: false,
+        };
+        let m = vote(&s, &tally, UserId::new(42));
+        m.validate().unwrap();
+        // Public: the channel sees the tally.
+        assert_eq!(m.body()["flags"].as_u64().unwrap_or(0) & 64, 0);
+        let body = kids(&m)[0]["content"].as_str().unwrap().to_string();
+        assert!(body.contains("Vote to skip"), "{body}");
+        assert!(
+            body.contains("<@42> wants to skip **One More Time**"),
+            "{body}"
+        );
+        assert!(body.contains("1 of 2 votes · 50% of 3 listening"), "{body}");
+        let passed = vote(
+            &s,
+            &VoteTally {
+                count: 2,
+                passed: true,
+                ..tally
+            },
+            UserId::new(42),
+        );
+        let body = kids(&passed)[0]["content"].as_str().unwrap().to_string();
+        assert!(body.contains("Skipped by vote"), "{body}");
+        assert!(body.contains("2 votes"), "{body}");
+
+        // A control on the queue page carries the page, so a press redraws it.
+        let mut s = snap(25, true, false);
+        s.layouts = Arc::new(BotLayouts {
+            queue: ViewLayout {
+                blocks: vec![
+                    LayoutBlock::List {
+                        item: "{index}. {track.title}".into(),
+                        empty: "-".into(),
+                        page_size: 10,
+                    },
+                    LayoutBlock::Row {
+                        buttons: vec![ButtonSpec::Control {
+                            control: ControlButton::Clear,
+                        }],
+                    },
+                    LayoutBlock::Pager,
+                ],
+            },
+            ..Default::default()
+        });
+        let m = queue_page(&s, 1);
+        m.validate().unwrap();
+        let top = m.body()["components"].as_array().unwrap().clone();
+        assert_eq!(top[1]["components"][0]["custom_id"], "cd:1:1:777:cl:@q1");
+        // The controller's own controls say nothing.
+        let c = now_playing(&s, false).body();
+        assert_eq!(
+            c["components"][0]["components"][4]["components"][2]["custom_id"],
+            "cd:1:1:777:pl"
+        );
     }
 
     #[test]

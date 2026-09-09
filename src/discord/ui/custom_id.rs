@@ -1,4 +1,4 @@
-//! Component `custom_id`s: `cd:1:<bot>:<guild>:<action>[:<arg>]`.
+//! Component `custom_id`s: `cd:1:<bot>:<guild>:<action>[:<arg>][:@<origin>]`.
 //!
 //! Every button and select the bot posts carries which identity and guild it belongs to, so an id
 //! that arrives on the wrong bot (a copied message, a stale controller after a token reshuffle) is
@@ -142,23 +142,72 @@ impl Action {
     }
 }
 
+/// The message a control sits on when it is not the controller (a page of the queue, the
+/// history or the lyrics): that message is redrawn after the press, since what it shows has just
+/// changed. Carried as a trailing `@q2` / `@h0` / `@l1`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    Queue(u32),
+    History(u32),
+    Lyrics(u32),
+}
+
+impl Origin {
+    fn code(self) -> String {
+        match self {
+            Origin::Queue(p) => format!("@q{p}"),
+            Origin::History(p) => format!("@h{p}"),
+            Origin::Lyrics(p) => format!("@l{p}"),
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        let mut rest = s.strip_prefix('@')?.chars();
+        let kind = rest.next()?;
+        let page: u32 = rest.as_str().parse().ok()?;
+        Some(match kind {
+            'q' => Origin::Queue(page),
+            'h' => Origin::History(page),
+            'l' => Origin::Lyrics(page),
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CustomId {
     /// Identity index in the token list.
     pub bot: u8,
     pub guild: u64,
     pub action: Action,
+    /// Set on a control placed on a queue, history or lyrics message.
+    pub origin: Option<Origin>,
 }
 
 impl CustomId {
     pub fn new(bot: u8, guild: u64, action: Action) -> Self {
-        Self { bot, guild, action }
+        Self {
+            bot,
+            guild,
+            action,
+            origin: None,
+        }
+    }
+
+    /// Note which message the component sits on.
+    pub fn on(mut self, origin: Option<Origin>) -> Self {
+        self.origin = origin;
+        self
     }
 }
 
 impl fmt::Display for CustomId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cd:1:{}:{}:{}", self.bot, self.guild, self.action.code())
+        write!(f, "cd:1:{}:{}:{}", self.bot, self.guild, self.action.code())?;
+        if let Some(o) = self.origin {
+            write!(f, ":{}", o.code())?;
+        }
+        Ok(())
     }
 }
 
@@ -166,16 +215,30 @@ impl FromStr for CustomId {
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, ()> {
-        let mut parts = s.splitn(6, ':');
-        if parts.next() != Some("cd") || parts.next() != Some("1") {
+        let mut parts: Vec<&str> = s.split(':').collect();
+        if parts.len() < 5 || parts[0] != "cd" || parts[1] != "1" {
             return Err(());
         }
-        let bot = parts.next().and_then(|b| b.parse().ok()).ok_or(())?;
-        let guild = parts.next().and_then(|g| g.parse().ok()).ok_or(())?;
-        let code = parts.next().ok_or(())?;
-        let arg = parts.next();
-        let action = Action::parse(code, arg).ok_or(())?;
-        Ok(CustomId { bot, guild, action })
+        let origin = match parts.last() {
+            Some(last) if last.starts_with('@') => {
+                let o = Origin::parse(last).ok_or(())?;
+                parts.pop();
+                Some(o)
+            }
+            _ => None,
+        };
+        let bot = parts[2].parse().map_err(|_| ())?;
+        let guild = parts[3].parse().map_err(|_| ())?;
+        let code = parts[4];
+        // An argument keeps any colons of its own.
+        let arg = (parts.len() > 5).then(|| parts[5..].join(":"));
+        let action = Action::parse(code, arg.as_deref()).ok_or(())?;
+        Ok(CustomId {
+            bot,
+            guild,
+            action,
+            origin,
+        })
     }
 }
 
@@ -225,6 +288,19 @@ mod tests {
             assert!(s.len() < 100, "{s}");
             assert_eq!(s.parse::<CustomId>().unwrap(), id, "{s}");
         }
+        for o in [Origin::Queue(2), Origin::History(0), Origin::Lyrics(7)] {
+            let id = CustomId::new(1, 5, Action::Skip).on(Some(o));
+            let s = id.to_string();
+            assert!(s.ends_with(&o.code()), "{s}");
+            assert_eq!(s.parse::<CustomId>().unwrap(), id, "{s}");
+        }
+        assert_eq!(
+            "cd:1:1:5:cl:@q3".parse::<CustomId>().unwrap().origin,
+            Some(Origin::Queue(3))
+        );
+        assert!("cd:1:1:5:sk:@x1".parse::<CustomId>().is_err());
+        assert!("cd:1:1:5:sk:@".parse::<CustomId>().is_err());
+        assert!("cd:1:1:5:sk:@q".parse::<CustomId>().is_err());
     }
 
     #[test]

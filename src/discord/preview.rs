@@ -24,7 +24,7 @@ use crate::discord::hub;
 use crate::discord::identity::Identity;
 use crate::discord::lyrics;
 use crate::discord::player::{
-    Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem,
+    Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem, VoteTally,
 };
 use crate::discord::settings::{self, PlayEntry};
 use crate::discord::source::TrackFacts;
@@ -402,6 +402,28 @@ pub async fn render(
             &snap,
             "Couldn't join",
             "-# I'm not allowed to connect to that channel.",
+        ),
+        LayoutView::Vote => views::vote(
+            &snap,
+            &VoteTally {
+                count: 2,
+                needed: 3,
+                listeners: 5,
+                percent: 50,
+                passed: false,
+            },
+            UserId::new(listener),
+        ),
+        LayoutView::VotePassed => views::vote(
+            &snap,
+            &VoteTally {
+                count: 3,
+                needed: 3,
+                listeners: 5,
+                percent: 50,
+                passed: true,
+            },
+            UserId::new(listener),
         ),
         LayoutView::Queue => views::queue_page(&snap, 0),
         LayoutView::History => {

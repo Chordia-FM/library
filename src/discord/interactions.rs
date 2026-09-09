@@ -19,9 +19,12 @@ use serenity::all::{ComponentInteraction, ComponentInteractionDataKind, Context,
 use crate::discord::commands::guard;
 use crate::discord::commands::play::resolve;
 use crate::discord::identity::Identity;
-use crate::discord::player::{Cover, GuildPlayer, LeaveReason, PlayerError, Position, QueueItem};
-use crate::discord::ui::custom_id::{Action, CustomId};
-use crate::discord::ui::{send, views};
+use crate::discord::player::{
+    Cover, GuildPlayer, LeaveReason, PlayerError, PlayerSnapshot, Position, QueueItem,
+};
+use crate::discord::settings::{self, PlayEntry, SkipMode};
+use crate::discord::ui::custom_id::{Action, CustomId, Origin};
+use crate::discord::ui::{send, views, Message};
 use crate::search::HitKind;
 
 pub async fn handle(
@@ -65,6 +68,25 @@ pub async fn handle(
         | Action::Clear
         | Action::Leave
         | Action::AutoplayToggle => {
+            // Under the vote rule a Skip press is a vote, from anyone listening.
+            if matches!(cid.action, Action::Skip)
+                && player.settings().await.skip_mode == SkipMode::Vote
+            {
+                let snap = player.snapshot().await;
+                let msg = if player.is_listener(user).await {
+                    match player.vote_skip(user).await {
+                        Ok(tally) => views::vote(&snap, &tally, user),
+                        Err(e) => views::error(&snap, "Couldn't vote", &format!("-# {e}")),
+                    }
+                } else {
+                    views::notice(
+                        &snap,
+                        "Join the voice channel to vote",
+                        "-# Only listeners vote.",
+                    )
+                };
+                return send::interaction_followup(http, token, msg).await;
+            }
             if let Err(r) =
                 guard::controller_for(identity, &player, guild, user, ic.member.as_ref()).await
             {
@@ -85,7 +107,19 @@ pub async fn handle(
                     "Couldn't do that",
                     &format!("-# {e}"),
                 );
-                send::interaction_followup(http, token, err).await?;
+                return send::interaction_followup(http, token, err).await;
+            }
+            // Pressed on a queue, history or lyrics page: what it shows has just changed.
+            if let Some(origin) = cid.origin {
+                let snap = player.snapshot().await;
+                let msg = match origin {
+                    Origin::Queue(p) => views::queue_page(&snap, p as usize),
+                    Origin::History(p) => {
+                        views::history(&snap, &recent(identity, guild).await?, p as usize)
+                    }
+                    Origin::Lyrics(p) => lyrics_page(identity, &snap, p as usize).await,
+                };
+                return send::interaction_edit(http, token, msg).await;
             }
             Ok(())
         }
@@ -108,16 +142,7 @@ pub async fn handle(
                 Action::HistoryLast => usize::MAX,
                 _ => 0,
             };
-            let Some(app_id) = identity.app_id_sync() else {
-                return Ok(());
-            };
-            let plays = crate::discord::settings::recent_plays(
-                &identity.state.db,
-                &app_id.to_string(),
-                &guild.get().to_string(),
-                views::HISTORY_LIMIT,
-            )
-            .await?;
+            let plays = recent(identity, guild).await?;
             let snap = player.snapshot().await;
             send::interaction_edit(http, token, views::history(&snap, &plays, page)).await
         }
@@ -246,37 +271,8 @@ pub async fn handle(
                 _ => 0,
             };
             let snap = player.snapshot().await;
-            let Some(cur) = &snap.current else {
-                return send::interaction_edit(
-                    http,
-                    token,
-                    views::notice(
-                        &snap,
-                        "Nothing playing",
-                        "-# Lyrics follow the current track.",
-                    ),
-                )
-                .await;
-            };
-            let track = &cur.item.track;
-            let raw = crate::catalog::get_track_lyrics(&identity.state.db, &track.id)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let pages = crate::discord::lyrics::pages(
-                &crate::discord::lyrics::lines(&raw),
-                crate::discord::lyrics::PAGE_CHARS,
-            );
-            if pages.is_empty() {
-                return send::interaction_edit(
-                    http,
-                    token,
-                    views::notice(&snap, "No lyrics", "-# This file's tags hold none."),
-                )
-                .await;
-            }
-            send::interaction_edit(http, token, views::lyrics(&snap, track, &pages, page)).await
+            let msg = lyrics_page(identity, &snap, page).await;
+            send::interaction_edit(http, token, msg).await
         }
         Action::Setting(name) => {
             if let Err(r) = guard::admin_for(identity, user, ic.member.as_ref()) {
@@ -319,6 +315,45 @@ pub async fn handle(
         // Confirmations arrive with the destructive queue actions.
         Action::Confirm(_) => Ok(()),
     }
+}
+
+/// The play log this guild's history pages, newest first.
+async fn recent(identity: &Identity, guild: GuildId) -> anyhow::Result<Vec<PlayEntry>> {
+    let Some(app_id) = identity.app_id_sync() else {
+        return Ok(Vec::new());
+    };
+    Ok(settings::recent_plays(
+        &identity.state.db,
+        &app_id.to_string(),
+        &guild.get().to_string(),
+        views::HISTORY_LIMIT,
+    )
+    .await?)
+}
+
+/// A page of the current track's lyrics, or why there is none.
+async fn lyrics_page(identity: &Identity, snap: &PlayerSnapshot, page: usize) -> Message {
+    let Some(cur) = &snap.current else {
+        return views::notice(
+            snap,
+            "Nothing playing",
+            "-# Lyrics follow the current track.",
+        );
+    };
+    let track = &cur.item.track;
+    let raw = crate::catalog::get_track_lyrics(&identity.state.db, &track.id)
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let pages = crate::discord::lyrics::pages(
+        &crate::discord::lyrics::lines(&raw),
+        crate::discord::lyrics::PAGE_CHARS,
+    );
+    if pages.is_empty() {
+        return views::notice(snap, "No lyrics", "-# This file's tags hold none.");
+    }
+    views::lyrics(snap, track, &pages, page)
 }
 
 async fn controlled_action(action: &Action, player: &Arc<GuildPlayer>) -> Result<(), PlayerError> {

@@ -408,11 +408,50 @@ pub struct GuildSettings {
     pub can_autoplay: bool,
     /// Messages after the controller before it is re-posted at the bottom; 0 = never.
     pub announce_after: u32,
+    /// How a track gets skipped: by one person allowed to, or by a vote among the listeners.
+    pub skip_mode: SkipMode,
+    /// The share of listeners (people in the voice channel, bots aside) a vote needs, 1 to 100.
+    pub vote_percent: u8,
     /// This server's own versions of some of the bot's messages, over the bot's layouts.
     pub layout_overrides: LayoutOverrides,
 }
 
+/// How a track gets skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipMode {
+    /// One person allowed to control playback skips at once.
+    #[default]
+    Single,
+    /// Listeners vote; the track goes once enough of them have.
+    Vote,
+}
+
+impl SkipMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipMode::Single => "single",
+            SkipMode::Vote => "vote",
+        }
+    }
+}
+
 impl GuildSettings {
+    /// How many votes a skip needs among `listeners` people: the share, rounded up, one at least.
+    pub fn votes_needed(&self, listeners: usize) -> usize {
+        (listeners * self.vote_percent.clamp(1, 100) as usize)
+            .div_ceil(100)
+            .max(1)
+    }
+
+    /// The skip rule in words, for the settings panel.
+    pub fn skip_label(&self) -> String {
+        match self.skip_mode {
+            SkipMode::Single => "single".to_string(),
+            SkipMode::Vote => format!("vote, {}% of listeners", self.vote_percent),
+        }
+    }
+
     pub fn defaults(app_id: &str, guild_id: &str) -> Self {
         Self {
             app_id: app_id.to_string(),
@@ -429,6 +468,8 @@ impl GuildSettings {
             can_always_on: true,
             can_autoplay: true,
             announce_after: 20,
+            skip_mode: SkipMode::Single,
+            vote_percent: 50,
             layout_overrides: LayoutOverrides::default(),
         }
     }
@@ -460,6 +501,8 @@ pub struct GuildSettingsPatch {
     pub announce_after: Option<u32>,
     pub can_always_on: Option<bool>,
     pub can_autoplay: Option<bool>,
+    pub skip_mode: Option<SkipMode>,
+    pub vote_percent: Option<u8>,
     /// Checked against the layout rules by the API before it gets here.
     pub layout_overrides: Option<LayoutOverrides>,
 }
@@ -501,6 +544,12 @@ impl GuildSettingsPatch {
                 s.autoplay = false;
             }
         }
+        if let Some(v) = self.skip_mode {
+            s.skip_mode = v;
+        }
+        if let Some(v) = self.vote_percent {
+            s.vote_percent = v.clamp(1, 100);
+        }
         if let Some(v) = self.layout_overrides {
             s.layout_overrides = v;
         }
@@ -523,6 +572,8 @@ struct GuildRow {
     can_always_on: i64,
     can_autoplay: i64,
     announce_after: i64,
+    skip_mode: String,
+    vote_percent: i64,
     layout_overrides: Option<String>,
 }
 
@@ -543,6 +594,12 @@ impl From<GuildRow> for GuildSettings {
             can_always_on: r.can_always_on != 0,
             can_autoplay: r.can_autoplay != 0,
             announce_after: r.announce_after.clamp(0, 500) as u32,
+            skip_mode: if r.skip_mode == "vote" {
+                SkipMode::Vote
+            } else {
+                SkipMode::Single
+            },
+            vote_percent: r.vote_percent.clamp(1, 100) as u8,
             layout_overrides: r
                 .layout_overrides
                 .as_deref()
@@ -558,7 +615,7 @@ impl From<GuildRow> for GuildSettings {
 
 const GUILD_COLS: &str = "app_id, guild_id, dj_role_ids, controller_channel_id, \
      controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce, \
-     can_always_on, can_autoplay, announce_after, layout_overrides";
+     can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, layout_overrides";
 
 pub async fn load_guild(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<GuildSettings> {
     let row = sqlx::query_as::<_, GuildRow>(AssertSqlSafe(format!(
@@ -592,8 +649,9 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     sqlx::query(
         "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_ids, controller_channel_id, \
              controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, \
-             announce, can_always_on, can_autoplay, announce_after, layout_overrides, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             announce, can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, \
+             layout_overrides, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id, guild_id) DO UPDATE SET \
              dj_role_ids = excluded.dj_role_ids, \
              controller_channel_id = excluded.controller_channel_id, \
@@ -602,6 +660,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
              always_on_channel_id = excluded.always_on_channel_id, autoplay = excluded.autoplay, \
              announce = excluded.announce, can_always_on = excluded.can_always_on, \
              can_autoplay = excluded.can_autoplay, announce_after = excluded.announce_after, \
+             skip_mode = excluded.skip_mode, vote_percent = excluded.vote_percent, \
              layout_overrides = excluded.layout_overrides, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
@@ -618,6 +677,8 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(s.can_always_on as i64)
     .bind(s.can_autoplay as i64)
     .bind(s.announce_after as i64)
+    .bind(s.skip_mode.as_str())
+    .bind(s.vote_percent as i64)
     .bind(overrides)
     .bind(now_ms())
     .execute(db)

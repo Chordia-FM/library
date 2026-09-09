@@ -205,3 +205,40 @@ pub async fn controller_for(
     }
     Err(Refusal::NeedDj { roles })
 }
+
+/// The caller must be a DJ: hold one of the server's DJ roles or, where none are set, manage the
+/// server. Owners and server managers always may. This is the force-skip permission, stricter
+/// than [`controller`]: with no DJ roles, being in the channel is not enough.
+pub async fn dj(ctx: Context<'_>, player: &GuildPlayer) -> Result<(), Refusal> {
+    let identity = ctx.data();
+    let user = ctx.author().id;
+    if identity.is_owner(user.get()) {
+        return Ok(());
+    }
+    let member = ctx.author_member().await;
+    let manages = member.as_deref().is_some_and(|m| {
+        m.permissions.is_some_and(|p| {
+            p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
+        })
+    });
+    if manages {
+        return Ok(());
+    }
+    let roles: Vec<RoleId> = player
+        .settings()
+        .await
+        .dj_roles()
+        .into_iter()
+        .map(RoleId::new)
+        .collect();
+    if roles.is_empty() {
+        return Err(Refusal::NeedAdmin);
+    }
+    if member
+        .as_deref()
+        .is_some_and(|m| m.roles.iter().any(|r| roles.contains(r)))
+    {
+        return Ok(());
+    }
+    Err(Refusal::NeedDj { roles })
+}

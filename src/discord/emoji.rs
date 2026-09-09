@@ -35,7 +35,7 @@ const SIZE: u32 = 128;
 const NAME_PREFIX: &str = "cd_";
 /// Bumped whenever an existing emoji name changes meaning (a redrawn segment, say). It is part of
 /// the applied stamp, so a set made by an older build is regenerated rather than reused by name.
-pub const SET_VERSION: u32 = 5;
+pub const SET_VERSION: u32 = 6;
 
 /// The colour of a stateful button's icon while it is off: white, so the accent colour reads as
 /// "on" without a word of label.
@@ -91,6 +91,8 @@ pub enum Icon {
     PageBack,
     PageNext,
     PageLast,
+    /// A vote to skip.
+    Vote,
     /// Progress-bar segments: left cap, middle, right cap, five states each (see [`BarState`]).
     BarL0,
     BarL1,
@@ -173,6 +175,7 @@ phosphor! {
     PageBack => "back", "caret-left", "◀";
     PageNext => "forward", "caret-right", "▶";
     PageLast => "last", "caret-line-right", "⏭";
+    Vote => "vote", "thumbs-up", "👍";
 }
 
 /// Which end of the bar a segment is.
@@ -332,7 +335,21 @@ impl Icon {
 
     /// The SVG for this icon in `hex`.
     fn svg(self, hex: &str) -> String {
-        let hex = if self.is_off() { OFF_HEX } else { hex };
+        // Off states are white; the warning and the cross take their message's colour, so the
+        // icon and the bar down the side of a heads-up or an error agree.
+        let fixed;
+        let hex = match self {
+            _ if self.is_off() => OFF_HEX,
+            Icon::Warning => {
+                fixed = format!("#{:06x}", accent::NOTICE);
+                &fixed
+            }
+            Icon::Cross => {
+                fixed = format!("#{:06x}", accent::ERROR);
+                &fixed
+            }
+            _ => hex,
+        };
         if let Some(src) = self.phosphor_svg() {
             return if src.contains("fill=\"currentColor\"") {
                 src.replace("fill=\"currentColor\"", &format!("fill=\"{hex}\""))
@@ -588,7 +605,7 @@ mod tests {
             );
             assert!(names.insert(name), "duplicate emoji name {name}");
         }
-        assert_eq!(names.len(), 55);
+        assert_eq!(names.len(), 56);
     }
 
     #[test]

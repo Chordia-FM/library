@@ -54,15 +54,26 @@ const TRACK: &[&str] = &[
     "done",
     "notice",
     "error",
+    "vote",
+    "vote_passed",
     "item",
 ];
 /// Where the file facts and the player line apply: wherever a track can be playing.
-const PLAYING: &[&str] = &["now_playing", "lyrics", "done", "notice", "error"];
+const PLAYING: &[&str] = &[
+    "now_playing",
+    "lyrics",
+    "done",
+    "notice",
+    "error",
+    "vote",
+    "vote_passed",
+];
 const QUEUED: &[&str] = &["queued", "queued_album", "queued_artist"];
 const ITEM: &[&str] = &["item"];
 const PAGED: &[&str] = &["queue", "history", "lyrics"];
 const REPLY: &[&str] = &["done", "notice", "error"];
 const LYRICS: &[&str] = &["lyrics"];
+const VOTE: &[&str] = &["vote", "vote_passed"];
 const BAR: Option<ArgInfo> = Some(ArgInfo {
     label: "segments",
     min: 4,
@@ -306,6 +317,28 @@ pub fn variables() -> Vec<VariableInfo> {
         v("left.reason", "Why the bot left", &["left"], None),
         // lyrics
         v("lyrics", "This page of the lyrics", LYRICS, None),
+        // a vote to skip
+        v("vote.by", "Who just voted, as a mention", VOTE, None),
+        v("vote.count", "Votes so far", VOTE, None),
+        v(
+            "vote.needed",
+            "Votes the server's rule asks for",
+            VOTE,
+            None,
+        ),
+        v("vote.remaining", "Votes still missing", VOTE, None),
+        v(
+            "vote.listeners",
+            "People in the voice channel, bots aside",
+            VOTE,
+            None,
+        ),
+        v(
+            "vote.percent",
+            "The share of listeners a vote needs",
+            VOTE,
+            None,
+        ),
         // list entries
         v("index", "The entry's number in the list", ITEM, None),
         v("eta", "How long until the entry plays", ITEM, None),
