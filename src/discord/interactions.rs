@@ -110,19 +110,7 @@ pub async fn handle(
                 );
                 return send::interaction_followup(http, token, err).await;
             }
-            // Pressed on a queue, history or lyrics page: what it shows has just changed.
-            if let Some(origin) = cid.origin {
-                let snap = player.snapshot().await;
-                let msg = match origin {
-                    Origin::Queue(p) => views::queue_page(&snap, p as usize),
-                    Origin::History(p) => {
-                        views::history(&snap, &recent(identity, guild).await?, p as usize)
-                    }
-                    Origin::Lyrics(p) => lyrics_page(identity, &snap, p as usize).await,
-                };
-                return send::interaction_edit(http, token, msg).await;
-            }
-            Ok(())
+            redraw(identity, &player, guild, cid.origin, http, token).await
         }
         Action::QueueOpen | Action::QueueFirst => {
             let snap = player.snapshot().await;
@@ -175,7 +163,7 @@ pub async fn handle(
                     _ => {}
                 })
                 .await;
-            send::interaction_edit(http, token, eq_panel(&player).await).await
+            redraw(identity, &player, guild, cid.origin, http, token).await
         }
         Action::Select(ref ctx_name) if ctx_name == "eq_preset" || ctx_name == "eq_band" => {
             if let Err(r) =
@@ -199,7 +187,7 @@ pub async fn handle(
             } else if let Some(i) = value.strip_prefix("b:").and_then(|i| i.parse().ok()) {
                 player.set_eq_band(i).await;
             }
-            send::interaction_edit(http, token, eq_panel(&player).await).await
+            redraw(identity, &player, guild, cid.origin, http, token).await
         }
         Action::Cancel => send::interaction_edit(http, token, views::cancelled()).await,
         Action::Select(ref ctx_name) if ctx_name == "dj" => {
@@ -370,6 +358,33 @@ pub async fn handle(
         // Confirmations arrive with the destructive queue actions.
         Action::Confirm(_) => Ok(()),
     }
+}
+
+/// A control pressed somewhere other than the controller (a queue page, the equalizer panel):
+/// that message is redrawn, since what it shows has just changed. The controller redraws
+/// itself, so a press on it needs nothing here.
+async fn redraw(
+    identity: &Identity,
+    player: &GuildPlayer,
+    guild: GuildId,
+    origin: Option<Origin>,
+    http: &serenity::all::Http,
+    token: &str,
+) -> anyhow::Result<()> {
+    let Some(origin) = origin else {
+        return Ok(());
+    };
+    let msg = match origin {
+        Origin::Queue(p) => views::queue_page(&player.snapshot().await, p as usize),
+        Origin::History(p) => views::history(
+            &player.snapshot().await,
+            &recent(identity, guild).await?,
+            p as usize,
+        ),
+        Origin::Lyrics(p) => lyrics_page(identity, &player.snapshot().await, p as usize).await,
+        Origin::Equalizer => eq_panel(player).await,
+    };
+    send::interaction_edit(http, token, msg).await
 }
 
 /// The equalizer panel for this guild as it stands, its curve drawn fresh.

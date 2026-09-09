@@ -35,7 +35,7 @@ const SIZE: u32 = 128;
 const NAME_PREFIX: &str = "cd_";
 /// Bumped whenever an existing emoji name changes meaning (a redrawn segment, say). It is part of
 /// the applied stamp, so a set made by an older build is regenerated rather than reused by name.
-pub const SET_VERSION: u32 = 8;
+pub const SET_VERSION: u32 = 9;
 
 /// The colour of a stateful button's icon while it is off: white, so the accent colour reads as
 /// "on" without a word of label.
@@ -95,8 +95,9 @@ pub enum Icon {
     Vote,
     /// A Chordia playlist.
     Playlist,
-    /// The equalizer.
+    /// The equalizer, and the equalizer while off (white).
     Equalizer,
+    EqualizerOff,
     /// Progress-bar segments: left cap, middle, right cap, five states each (see [`BarState`]).
     BarL0,
     BarL1,
@@ -182,6 +183,7 @@ phosphor! {
     Vote => "vote", "thumbs-up", "👍";
     Playlist => "playlist", "playlist", "📃";
     Equalizer => "equalizer", "equalizer", "🎚";
+    EqualizerOff => "equalizeroff", "equalizer", "🎚";
 }
 
 /// Which end of the bar a segment is.
@@ -335,7 +337,7 @@ impl Icon {
     pub fn is_off(self) -> bool {
         matches!(
             self,
-            Icon::ShuffleOff | Icon::LoopOff | Icon::RadioOff | Icon::MuteOff
+            Icon::ShuffleOff | Icon::LoopOff | Icon::RadioOff | Icon::MuteOff | Icon::EqualizerOff
         )
     }
 
@@ -611,7 +613,7 @@ mod tests {
             );
             assert!(names.insert(name), "duplicate emoji name {name}");
         }
-        assert_eq!(names.len(), 58);
+        assert_eq!(names.len(), 59);
     }
 
     #[test]

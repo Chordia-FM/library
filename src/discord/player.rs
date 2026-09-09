@@ -1205,6 +1205,8 @@ impl GuildPlayer {
                 .any(|(a, b)| a.gain != b.gain)
         {
             self.apply_eq().await;
+            // The controller may show the equalizer's state, or carry its switch.
+            self.controller_wake.notify_one();
         }
         out
     }

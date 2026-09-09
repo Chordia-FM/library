@@ -616,7 +616,9 @@ fn modernize_block(view: LayoutView, block: &mut LayoutBlock) {
         | LayoutBlock::Separator { .. }
         | LayoutBlock::Row { .. }
         | LayoutBlock::Pager
-        | LayoutBlock::EqControls => {}
+        | LayoutBlock::EqPresets
+        | LayoutBlock::EqBands
+        | LayoutBlock::EqNudges => {}
     }
 }
 

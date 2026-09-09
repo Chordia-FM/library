@@ -180,11 +180,36 @@ fn id(snap: &PlayerSnapshot, action: Action) -> String {
     CustomId::new(snap.bot_index, snap.guild_id.get(), action).to_string()
 }
 
-/// A control's button, noting which message it sits on when that is not the controller.
-fn btn(scene: &Scene, action: Action, icon: Icon) -> Component {
+/// A component's id on this message, noting which message that is when it is not the
+/// controller, so a press can redraw it.
+fn cid_on(scene: &Scene, action: Action) -> String {
     let snap = scene.snap;
-    let cid = CustomId::new(snap.bot_index, snap.guild_id.get(), action).on(scene.origin);
-    button(Button::new(ButtonStyle::Secondary, cid.to_string()).emoji(snap.icons.get(icon)))
+    CustomId::new(snap.bot_index, snap.guild_id.get(), action)
+        .on(scene.origin)
+        .to_string()
+}
+
+/// A control's button.
+fn btn(scene: &Scene, action: Action, icon: Icon) -> Component {
+    button(
+        Button::new(ButtonStyle::Secondary, cid_on(scene, action))
+            .emoji(scene.snap.icons.get(icon)),
+    )
+}
+
+/// Controls that mean nothing without a track: left out of a message while nothing plays. The
+/// rest are settings and stand on any message.
+fn needs_playback(which: ControlButton) -> bool {
+    matches!(
+        which,
+        ControlButton::Previous
+            | ControlButton::PlayPause
+            | ControlButton::Skip
+            | ControlButton::Stop
+            | ControlButton::SeekBack
+            | ControlButton::SeekForward
+            | ControlButton::Lyrics
+    )
 }
 
 /// A bar of `cells` segment emojis (or their text fallbacks) filled to `position` of `total`.
@@ -264,14 +289,18 @@ fn now_playing_line(snap: &PlayerSnapshot) -> String {
 
 /// One control as a button. Stateful ones carry their state in the icon's colour: white off,
 /// accent on, and the loop's "1" for one track. No labels; the icons are their own explanation.
-fn control(scene: &Scene, cur: &CurrentSnapshot, which: ControlButton) -> Component {
+fn control(scene: &Scene, cur: Option<&CurrentSnapshot>, which: ControlButton) -> Component {
     let snap = scene.snap;
     let (action, icon) = match which {
         ControlButton::Previous => (Action::Previous, Icon::Prev),
         // The play/pause button shows what pressing it will do.
         ControlButton::PlayPause => (
             Action::PlayPause,
-            if cur.paused { Icon::Play } else { Icon::Pause },
+            if cur.is_some_and(|c| !c.paused) {
+                Icon::Pause
+            } else {
+                Icon::Play
+            },
         ),
         ControlButton::Skip => (Action::Skip, Icon::Next),
         ControlButton::Stop => (Action::Stop, Icon::Stop),
@@ -317,6 +346,14 @@ fn control(scene: &Scene, cur: &CurrentSnapshot, which: ControlButton) -> Compon
         ControlButton::History => (Action::HistoryOpen, Icon::History),
         ControlButton::Leave => (Action::Leave, Icon::Leave),
         ControlButton::Equalizer => (Action::EqOpen, Icon::Equalizer),
+        ControlButton::EqToggle => (
+            Action::EqToggle,
+            if snap.eq.enabled {
+                Icon::Equalizer
+            } else {
+                Icon::EqualizerOff
+            },
+        ),
     };
     btn(scene, action, icon)
 }
@@ -763,11 +800,13 @@ fn button_for(scene: &Scene, spec: &ButtonSpec) -> Option<Component> {
     match spec {
         // A control needs something playing (the play/pause button shows its state); it goes on
         // any message, not only ones about the current track.
-        ButtonSpec::Control { control: which } => scene
-            .snap
-            .current
-            .as_ref()
-            .map(|c| control(scene, c, *which)),
+        ButtonSpec::Control { control: which } => {
+            let cur = scene.snap.current.as_ref();
+            if cur.is_none() && needs_playback(*which) {
+                return None;
+            }
+            Some(control(scene, cur, *which))
+        }
         ButtonSpec::Link { label, url } => {
             let url = scene.render(url);
             let url = url.trim();
@@ -898,7 +937,9 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
                         .push(paging_row(scene.snap, paging, scene.page, scene.pages));
                 }
             }
-            LayoutBlock::EqControls => out.components.extend(eq_controls(scene)),
+            LayoutBlock::EqPresets => out.components.push(eq_presets_row(scene)),
+            LayoutBlock::EqBands => out.components.push(eq_bands_row(scene)),
+            LayoutBlock::EqNudges => out.components.push(eq_nudges_row(scene)),
         }
     }
     out
@@ -1645,8 +1686,8 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
 }
 
 /// The equalizer panel, laid out by the `equalizer` layout: the curve rides along as `eq.png`
-/// for a gallery to show, the `eq.*` variables say the rest, and the controls block edits the
-/// panel in place.
+/// for a gallery to show, the `eq.*` variables say the rest, and the menus, nudges and
+/// controls placed on it edit it in place.
 pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Arc<Vec<u8>>>) -> Message {
     let cover = picture.map(|bytes| Cover {
         filename: "eq.png".to_string(),
@@ -1656,15 +1697,14 @@ pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Arc<Vec<u8>
     let mut scene = Scene::new(snap, Icon::Equalizer, "Equalizer", snap.icons.accent());
     scene.eq_band = band.min(eq::FREQS.len() - 1);
     scene.eq_picture = cover.as_ref();
+    scene.origin = Some(Origin::Equalizer);
     with_current(&mut scene, snap);
     finish(&scene, &snap.layouts.equalizer, false).ephemeral()
 }
 
-/// The equalizer's controls: a preset menu, a band menu, the nudge buttons and the switch.
-fn eq_controls(scene: &Scene) -> Vec<Component> {
-    let snap = scene.snap;
-    let icons = &snap.icons;
-    let cfg = &snap.eq;
+/// The equalizer's preset menu, the current one chosen (or "Custom").
+fn eq_presets_row(scene: &Scene) -> Component {
+    let cfg = &scene.snap.eq;
     let current = eq::preset_of(cfg).map(|p| p.name);
     let mut presets: Vec<SelectOption> = eq::PRESETS
         .iter()
@@ -1679,6 +1719,19 @@ fn eq_controls(scene: &Scene) -> Vec<Component> {
     if current.is_none() {
         presets.insert(0, SelectOption::new("Custom", "custom").default(true));
     }
+    row(vec![Component::StringSelect {
+        custom_id: cid_on(scene, Action::Select("eq_preset".into())),
+        placeholder: Some("Preset".into()),
+        options: presets,
+        min: 1,
+        max: 1,
+        disabled: false,
+    }])
+}
+
+/// The menu of the band the nudge buttons act on, each with its gain.
+fn eq_bands_row(scene: &Scene) -> Component {
+    let cfg = &scene.snap.eq;
     let band = scene.eq_band.min(eq::FREQS.len() - 1);
     let bands: Vec<SelectOption> = cfg
         .bands
@@ -1698,42 +1751,31 @@ fn eq_controls(scene: &Scene) -> Vec<Component> {
             o
         })
         .collect();
+    row(vec![Component::StringSelect {
+        custom_id: cid_on(scene, Action::Select("eq_band".into())),
+        placeholder: Some("Band to nudge".into()),
+        options: bands,
+        min: 1,
+        max: 1,
+        disabled: false,
+    }])
+}
+
+/// The nudge buttons, in words: three or one dB either way, and Flat.
+fn eq_nudges_row(scene: &Scene) -> Component {
     let step = |n: i8| {
         button(
-            Button::new(ButtonStyle::Secondary, id(snap, Action::EqStep(n)))
+            Button::new(ButtonStyle::Secondary, cid_on(scene, Action::EqStep(n)))
                 .label(format!("{n:+} dB")),
         )
     };
-    vec![
-        row(vec![Component::StringSelect {
-            custom_id: id(snap, Action::Select("eq_preset".into())),
-            placeholder: Some("Preset".into()),
-            options: presets,
-            min: 1,
-            max: 1,
-            disabled: false,
-        }]),
-        row(vec![Component::StringSelect {
-            custom_id: id(snap, Action::Select("eq_band".into())),
-            placeholder: Some("Band to nudge".into()),
-            options: bands,
-            min: 1,
-            max: 1,
-            disabled: false,
-        }]),
-        row(vec![
-            step(-3),
-            step(-1),
-            step(1),
-            step(3),
-            button(Button::new(ButtonStyle::Secondary, id(snap, Action::EqFlat)).label("Flat")),
-        ]),
-        row(vec![button(
-            Button::new(ButtonStyle::Secondary, id(snap, Action::EqToggle))
-                .emoji(icons.get(Icon::Equalizer))
-                .label(if cfg.enabled { "Turn off" } else { "Turn on" }),
-        )]),
-    ]
+    row(vec![
+        step(-3),
+        step(-1),
+        step(1),
+        step(3),
+        button(Button::new(ButtonStyle::Secondary, cid_on(scene, Action::EqFlat)).label("Flat")),
+    ])
 }
 
 /// One page of a track's lyrics, laid out by the `lyrics` layout; its page buttons turn the
@@ -2845,9 +2887,10 @@ mod tests {
     }
 
     #[test]
-    fn the_equalizer_panel_is_a_layout_with_its_own_variables() {
+    fn the_equalizer_panel_is_a_layout_of_menus_and_controls() {
         let mut s = snap(0, true, false);
-        // Without a picture the gallery is left out: header, divider, then the four rows.
+        // Without a picture the gallery is left out: header, divider, the two menus, the nudges,
+        // the switch.
         let m = equalizer(&s, 2, None);
         m.validate().unwrap();
         let k = kids(&m);
@@ -2859,8 +2902,23 @@ mod tests {
         let band_select = &k[3]["components"][0];
         assert_eq!(band_select["options"][2]["default"], true);
         assert_eq!(band_select["options"][2]["label"], "125 Hz");
-        assert_eq!(k[4]["components"].as_array().unwrap().len(), 5);
-        // With one, the curve rides along as an upload the gallery shows.
+        // Everything on the panel says where it sits, so a press redraws the panel.
+        assert_eq!(band_select["custom_id"], "cd:1:1:777:sel:eq_band:@e0");
+        let nudges = k[4]["components"].as_array().unwrap();
+        assert_eq!(nudges.len(), 5);
+        assert_eq!(nudges[0]["custom_id"], "cd:1:1:777:eqs:-3:@e0");
+        assert_eq!(nudges[0]["label"], "-3 dB");
+        assert_eq!(nudges[4]["custom_id"], "cd:1:1:777:eqf:@e0");
+        assert_eq!(nudges[4]["label"], "Flat");
+        // The switch is an icon: white while off and the accent while on, like every toggle.
+        let mut set = IconSet::default();
+        for (i, icon) in Icon::all().enumerate() {
+            set.insert_for_test(icon, 1000 + i as u64);
+        }
+        s.icons = Arc::new(set);
+        let k = kids(&equalizer(&s, 0, None));
+        assert_eq!(k[5]["components"][0]["emoji"]["name"], "cd_equalizeroff");
+        assert!(k[5]["components"][0]["label"].is_null());
         s.eq = eq::preset_config(eq::preset("Rock").unwrap());
         let m = equalizer(&s, 0, Some(Arc::new(vec![0u8; 8])));
         let k = kids(&m);
@@ -2868,14 +2926,30 @@ mod tests {
         assert_eq!(k[2]["type"], 12);
         assert_eq!(k[2]["items"][0]["media"]["url"], "attachment://eq.png");
         assert_eq!(m.body()["attachments"][0]["filename"], "eq.png");
-        // A layout of one's own reads every band through the variables.
+        assert_eq!(k[6]["components"][0]["emoji"]["name"], "cd_equalizer");
+        // A layout of one's own places each piece where it likes and reads every band through
+        // the variables; the switch stands even while nothing plays, a Skip button waits.
+        s.icons = Arc::new(IconSet::default());
+        s.current = None;
         s.layouts = Arc::new(BotLayouts {
             equalizer: ViewLayout {
                 blocks: vec![
                     LayoutBlock::Text {
                         content: "{eq.preset} {eq.state} {eq.preamp} · {eq.31}/{eq.1k}/{eq.16k} · {eq.band} {eq.band.gain}\n{eq.bands}".into(),
                     },
-                    LayoutBlock::EqControls,
+                    LayoutBlock::Row {
+                        buttons: vec![
+                            ButtonSpec::Control {
+                                control: ControlButton::EqToggle,
+                            },
+                            ButtonSpec::Control {
+                                control: ControlButton::Skip,
+                            },
+                        ],
+                    },
+                    LayoutBlock::EqNudges,
+                    LayoutBlock::EqBands,
+                    LayoutBlock::EqPresets,
                 ],
             },
             ..Default::default()
@@ -2884,6 +2958,13 @@ mod tests {
         assert_eq!(
             body["components"][0]["content"],
             "Rock on -2 · +5/-1/+4 · 16 kHz +4\n31 +5 · 62 +4 · 125 +3 · 250 +1 · 500 -1 · 1k -1 · 2k 0 · 4k +2 · 8k +3 · 16k +4"
+        );
+        assert_eq!(
+            body["components"][1]["components"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
         );
         assert_eq!(body["components"].as_array().unwrap().len(), 5);
     }

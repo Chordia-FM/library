@@ -166,6 +166,8 @@ pub enum Origin {
     Queue(u32),
     History(u32),
     Lyrics(u32),
+    /// The equalizer panel.
+    Equalizer,
 }
 
 impl Origin {
@@ -174,6 +176,7 @@ impl Origin {
             Origin::Queue(p) => format!("@q{p}"),
             Origin::History(p) => format!("@h{p}"),
             Origin::Lyrics(p) => format!("@l{p}"),
+            Origin::Equalizer => "@e0".to_string(),
         }
     }
 
@@ -185,6 +188,7 @@ impl Origin {
             'q' => Origin::Queue(page),
             'h' => Origin::History(page),
             'l' => Origin::Lyrics(page),
+            'e' => Origin::Equalizer,
             _ => return None,
         })
     }
@@ -309,7 +313,12 @@ mod tests {
             assert!(s.len() < 100, "{s}");
             assert_eq!(s.parse::<CustomId>().unwrap(), id, "{s}");
         }
-        for o in [Origin::Queue(2), Origin::History(0), Origin::Lyrics(7)] {
+        for o in [
+            Origin::Queue(2),
+            Origin::History(0),
+            Origin::Lyrics(7),
+            Origin::Equalizer,
+        ] {
             let id = CustomId::new(1, 5, Action::Skip).on(Some(o));
             let s = id.to_string();
             assert!(s.ends_with(&o.code()), "{s}");
