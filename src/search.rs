@@ -13,6 +13,8 @@
 //! The query is normalized with [`crate::metadata::normalize`], the same function that produced the
 //! stored keys, so "Daft Punk" and "daft-punk" hit the same row.
 
+use std::collections::HashMap;
+
 use sqlx::{AssertSqlSafe, SqlitePool};
 
 use crate::catalog::{TrackRow, TRACK_COLS_NO_LIB, TRACK_JOINS};
@@ -287,6 +289,158 @@ async fn search_artists(
             cover_hash: None,
             track_count: r.track_count,
         })
+        .collect())
+}
+
+/// `?, ?, …` for an `IN` list.
+fn placeholders(n: usize) -> String {
+    std::iter::repeat_n("?", n).collect::<Vec<_>>().join(", ")
+}
+
+/// The hits in the order `ids` were given, ones the query did not return left out.
+fn in_order(ids: &[String], hits: impl Iterator<Item = SearchHit>) -> Vec<SearchHit> {
+    let mut by_id: HashMap<String, SearchHit> = hits.map(|h| (h.id.clone(), h)).collect();
+    ids.iter().filter_map(|id| by_id.remove(id)).collect()
+}
+
+/// Hits for these tracks, in the order given; unknown ids are skipped. No ranking: the caller
+/// chose the order.
+pub async fn track_hits(db: &SqlitePool, ids: &[String]) -> AppResult<Vec<SearchHit>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT t.id, t.title, COALESCE(ar.name, '') AS artist, t.duration_ms, \
+                COALESCE(t.cover_hash, al.cover_hash) AS cover_hash, \
+                t.title_norm, COALESCE(ar.name_normalized, '') AS artist_norm \
+         FROM tracks t \
+         LEFT JOIN artists ar ON ar.id = t.artist_id \
+         LEFT JOIN albums al ON al.id = t.album_id \
+         WHERE t.id IN ({})",
+        placeholders(ids.len())
+    );
+    let mut query = sqlx::query_as::<_, TrackHitRow>(AssertSqlSafe(sql));
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(db).await?;
+    Ok(in_order(
+        ids,
+        rows.into_iter().map(|r| SearchHit {
+            score: 0,
+            kind: HitKind::Track,
+            id: r.id,
+            title: r.title,
+            subtitle: r.artist,
+            duration_ms: Some(r.duration_ms),
+            cover_hash: r.cover_hash,
+            track_count: 1,
+        }),
+    ))
+}
+
+/// Hits for these albums, in the order given.
+pub async fn album_hits(db: &SqlitePool, ids: &[String]) -> AppResult<Vec<SearchHit>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT al.id, al.title, COALESCE(aa.name, '') AS artist, al.year, al.cover_hash, \
+                COUNT(t.id) AS track_count, SUM(t.duration_ms) AS duration_ms, \
+                COALESCE(al.title_normalized, '') AS title_norm, \
+                COALESCE(aa.name_normalized, '') AS artist_norm \
+         FROM albums al \
+         LEFT JOIN artists aa ON aa.id = al.artist_id \
+         JOIN tracks t ON t.album_id = al.id \
+         WHERE al.id IN ({}) \
+         GROUP BY al.id",
+        placeholders(ids.len())
+    );
+    let mut query = sqlx::query_as::<_, AlbumHitRow>(AssertSqlSafe(sql));
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(db).await?;
+    Ok(in_order(
+        ids,
+        rows.into_iter().map(|r| SearchHit {
+            score: 0,
+            kind: HitKind::Album,
+            id: r.id,
+            title: r.title,
+            subtitle: match r.year {
+                Some(y) if !r.artist.is_empty() => format!("{} · {y}", r.artist),
+                Some(y) => y.to_string(),
+                None => r.artist,
+            },
+            duration_ms: r.duration_ms,
+            cover_hash: r.cover_hash,
+            track_count: r.track_count,
+        }),
+    ))
+}
+
+/// Hits for these artists, in the order given.
+pub async fn artist_hits(db: &SqlitePool, ids: &[String]) -> AppResult<Vec<SearchHit>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT ar.id, ar.name, COALESCE(ar.name_normalized, '') AS name_norm, \
+                (SELECT COUNT(*) FROM tracks t LEFT JOIN albums al ON al.id = t.album_id \
+                 WHERE t.artist_id = ar.id OR al.artist_id = ar.id) AS track_count \
+         FROM artists ar \
+         WHERE ar.id IN ({}) AND track_count > 0",
+        placeholders(ids.len())
+    );
+    let mut query = sqlx::query_as::<_, ArtistHitRow>(AssertSqlSafe(sql));
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(db).await?;
+    Ok(in_order(
+        ids,
+        rows.into_iter().map(|r| SearchHit {
+            score: 0,
+            kind: HitKind::Artist,
+            id: r.id,
+            title: r.name,
+            subtitle: format!("{} tracks", r.track_count),
+            duration_ms: None,
+            cover_hash: None,
+            track_count: r.track_count,
+        }),
+    ))
+}
+
+/// For each of these tracks, in the order given: its album and its artist (the track's own, else
+/// the album's), for turning a list of tracks into the albums and artists behind them.
+pub async fn owners_of(
+    db: &SqlitePool,
+    ids: &[String],
+) -> AppResult<Vec<(String, Option<String>, Option<String>)>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let sql = format!(
+        "SELECT t.id, t.album_id, COALESCE(t.artist_id, al.artist_id) AS artist_id \
+         FROM tracks t LEFT JOIN albums al ON al.id = t.album_id \
+         WHERE t.id IN ({})",
+        placeholders(ids.len())
+    );
+    let mut query =
+        sqlx::query_as::<_, (String, Option<String>, Option<String>)>(AssertSqlSafe(sql));
+    for id in ids {
+        query = query.bind(id);
+    }
+    let rows = query.fetch_all(db).await?;
+    let mut by_id: HashMap<String, (Option<String>, Option<String>)> = rows
+        .into_iter()
+        .map(|(id, al, ar)| (id, (al, ar)))
+        .collect();
+    Ok(ids
+        .iter()
+        .filter_map(|id| by_id.remove(id).map(|(al, ar)| (id.clone(), al, ar)))
         .collect())
 }
 

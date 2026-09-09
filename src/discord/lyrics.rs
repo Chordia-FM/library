@@ -1,12 +1,25 @@
-//! Lyrics from the file's own tags, shaped for Discord.
+//! Lyrics for Discord: the file's own tags, else the Hub's, shaped into pages.
 //!
-//! The scanner has stored `tracks.lyrics` since migration 0005 and nothing ever read it. Tags carry
-//! either plain text or LRC (`[mm:ss.xx]` per line, sometimes `[ar:]`/`[ti:]` metadata); the bot
-//! shows the words, so timestamps and metadata are stripped, and the text is cut into pages that
-//! fit a text display with room for the header.
+//! The scanner has stored `tracks.lyrics` since migration 0005. Tags carry either plain text or
+//! LRC (`[mm:ss.xx]` per line, sometimes `[ar:]`/`[ti:]` metadata); the bot shows the words, so
+//! timestamps and metadata are stripped, and the text is cut into pages that fit a text display
+//! with room for the header. A file with no tags asks the Hub, which serves its cache or fetches
+//! from the provider, the same as the web client.
+
+use crate::catalog::{self, TrackRow};
+use crate::http::AppState;
 
 /// Discord's text display holds 4000 characters; the page stays under it with the header's share.
 pub const PAGE_CHARS: usize = 3500;
+
+/// The words for a track: the file's own tags first, else what the Hub has (its cache, or the
+/// provider on a miss).
+pub async fn text_for(state: &AppState, track: &TrackRow) -> Option<String> {
+    if let Ok(Some(tagged)) = catalog::get_track_lyrics(&state.db, &track.id).await {
+        return Some(tagged);
+    }
+    super::hub::lyrics(state, track).await
+}
 
 /// Lines of lyrics without LRC timestamps or metadata tags, blank runs collapsed to one.
 pub fn lines(raw: &str) -> Vec<String> {

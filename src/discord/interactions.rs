@@ -345,17 +345,19 @@ async fn lyrics_page(identity: &Identity, snap: &PlayerSnapshot, page: usize) ->
         );
     };
     let track = &cur.item.track;
-    let raw = crate::catalog::get_track_lyrics(&identity.state.db, &track.id)
+    let raw = crate::discord::lyrics::text_for(&identity.state, track)
         .await
-        .ok()
-        .flatten()
         .unwrap_or_default();
     let pages = crate::discord::lyrics::pages(
         &crate::discord::lyrics::lines(&raw),
         crate::discord::lyrics::PAGE_CHARS,
     );
     if pages.is_empty() {
-        return views::notice(snap, "No lyrics", "-# This file's tags hold none.");
+        return views::notice(
+            snap,
+            "No lyrics",
+            "-# Neither the file's tags nor Chordia have any.",
+        );
     }
     views::lyrics(snap, track, &pages, page)
 }

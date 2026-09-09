@@ -10,9 +10,9 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chordia_contracts::discord::{
-    ArtistArt, ArtistArtRequest, ListenersNowPlaying, PlaylistHit, PlaylistSearchRequest,
-    PlaylistTracksRequest, PlaylistTracksResponse, ResolveListenersRequest, ResolveTracksRequest,
-    ResolvedListener, ResolvedTrack,
+    ArtistArt, ArtistArtRequest, BotLyricsRequest, ListenersNowPlaying, PlaylistHit,
+    PlaylistSearchRequest, PlaylistTracksRequest, PlaylistTracksResponse, ResolveListenersRequest,
+    ResolveTracksRequest, ResolvedListener, ResolvedTrack,
 };
 use chordia_contracts::social::NowPlayingReport;
 use uuid::Uuid;
@@ -26,6 +26,8 @@ use crate::pairing::HubClient;
 const LISTENER_TTL: Duration = Duration::from_secs(10 * 60);
 /// How long a track's or artist's page answer stands.
 const LINK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a track's lyrics (or the lack of them) stand: paging through them costs one call.
+const LYRICS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 type Cached<T> = Mutex<HashMap<String, (Instant, Option<T>)>>;
 
@@ -34,6 +36,8 @@ pub struct Caches {
     listeners: Cached<ResolvedListener>,
     tracks: Cached<ResolvedTrack>,
     artists: Cached<ArtistArt>,
+    /// A track's lyrics as plain lines, by the library's track id.
+    lyrics: Cached<String>,
     /// Fetched pictures by their Hub path, as `(mime, bytes)`.
     images: Cached<(String, std::sync::Arc<Vec<u8>>)>,
 }
@@ -215,7 +219,7 @@ pub async fn search_playlists(state: &AppState, query: &str, asker: u64) -> Vec<
     let req = PlaylistSearchRequest {
         query: query.to_string(),
         discord_id: Some(asker.to_string()),
-        limit: 10,
+        limit: 25,
     };
     match hub(state).search_playlists(&key, &req).await {
         Ok(resp) => resp.playlists,
@@ -253,6 +257,38 @@ pub async fn playlist_tracks(
         }
     }
     Some((resp, rows))
+}
+
+/// The track's lyrics from the Hub (its cache, else the provider), as plain lines; `None` when
+/// there are none or there is no Hub. Remembered either way for a while.
+pub async fn lyrics(state: &AppState, track: &TrackRow) -> Option<String> {
+    let rt = caches()?;
+    if let Some(hit) = fresh(&rt.hub.lyrics, &track.id, LYRICS_TTL) {
+        return hit;
+    }
+    let key = key(state).await?;
+    let library_id = hub_library_id(state, &track.library_id).await?;
+    let req = BotLyricsRequest {
+        library_id,
+        track_ref: track.id.clone(),
+    };
+    let value = match hub(state).bot_lyrics(&key, &req).await {
+        Ok(l) => {
+            let text = l
+                .lines
+                .iter()
+                .map(|line| line.text.trim())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "asking the Hub for lyrics");
+            None
+        }
+    };
+    remember(&rt.hub.lyrics, track.id.clone(), value.clone());
+    value
 }
 
 /// Where a track's page is on the Hub, for a deep link.

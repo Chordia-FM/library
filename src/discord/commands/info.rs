@@ -99,7 +99,7 @@ pub async fn stats(
     .await
 }
 
-/// Lyrics for the track that is playing, from the file's own tags
+/// Lyrics for the track that is playing, from the file's tags or Chordia
 #[poise::command(slash_command, guild_only)]
 pub async fn lyrics(ctx: Context<'_>) -> Result<(), Error> {
     ctx.defer_ephemeral().await?;
@@ -129,14 +129,18 @@ pub async fn lyrics(ctx: Context<'_>) -> Result<(), Error> {
         .await;
     };
     let track = &cur.item.track;
-    let raw = crate::catalog::get_track_lyrics(&identity.state.db, &track.id)
-        .await?
+    let raw = lyrics::text_for(&identity.state, track)
+        .await
         .unwrap_or_default();
     let pages = lyrics::pages(&lyrics::lines(&raw), lyrics::PAGE_CHARS);
     if pages.is_empty() {
         return send::respond(
             ctx,
-            views::notice(&snap, "No lyrics", "-# This file's tags hold none."),
+            views::notice(
+                &snap,
+                "No lyrics",
+                "-# Neither the file's tags nor Chordia have any.",
+            ),
         )
         .await;
     }

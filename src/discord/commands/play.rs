@@ -251,11 +251,8 @@ async fn autocomplete_artist(ctx: Context<'_>, partial: &str) -> Vec<Autocomplet
 }
 
 /// Autocomplete for `/playlist`: the Hub's playlists the asker may queue, by name, their own
-/// first.
+/// first; with nothing typed, their own and the newest public ones.
 async fn autocomplete_playlist(ctx: Context<'_>, partial: &str) -> Vec<AutocompleteChoice> {
-    if partial.trim().len() < 2 {
-        return Vec::new();
-    }
     hub::search_playlists(&ctx.data().state, partial, ctx.author().id.get())
         .await
         .into_iter()
@@ -280,13 +277,25 @@ async fn autocomplete_kinds(
     partial: &str,
     kinds: &[HitKind],
 ) -> Vec<AutocompleteChoice> {
-    if partial.trim().is_empty() {
-        return Vec::new();
-    }
-    let hits = match search::search(&ctx.data().state.db, partial, kinds, 25).await {
+    let identity = ctx.data();
+    let db = &identity.state.db;
+    // Nothing typed yet: the asker's own recent requests, what this server plays most, and what
+    // is newest, rather than an empty list.
+    let hits = if partial.trim().is_empty() {
+        let Some(guild) = ctx.guild_id() else {
+            return Vec::new();
+        };
+        let app_id = identity.app_id_sync().unwrap_or(0).to_string();
+        let user = ctx.author().id.get();
+        crate::discord::suggest::suggest(db, &app_id, &guild.get().to_string(), user, kinds, 25)
+            .await
+    } else {
+        search::search(db, partial, kinds, 25).await
+    };
+    let hits = match hits {
         Ok(h) => h,
         Err(e) => {
-            tracing::debug!(error = %e, "autocomplete search failed");
+            tracing::debug!(error = %e, "autocomplete failed");
             return Vec::new();
         }
     };

@@ -268,3 +268,79 @@ async fn album_and_artist_expansions_are_ordered() {
     let rows = search::artist_tracks(&db, "ar-dp", 2).await.unwrap();
     assert_eq!(rows.len(), 2);
 }
+
+/// The suggestions autocomplete opens with: the asker's requests, the server's favourites, the
+/// newest tracks, in that order and each once.
+#[cfg(feature = "discord")]
+#[tokio::test]
+async fn suggestions_lead_with_the_askers_requests_then_the_popular_then_the_new() {
+    use chordia_library::discord::suggest::suggest;
+
+    let (db, _dir) = db().await;
+    artist(&db, "ar1", "Daft Punk").await;
+    album(&db, "al1", "Discovery", "ar1", 2001).await;
+    for i in 1..=6 {
+        track(
+            &db,
+            &format!("t{i}"),
+            &format!("Track {i}"),
+            "ar1",
+            Some("al1"),
+            i,
+            200_000,
+        )
+        .await;
+    }
+    // 42 asked for t2 twice and t3 once; the room hammered t5; someone played t1.
+    for (track, by, at) in [
+        ("t2", "42", 1),
+        ("t3", "42", 2),
+        ("t2", "42", 3),
+        ("t5", "7", 4),
+        ("t5", "8", 5),
+        ("t5", "9", 6),
+        ("t1", "7", 7),
+    ] {
+        sqlx::query(
+            "INSERT INTO discord_plays (app_id, guild_id, track_id, requested_by, started_at) \
+             VALUES ('1', 'g', ?, ?, ?)",
+        )
+        .bind(track)
+        .bind(by)
+        .bind(at)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    let hits = suggest(&db, "1", "g", 42, &[HitKind::Track], 25)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = hits.iter().map(|h| h.id.as_str()).collect();
+    // Mine newest first, then the most played not already there, then the newest indexed.
+    assert_eq!(ids, ["t2", "t3", "t5", "t1", "t6", "t4"]);
+    assert_eq!(hits[0].title, "Track 2");
+    // Several kinds share the room, tracks first, the album and the artist behind them.
+    let mixed = suggest(
+        &db,
+        "1",
+        "g",
+        42,
+        &[HitKind::Track, HitKind::Album, HitKind::Artist],
+        25,
+    )
+    .await
+    .unwrap();
+    assert_eq!(mixed[0].kind, HitKind::Track);
+    assert!(mixed
+        .iter()
+        .any(|h| h.kind == HitKind::Album && h.id == "al1"));
+    assert!(mixed
+        .iter()
+        .any(|h| h.kind == HitKind::Artist && h.id == "ar1"));
+    // A stranger with no requests still gets the favourites and the new.
+    let theirs = suggest(&db, "1", "g", 99, &[HitKind::Track], 3)
+        .await
+        .unwrap();
+    let ids: Vec<&str> = theirs.iter().map(|h| h.id.as_str()).collect();
+    assert_eq!(ids, ["t5", "t2", "t1"]);
+}

@@ -400,10 +400,8 @@ pub async fn render(
         ),
         LayoutView::Lyrics => {
             // The track's own lyrics when the file has them; else two pages of stand-in.
-            let raw = catalog::get_track_lyrics(&identity.state.db, &current.id)
+            let raw = lyrics::text_for(&identity.state, current)
                 .await
-                .ok()
-                .flatten()
                 .unwrap_or_default();
             let mut pages = lyrics::pages(&lyrics::lines(&raw), lyrics::PAGE_CHARS);
             if pages.is_empty() {

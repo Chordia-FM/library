@@ -11,11 +11,13 @@ use std::path::Path;
 use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, CatalogSyncResponse};
 use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse, ServerOwner};
 use chordia_contracts::discord::{
-    ArtistArtRequest, ArtistArtResponse, AttributedScrobbleBatch, ListenersNowPlaying,
-    PlaylistSearchRequest, PlaylistSearchResponse, PlaylistTracksRequest, PlaylistTracksResponse,
-    ResolveListenersRequest, ResolveListenersResponse, ResolveTracksRequest, ResolveTracksResponse,
+    ArtistArtRequest, ArtistArtResponse, AttributedScrobbleBatch, BotLyricsRequest,
+    ListenersNowPlaying, PlaylistSearchRequest, PlaylistSearchResponse, PlaylistTracksRequest,
+    PlaylistTracksResponse, ResolveListenersRequest, ResolveListenersResponse,
+    ResolveTracksRequest, ResolveTracksResponse,
 };
 use chordia_contracts::identify::{IdentifyRequest, IdentifyResponse};
+use chordia_contracts::lyrics::Lyrics;
 use chordia_contracts::scrobble::ScrobbleBatch;
 use chordia_contracts::scrobble::ScrobbleBatchResponse;
 use serde::{Deserialize, Serialize};
@@ -197,6 +199,17 @@ impl HubClient {
         req: &ResolveTracksRequest,
     ) -> anyhow::Result<ResolveTracksResponse> {
         self.library_post("/v1/catalog/resolve-tracks", server_api_key, req)
+            .await
+    }
+
+    /// `POST /v1/lyrics:bot`: a track's lyrics, by the library's own track id; an error when
+    /// the Hub has none.
+    pub async fn bot_lyrics(
+        &self,
+        server_api_key: &str,
+        req: &BotLyricsRequest,
+    ) -> anyhow::Result<Lyrics> {
+        self.library_post("/v1/lyrics:bot", server_api_key, req)
             .await
     }
 

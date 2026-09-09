@@ -41,6 +41,7 @@ pub mod preview;
 pub mod rest;
 pub mod settings;
 pub mod source;
+pub mod suggest;
 pub mod theme;
 pub mod ui;
 
