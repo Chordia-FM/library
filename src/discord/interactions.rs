@@ -188,7 +188,7 @@ pub async fn handle(
                 }
             };
             let resolved = resolve(
-                &identity.state.db,
+                &identity.state,
                 &value,
                 &[HitKind::Track, HitKind::Album, HitKind::Artist],
             )
@@ -241,8 +241,11 @@ pub async fn handle(
                         &snap,
                         &items,
                         &enq,
-                        resolved.kind,
-                        resolved.source.as_deref(),
+                        views::Added {
+                            kind: resolved.kind,
+                            source: resolved.source.as_deref(),
+                            url: resolved.source_url.as_deref(),
+                        },
                         cover.as_ref(),
                         art.image.as_ref(),
                         art.banner.as_ref(),

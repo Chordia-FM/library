@@ -1031,18 +1031,25 @@ pub fn left(snap: &PlayerSnapshot, reason: LeaveReason) -> Message {
 
 // ---- toasts & lists --------------------------------------------------------------------------------
 
-/// Public confirmation after `/play`, laid out by the `queued`, `queued_album` or
-/// `queued_artist` layout by what the query was. `source` names the album/artist when several
-/// tracks were added; `cover` is the picture for what was added (the first track's art, or the
-/// artist's when the query was an artist) and `artist_art` the artist's picture when it was
-/// fetched.
-#[allow(clippy::too_many_arguments)]
+/// What a `/play` (or `/album`, `/artist`, `/playlist`) added, for the toast.
+#[derive(Clone, Copy)]
+pub struct Added<'a> {
+    pub kind: HitKind,
+    /// The album, artist or playlist the tracks came from.
+    pub source: Option<&'a str>,
+    /// The source's page on the web client, relative to it.
+    pub url: Option<&'a str>,
+}
+
+/// Public confirmation after `/play`, laid out by the `queued`, `queued_album`, `queued_artist`
+/// or `queued_playlist` layout by what the query was. `cover` is the picture for what was added
+/// (the first track's art, or the artist's when the query was an artist) and `artist_art` the
+/// artist's picture when it was fetched.
 pub fn queued(
     snap: &PlayerSnapshot,
     items: &[QueueItem],
     enq: &Enqueued,
-    kind: HitKind,
-    source: Option<&str>,
+    added: Added<'_>,
     cover: Option<&Cover>,
     artist_art: Option<&Cover>,
     artist_banner: Option<&Cover>,
@@ -1061,44 +1068,57 @@ pub fn queued(
         .iter()
         .map(|i| i.track.duration_ms.max(0) as u64)
         .sum();
-    let (icon, heading, added, added_meta, layout) = match kind {
-        HitKind::Album | HitKind::Artist => {
-            let what = source
-                .map(|s| format!("**{}**", linked(s, web, s)))
-                .unwrap_or_else(|| fmt::count(enq.count, "track"));
-            let position = if enq.position == 0 {
-                "playing now".to_string()
-            } else {
-                format!("starting at #{}", enq.position)
+    let total = fmt::duration(total_ms);
+    // When it plays: now, somewhere in the shuffle, or at a place in the queue after so long.
+    let when = |first_of_many: bool| {
+        if enq.position == 0 {
+            "playing now".to_string()
+        } else if snap.shuffle {
+            "shuffled in".to_string()
+        } else {
+            format!(
+                "{}plays in ~{} (#{} in queue)",
+                if first_of_many { "first " } else { "" },
+                fmt::duration(eta_ms),
+                enq.position
+            )
+        }
+    };
+    let (icon, heading, added_line, added_meta, layout) = match added.kind {
+        HitKind::Album | HitKind::Artist | HitKind::Playlist => {
+            let what = match (added.source, added.url, web) {
+                (Some(s), Some(path), Some(web)) => {
+                    format!("**[{}]({web}{path})**", fmt::escape_md(s))
+                }
+                (Some(s), _, _) => format!("**{}**", linked(s, web, s)),
+                (None, _, _) => fmt::count(enq.count, "track"),
             };
-            let (icon, layout) = match kind {
+            let (icon, layout) = match added.kind {
                 HitKind::Artist => (Icon::Artist, &snap.layouts.queued_artist),
+                HitKind::Playlist => (Icon::Playlist, &snap.layouts.queued_playlist),
                 _ => (Icon::Album, &snap.layouts.queued_album),
             };
             (
                 icon,
                 format!("Added {}", fmt::count(enq.count, "track")),
                 what,
-                format!("{position} · {} · by {by}", fmt::duration(total_ms)),
+                format!("{total} in all · {} · by {by}", when(true)),
                 layout,
             )
         }
-        HitKind::Track if enq.position == 0 => (
-            Icon::Play,
-            "Playing now".to_string(),
-            track_block(&first.track, web, None),
-            format!("by {by}"),
-            &snap.layouts.queued,
-        ),
         HitKind::Track => (
-            Icon::Note,
-            "Added to queue".to_string(),
+            if enq.position == 0 {
+                Icon::Play
+            } else {
+                Icon::Note
+            },
+            if enq.position == 0 {
+                "Playing now".to_string()
+            } else {
+                "Added to queue".to_string()
+            },
             track_block(&first.track, web, None),
-            format!(
-                "#{} · plays in ~{} · by {by}",
-                enq.position,
-                fmt::duration(eta_ms)
-            ),
+            format!("{total} long · {} · by {by}", when(false)),
             &snap.layouts.queued,
         ),
     };
@@ -1108,13 +1128,13 @@ pub fn queued(
     scene.artist_art = artist_art;
     scene.artist_banner = artist_banner;
     scene.toast = Some(Toast {
-        added,
+        added: added_line,
         added_meta,
         count: enq.count,
         duration_ms: total_ms,
         position: enq.position,
         eta_ms,
-        source,
+        source: added.source,
         requested_by: first.requested_by,
     });
     finish(&scene, layout, false)
@@ -1325,6 +1345,13 @@ pub fn search_results(
                     fmt::escape_md(&h.title),
                     fmt::escape_md(&h.subtitle)
                 ),
+                HitKind::Playlist => format!(
+                    "`{n:>2}.` {} **{}** · {} · {}",
+                    icons.get(Icon::Playlist).markup(),
+                    fmt::escape_md(&h.title),
+                    fmt::escape_md(&h.subtitle),
+                    fmt::count(h.track_count.max(0) as usize, "track")
+                ),
             }
         })
         .collect();
@@ -1338,6 +1365,7 @@ pub fn search_results(
                 HitKind::Track => ("t", "Track", Icon::Note),
                 HitKind::Album => ("al", "Album", Icon::Album),
                 HitKind::Artist => ("ar", "Artist", Icon::Artist),
+                HitKind::Playlist => ("pl", "Playlist", Icon::Playlist),
             };
             let label = if h.subtitle.is_empty() || h.kind == HitKind::Artist {
                 h.title.clone()
@@ -1760,8 +1788,11 @@ mod tests {
                     position: 4,
                     count: 1,
                 },
-                HitKind::Track,
-                None,
+                Added {
+                    kind: HitKind::Track,
+                    source: None,
+                    url: None,
+                },
                 Some(&c),
                 None,
                 None,
@@ -1773,8 +1804,11 @@ mod tests {
                     position: 0,
                     count: 1,
                 },
-                HitKind::Track,
-                None,
+                Added {
+                    kind: HitKind::Track,
+                    source: None,
+                    url: None,
+                },
                 None,
                 None,
                 None,
@@ -1786,8 +1820,11 @@ mod tests {
                     position: 0,
                     count: 23,
                 },
-                HitKind::Album,
-                Some("Discovery"),
+                Added {
+                    kind: HitKind::Album,
+                    source: Some("Discovery"),
+                    url: None,
+                },
                 Some(&c),
                 Some(&c),
                 None,
@@ -1856,8 +1893,8 @@ mod tests {
         assert_eq!(c["type"], 17);
         assert_eq!(c["accent_color"], accent::BRAND);
         let kids = c["components"].as_array().unwrap();
-        // header, divider, the section (everything beside the art), gap, two rows
-        assert_eq!(kids.len(), 6);
+        // header, divider, the section (everything beside the art); the rows sit under the box
+        assert_eq!(kids.len(), 3);
         let head = kids[0]["content"].as_str().unwrap();
         assert_eq!(head, "### ▶ Now playing in <#555>");
         assert_eq!(kids[2]["type"], 9);
@@ -1872,10 +1909,10 @@ mod tests {
             body,
             "**One More Time**\nDaft Punk · *Discovery*\n-# Requested by <@42>\n━━●───────── 1:05 / 5:20\n-# 3 tracks in queue (16:00) · Volume: 80%"
         );
-        let row1 = kids[4]["components"].as_array().unwrap();
-        let row2 = kids[5]["components"].as_array().unwrap();
+        let row1 = b["components"][1]["components"].as_array().unwrap();
+        let row2 = b["components"][2]["components"].as_array().unwrap();
         assert_eq!(row1.len(), 5);
-        assert_eq!(row2.len(), 4);
+        assert_eq!(row2.len(), 5);
         // Every button is the neutral style; state lives in the icons, never in a label.
         assert!(row1.iter().chain(row2.iter()).all(|b| b["style"] == 2));
         assert!(row1.iter().chain(row2.iter()).all(|b| b["label"].is_null()));
@@ -1884,9 +1921,10 @@ mod tests {
         assert_eq!(row1[2]["emoji"]["name"], "⏸");
         // Without the emoji set the state icons fall back to glyphs.
         assert_eq!(row1[0]["emoji"]["name"], "🔁");
-        assert_eq!(row2[1]["emoji"]["name"], "📻");
-        assert_eq!(row2[3]["custom_id"], "cd:1:1:777:lv");
-        assert_eq!(row2[3]["emoji"]["name"], "🚪");
+        assert_eq!(row2[1]["emoji"]["name"], "🕘");
+        assert_eq!(row2[2]["emoji"]["name"], "📻");
+        assert_eq!(row2[4]["custom_id"], "cd:1:1:777:lv");
+        assert_eq!(row2[4]["emoji"]["name"], "🚪");
         // The cover rides along as an upload.
         assert_eq!(b["attachments"][0]["filename"], "cover-c.jpg");
         assert!(!m.ephemeral);
@@ -1905,7 +1943,7 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("### ⏸ Paused"));
-        assert_eq!(kids[4]["components"][2]["emoji"]["name"], "▶");
+        assert_eq!(b["components"][1]["components"][2]["emoji"]["name"], "▶");
     }
 
     #[test]
@@ -1924,8 +1962,8 @@ mod tests {
             head.starts_with("### <:cd_play:1000> Now playing"),
             "{head}"
         );
-        // No art here, so the section is plain text and the first button row is the fifth child.
-        let pause = &kids[4]["components"][2]["emoji"];
+        // The first button row sits under the box.
+        let pause = &b["components"][1]["components"][2]["emoji"];
         assert_eq!(pause["name"], "cd_pause");
         assert_eq!(pause["id"], "1001");
         assert!(!b.to_string().contains('⏸'));
@@ -2002,8 +2040,8 @@ mod tests {
         let m = now_playing(&snap(0, true, false), false);
         let b = m.body();
         let kids = kids(&m);
-        // header, divider, the section's text on its own, gap, two rows
-        assert_eq!(kids.len(), 6);
+        // header, divider, the section's text on its own
+        assert_eq!(kids.len(), 3);
         assert_eq!(kids[2]["type"], 10);
         assert!(b["attachments"].as_array().unwrap().is_empty());
         // With nothing queued the line says so.
@@ -2348,7 +2386,8 @@ mod tests {
         let head = k[0]["content"].as_str().unwrap();
         assert!(head.ends_with(" One More Time\n-# Daft Punk"), "{head}");
         assert_eq!(k[2]["content"], "two");
-        let nav = k.last().unwrap()["components"].as_array().unwrap();
+        let lb = m.body();
+        let nav = lb["components"][1]["components"].as_array().unwrap();
         assert_eq!(nav[0]["custom_id"], "cd:1:1:777:lyf");
         assert_eq!(nav[1]["custom_id"], "cd:1:1:777:lyp:0");
         assert_eq!(nav[2]["label"], "2/3");
@@ -2416,8 +2455,11 @@ mod tests {
             &s,
             &items,
             &enq,
-            HitKind::Artist,
-            Some("Daft Punk"),
+            Added {
+                kind: HitKind::Artist,
+                source: Some("Daft Punk"),
+                url: None,
+            },
             None,
             None,
             None,
@@ -2428,8 +2470,11 @@ mod tests {
             &s,
             &items,
             &enq,
-            HitKind::Album,
-            Some("Discovery"),
+            Added {
+                kind: HitKind::Album,
+                source: Some("Discovery"),
+                url: None,
+            },
             None,
             None,
             None,
@@ -2466,13 +2511,15 @@ mod tests {
         let s = snap(25, true, false);
         let first = queue_page(&s, 0);
         let rows = kids(&first);
-        let nav = rows.last().unwrap()["components"].as_array().unwrap();
+        // The page buttons sit under the box.
+        let fb = first.body();
+        let nav = fb["components"][1]["components"].as_array().unwrap();
         assert_eq!(nav[0]["disabled"], true);
         assert_eq!(nav[0]["custom_id"], "cd:1:1:777:qf");
         assert_eq!(nav[3]["disabled"], false);
         assert_eq!(nav[2]["label"], "1/3");
-        // The entries are numbered, right-aligned to the page's widest number.
-        let head = rows[0]["content"].as_str().unwrap();
+        // The header is a section with the Clear button beside it.
+        let head = rows[0]["components"][0]["content"].as_str().unwrap();
         assert!(head.contains("25 tracks"), "{head}");
         assert!(rows[2]["content"]
             .as_str()
@@ -2485,8 +2532,8 @@ mod tests {
         );
         assert!(list.contains("\n`10.` **Track 9**"), "{list}");
         let last = queue_page(&s, 2);
-        let rows = kids(&last);
-        let nav = rows.last().unwrap()["components"].as_array().unwrap();
+        let lb = last.body();
+        let nav = lb["components"][1]["components"].as_array().unwrap();
         assert_eq!(nav[3]["disabled"], true);
         assert_eq!(nav[4]["custom_id"], "cd:1:1:777:ql");
         assert_eq!(nav[2]["label"], "3/3");
@@ -2593,8 +2640,58 @@ mod tests {
         // The controller's own controls say nothing.
         let c = now_playing(&s, false).body();
         assert_eq!(
-            c["components"][0]["components"][4]["components"][2]["custom_id"],
+            c["components"][1]["components"][2]["custom_id"],
             "cd:1:1:777:pl"
+        );
+    }
+
+    #[test]
+    fn the_toast_says_how_long_and_when() {
+        let mut s = snap(3, true, false);
+        let one = Added {
+            kind: HitKind::Track,
+            source: None,
+            url: None,
+        };
+        let text = |m: Message| m.body().to_string();
+        let enq = |position: usize, count: usize| Enqueued { position, count };
+        let body = text(queued(&s, &s.queue[..1], &enq(2, 1), one, None, None, None));
+        assert!(body.contains("5:20 long · plays in ~"), "{body}");
+        assert!(body.contains("(#2 in queue) · by <@42>"), "{body}");
+        let body = text(queued(&s, &s.queue[..1], &enq(0, 1), one, None, None, None));
+        assert!(
+            body.contains("5:20 long · playing now · by <@42>"),
+            "{body}"
+        );
+        s.shuffle = true;
+        let body = text(queued(&s, &s.queue[..1], &enq(2, 1), one, None, None, None));
+        assert!(
+            body.contains("5:20 long · shuffled in · by <@42>"),
+            "{body}"
+        );
+        s.shuffle = false;
+        let album = Added {
+            kind: HitKind::Album,
+            source: Some("Discovery"),
+            url: None,
+        };
+        let body = text(queued(&s, &s.queue, &enq(2, 3), album, None, None, None));
+        assert!(body.contains("16:00 in all · first plays in ~"), "{body}");
+        // A playlist links to its page on the web client.
+        s.web_base = Some("https://chordia.example".into());
+        let playlist = Added {
+            kind: HitKind::Playlist,
+            source: Some("Evening drive"),
+            url: Some("/app/playlists/abc"),
+        };
+        let body = text(queued(&s, &s.queue, &enq(0, 3), playlist, None, None, None));
+        assert!(
+            body.contains("**[Evening drive](https://chordia.example/app/playlists/abc)**"),
+            "{body}"
+        );
+        assert!(
+            body.contains("16:00 in all · playing now · by <@42>"),
+            "{body}"
         );
     }
 
@@ -2618,7 +2715,8 @@ mod tests {
             ),
             "{list}"
         );
-        let nav = rows.last().unwrap()["components"].as_array().unwrap();
+        let hb = m.body();
+        let nav = hb["components"][1]["components"].as_array().unwrap();
         assert_eq!(nav[0]["custom_id"], "cd:1:1:777:hf");
         assert_eq!(nav[1]["custom_id"], "cd:1:1:777:h:0");
         assert_eq!(nav[3]["disabled"], true);
@@ -2640,8 +2738,11 @@ mod tests {
                 position: 1,
                 count: 1,
             },
-            HitKind::Track,
-            None,
+            Added {
+                kind: HitKind::Track,
+                source: None,
+                url: None,
+            },
             None,
             None,
             None,

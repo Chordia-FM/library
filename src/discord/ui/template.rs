@@ -50,6 +50,7 @@ const TRACK: &[&str] = &[
     "queued",
     "queued_album",
     "queued_artist",
+    "queued_playlist",
     "lyrics",
     "done",
     "notice",
@@ -68,7 +69,7 @@ const PLAYING: &[&str] = &[
     "vote",
     "vote_passed",
 ];
-const QUEUED: &[&str] = &["queued", "queued_album", "queued_artist"];
+const QUEUED: &[&str] = &["queued", "queued_album", "queued_artist", "queued_playlist"];
 const ITEM: &[&str] = &["item"];
 const PAGED: &[&str] = &["queue", "history", "lyrics"];
 const REPLY: &[&str] = &["done", "notice", "error"];
@@ -656,6 +657,9 @@ pub fn upgrade(layouts: &mut BotLayouts) {
         layouts.queued_album = layouts.queued.clone();
         layouts.queued_artist = layouts.queued.clone();
     }
+    if from < 6 && layouts.queued != default_queued() {
+        layouts.queued_playlist = layouts.queued.clone();
+    }
     layouts.version = LAYOUT_VERSION;
 }
 
@@ -681,6 +685,11 @@ pub fn upgrade_overrides(overrides: &mut LayoutOverrides) {
         if let Some(q) = overrides.queued.clone() {
             overrides.queued_album.get_or_insert_with(|| q.clone());
             overrides.queued_artist.get_or_insert(q);
+        }
+    }
+    if from < 6 {
+        if let Some(q) = overrides.queued.clone() {
+            overrides.queued_playlist.get_or_insert(q);
         }
     }
     overrides.version = LAYOUT_VERSION;
@@ -901,6 +910,7 @@ mod tests {
         upgrade(&mut l);
         assert_eq!(l.queued_album, shaped);
         assert_eq!(l.queued_artist, shaped);
+        assert_eq!(l.queued_playlist, shaped);
         // A toast left at its default leaves the new ones at theirs.
         let mut l = BotLayouts {
             version: 4,

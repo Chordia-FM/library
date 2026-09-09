@@ -25,6 +25,8 @@ pub enum HitKind {
     Track,
     Album,
     Artist,
+    /// A Chordia playlist on the Hub; never a search hit here, but what `/playlist` queues.
+    Playlist,
 }
 
 /// One search result, shaped for a picker: a title line, a subtitle line, and the ids and facts a

@@ -4,12 +4,15 @@ use std::sync::Arc;
 
 use serenity::all::AutocompleteChoice;
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 use super::{guard, Context, Error};
 use crate::catalog::{self, TrackRow};
+use crate::discord::hub;
 use crate::discord::player::{Cover, Position, QueueItem};
 use crate::discord::ui::{fmt, send, views};
 use crate::error::AppResult;
+use crate::http::AppState;
 use crate::search::{self, HitKind, SearchHit};
 
 #[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
@@ -32,12 +35,28 @@ impl From<Option<PlayPosition>> for Position {
 /// What a query resolved to: the tracks to queue, and what to call the set when it is more than one.
 pub struct Resolved {
     pub tracks: Vec<Arc<TrackRow>>,
-    /// What the query was: a track, an album or an artist. The toast is laid out by it.
+    /// What the query was: a track, an album, an artist or a playlist. The toast is laid out by
+    /// it.
     pub kind: HitKind,
     pub source: Option<String>,
+    /// The source's page on the web client, relative to it (a playlist's, say).
+    pub source_url: Option<String>,
     /// Set when the query was an artist, so the toast can show their picture rather than the
     /// first album's cover.
     pub artist: Option<ArtistRef>,
+}
+
+impl Resolved {
+    /// Nothing matched.
+    fn none(kind: HitKind) -> Self {
+        Resolved {
+            tracks: Vec::new(),
+            kind,
+            source: None,
+            source_url: None,
+            artist: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -73,8 +92,19 @@ const ARTIST_CAP: i64 = 100;
 
 /// Resolve `t:<id>` / `al:<id>` / `ar:<id>` (from autocomplete or a picker), or free text via the
 /// best search hit of the allowed kinds.
-pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResult<Resolved> {
+pub async fn resolve(state: &AppState, query: &str, kinds: &[HitKind]) -> AppResult<Resolved> {
+    let db = &state.db;
     let q = query.trim();
+    if let Some(id) = q.strip_prefix("pl:") {
+        return resolve_playlist(state, id).await;
+    }
+    // Playlists live on the Hub, not in the library's index: free text asks it by name.
+    if kinds == [HitKind::Playlist] {
+        return match hub::search_playlists(state, q).await.into_iter().next() {
+            Some(p) => resolve_playlist(state, &p.id.to_string()).await,
+            None => Ok(Resolved::none(HitKind::Playlist)),
+        };
+    }
     if let Some(id) = q.strip_prefix("t:") {
         return Ok(Resolved {
             tracks: catalog::get_track_row(db, id)
@@ -83,6 +113,7 @@ pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResu
                 .into_iter()
                 .collect(),
             kind: HitKind::Track,
+            source_url: None,
             source: None,
             artist: None,
         });
@@ -98,14 +129,16 @@ pub async fn resolve(db: &SqlitePool, query: &str, kinds: &[HitKind]) -> AppResu
         None => Ok(Resolved {
             tracks: Vec::new(),
             kind: HitKind::Track,
+            source_url: None,
             source: None,
             artist: None,
         }),
-        Some(hit) => resolve_hit(db, hit).await,
+        Some(hit) => resolve_hit(state, hit).await,
     }
 }
 
-pub async fn resolve_hit(db: &SqlitePool, hit: &SearchHit) -> AppResult<Resolved> {
+pub async fn resolve_hit(state: &AppState, hit: &SearchHit) -> AppResult<Resolved> {
+    let db = &state.db;
     match hit.kind {
         HitKind::Track => Ok(Resolved {
             tracks: catalog::get_track_row(db, &hit.id)
@@ -114,12 +147,32 @@ pub async fn resolve_hit(db: &SqlitePool, hit: &SearchHit) -> AppResult<Resolved
                 .into_iter()
                 .collect(),
             kind: HitKind::Track,
+            source_url: None,
             source: None,
             artist: None,
         }),
         HitKind::Album => resolve_album(db, &hit.id).await,
         HitKind::Artist => resolve_artist(db, &hit.id).await,
+        HitKind::Playlist => resolve_playlist(state, &hit.id).await,
     }
+}
+
+/// A Chordia playlist by its Hub id: the tracks this library holds, in order, named and linked
+/// to its page.
+async fn resolve_playlist(state: &AppState, id: &str) -> AppResult<Resolved> {
+    let Ok(uuid) = id.parse::<Uuid>() else {
+        return Ok(Resolved::none(HitKind::Playlist));
+    };
+    let Some((info, rows)) = hub::playlist_tracks(state, uuid).await else {
+        return Ok(Resolved::none(HitKind::Playlist));
+    };
+    Ok(Resolved {
+        tracks: rows.into_iter().map(Arc::new).collect(),
+        kind: HitKind::Playlist,
+        source: Some(info.name),
+        source_url: Some(format!("/app/playlists/{uuid}")),
+        artist: None,
+    })
 }
 
 async fn resolve_album(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
@@ -128,6 +181,7 @@ async fn resolve_album(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
     Ok(Resolved {
         tracks: tracks.into_iter().map(Arc::new).collect(),
         kind: HitKind::Album,
+        source_url: None,
         source,
         artist: None,
     })
@@ -154,6 +208,7 @@ async fn resolve_artist(db: &SqlitePool, id: &str) -> AppResult<Resolved> {
     Ok(Resolved {
         tracks: tracks.into_iter().map(Arc::new).collect(),
         kind: HitKind::Artist,
+        source_url: None,
         source,
         artist,
     })
@@ -177,6 +232,26 @@ async fn autocomplete_artist(ctx: Context<'_>, partial: &str) -> Vec<Autocomplet
     autocomplete_kinds(ctx, partial, &[HitKind::Artist]).await
 }
 
+/// Autocomplete for `/playlist`: the Hub's playlists the bot may queue, by name.
+async fn autocomplete_playlist(ctx: Context<'_>, partial: &str) -> Vec<AutocompleteChoice> {
+    if partial.trim().len() < 2 {
+        return Vec::new();
+    }
+    hub::search_playlists(&ctx.data().state, partial)
+        .await
+        .into_iter()
+        .map(|p| {
+            let label = format!(
+                "📃 {} · {} · by {}",
+                p.name,
+                fmt::count(p.track_count as usize, "track"),
+                p.owner_handle
+            );
+            AutocompleteChoice::new(fmt::ellipsize(&label, 100), format!("pl:{}", p.id))
+        })
+        .collect()
+}
+
 async fn autocomplete_kinds(
     ctx: Context<'_>,
     partial: &str,
@@ -198,6 +273,7 @@ async fn autocomplete_kinds(
                 HitKind::Track => ("t", format!("{} · {}", h.title, h.subtitle)),
                 HitKind::Album => ("al", format!("💿 {} · {}", h.title, h.subtitle)),
                 HitKind::Artist => ("ar", format!("👤 {} · {}", h.title, h.subtitle)),
+                HitKind::Playlist => ("pl", format!("📃 {} · {}", h.title, h.subtitle)),
             };
             AutocompleteChoice::new(fmt::ellipsize(&label, 100), format!("{prefix}:{}", h.id))
         })
@@ -216,11 +292,12 @@ async fn queue_resolved(
         Ok(x) => x,
         Err(r) => return send::respond(ctx, r.view(&super::snap(ctx).await)).await,
     };
-    let resolved = resolve(&identity.state.db, query, kinds).await?;
+    let resolved = resolve(&identity.state, query, kinds).await?;
     if resolved.tracks.is_empty() {
         let what = match kinds {
             [HitKind::Album] => "No album",
             [HitKind::Artist] => "No artist",
+            [HitKind::Playlist] => "No playlist you can queue",
             _ => "Nothing",
         };
         return send::respond(
@@ -268,8 +345,11 @@ async fn queue_resolved(
             &snap,
             &items,
             &enq,
-            resolved.kind,
-            resolved.source.as_deref(),
+            views::Added {
+                kind: resolved.kind,
+                source: resolved.source.as_deref(),
+                url: resolved.source_url.as_deref(),
+            },
             cover.as_ref(),
             art.image.as_ref(),
             art.banner.as_ref(),
@@ -312,6 +392,21 @@ pub async fn album(
 ) -> Result<(), Error> {
     ctx.defer().await?;
     queue_resolved(ctx, &query, &[HitKind::Album], position.into()).await
+}
+
+/// Queue one of the library owner's Chordia playlists, or a public one
+#[poise::command(slash_command, guild_only)]
+pub async fn playlist(
+    ctx: Context<'_>,
+    #[description = "Playlist name"]
+    #[autocomplete = "autocomplete_playlist"]
+    query: String,
+    #[description = "Add to the end of the queue (default) or play next"] position: Option<
+        PlayPosition,
+    >,
+) -> Result<(), Error> {
+    ctx.defer().await?;
+    queue_resolved(ctx, &query, &[HitKind::Playlist], position.into()).await
 }
 
 /// Queue an artist's tracks, album by album

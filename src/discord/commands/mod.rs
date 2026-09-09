@@ -30,6 +30,7 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         play::search(),
         play::album(),
         play::artist(),
+        play::playlist(),
         queue::queue(),
         queue::nowplaying(),
         queue::history(),

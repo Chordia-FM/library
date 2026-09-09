@@ -12,6 +12,7 @@ use chordia_contracts::catalog::{CatalogPruneRequest, CatalogSyncRequest, Catalo
 use chordia_contracts::directory::{HeartbeatRequest, HeartbeatResponse, ServerOwner};
 use chordia_contracts::discord::{
     ArtistArtRequest, ArtistArtResponse, AttributedScrobbleBatch, ListenersNowPlaying,
+    PlaylistSearchRequest, PlaylistSearchResponse, PlaylistTracksRequest, PlaylistTracksResponse,
     ResolveListenersRequest, ResolveListenersResponse, ResolveTracksRequest, ResolveTracksResponse,
 };
 use chordia_contracts::identify::{IdentifyRequest, IdentifyResponse};
@@ -196,6 +197,26 @@ impl HubClient {
         req: &ResolveTracksRequest,
     ) -> anyhow::Result<ResolveTracksResponse> {
         self.library_post("/v1/catalog/resolve-tracks", server_api_key, req)
+            .await
+    }
+
+    /// `POST /v1/catalog/playlists:search`: playlists the bot may queue, by name.
+    pub async fn search_playlists(
+        &self,
+        server_api_key: &str,
+        req: &PlaylistSearchRequest,
+    ) -> anyhow::Result<PlaylistSearchResponse> {
+        self.library_post("/v1/catalog/playlists:search", server_api_key, req)
+            .await
+    }
+
+    /// `POST /v1/catalog/playlists:tracks`: a playlist's tracks as this server's own refs.
+    pub async fn playlist_tracks(
+        &self,
+        server_api_key: &str,
+        req: &PlaylistTracksRequest,
+    ) -> anyhow::Result<PlaylistTracksResponse> {
+        self.library_post("/v1/catalog/playlists:tracks", server_api_key, req)
             .await
     }
 

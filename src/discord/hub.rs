@@ -10,13 +10,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use chordia_contracts::discord::{
-    ArtistArt, ArtistArtRequest, ListenersNowPlaying, ResolveListenersRequest,
-    ResolveTracksRequest, ResolvedListener, ResolvedTrack,
+    ArtistArt, ArtistArtRequest, ListenersNowPlaying, PlaylistHit, PlaylistSearchRequest,
+    PlaylistTracksRequest, PlaylistTracksResponse, ResolveListenersRequest, ResolveTracksRequest,
+    ResolvedListener, ResolvedTrack,
 };
 use chordia_contracts::social::NowPlayingReport;
 use uuid::Uuid;
 
-use crate::catalog::TrackRow;
+use crate::catalog::{self, TrackRow};
 use crate::discord::player::Cover;
 use crate::http::AppState;
 use crate::pairing::HubClient;
@@ -202,6 +203,49 @@ pub async fn hub_library_id(state: &AppState, local_library_id: &str) -> Option<
         .flatten()
         .flatten()
         .and_then(|s| s.parse().ok())
+}
+
+/// Playlists the bot may queue whose name matches, from the Hub: the library owner's own and
+/// anyone's public ones. Nothing without a Hub.
+pub async fn search_playlists(state: &AppState, query: &str) -> Vec<PlaylistHit> {
+    let Some(key) = key(state).await else {
+        return Vec::new();
+    };
+    let req = PlaylistSearchRequest {
+        query: query.to_string(),
+        limit: 10,
+    };
+    match hub(state).search_playlists(&key, &req).await {
+        Ok(resp) => resp.playlists,
+        Err(e) => {
+            tracing::debug!(error = %e, "searching playlists");
+            Vec::new()
+        }
+    }
+}
+
+/// A playlist's tracks as this library's rows, in playlist order, with the Hub's word on it
+/// (its name, its owner, how many of its tracks this server does not hold).
+pub async fn playlist_tracks(
+    state: &AppState,
+    id: Uuid,
+) -> Option<(PlaylistTracksResponse, Vec<TrackRow>)> {
+    let key = key(state).await?;
+    let req = PlaylistTracksRequest { playlist_id: id };
+    let resp = match hub(state).playlist_tracks(&key, &req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "fetching a playlist");
+            return None;
+        }
+    };
+    let mut rows = Vec::with_capacity(resp.tracks.len());
+    for t in &resp.tracks {
+        if let Ok(Some(row)) = catalog::get_track_row(&state.db, &t.track_ref).await {
+            rows.push(row);
+        }
+    }
+    Some((resp, rows))
 }
 
 /// Where a track's page is on the Hub, for a deep link.
