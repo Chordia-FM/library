@@ -4,7 +4,7 @@ use serenity::all::Role;
 
 use super::{guard, Context, Error};
 use crate::discord::player::LeaveReason;
-use crate::discord::settings::SkipMode;
+use crate::discord::settings::{Pickup, SkipMode};
 use crate::discord::ui::{send, views};
 
 #[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
@@ -51,6 +51,47 @@ pub async fn skipmode(
         ),
     };
     send::respond(ctx, views::ok(&super::snap(ctx).await, "Skipping", &detail)).await
+}
+
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+pub enum PickupChoice {
+    #[name = "position"]
+    Position,
+    #[name = "start"]
+    Start,
+}
+
+/// Where the bot picks up after a restart: where it left off, or at the start of the track
+#[poise::command(slash_command, guild_only)]
+pub async fn pickup(
+    ctx: Context<'_>,
+    #[description = "Where it left off, or the start of the track"] mode: PickupChoice,
+) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    if let Err(r) = guard::admin(ctx).await {
+        return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
+    }
+    let guild = super::guild_of(ctx)?;
+    let player = ctx.data().player(guild).await;
+    let updated = player
+        .update_settings(|s| {
+            s.pickup = match mode {
+                PickupChoice::Position => Pickup::Position,
+                PickupChoice::Start => Pickup::Start,
+            }
+        })
+        .await;
+    let detail = match updated.pickup {
+        Pickup::Position => {
+            "-# When the library restarts mid-track, the bot comes back to the same spot."
+        }
+        Pickup::Start => "-# When the library restarts mid-track, the bot starts that track over.",
+    };
+    send::respond(
+        ctx,
+        views::ok(&super::snap(ctx).await, "After a restart", detail),
+    )
+    .await
 }
 
 /// This server's settings for the bot

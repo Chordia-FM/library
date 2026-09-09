@@ -1664,13 +1664,14 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
         format!("{} seconds", gs.crossfade_secs)
     };
     let summary = onoff(gs.summary);
+    let pickup = gs.pickup.label();
     let mut body = header(
         &icons.get(Icon::Gear),
         "Settings",
         Some(&format!("{} in this server", snap.bot_name)),
     );
     body.push(text(format!(
-        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Skipping** · {skip}\n**Crossfade** · {crossfade}\n**Session summary** · {summary}\n**Re-post controller when it scrolls away** · {}",
+        "**DJ roles** · {dj}\n**Volume** · {volume}\n**Normalize volume** · {}\n**Autoplay** · {autoplay}\n**24/7** · {always_on}\n**Skipping** · {skip}\n**Crossfade** · {crossfade}\n**After a restart** · {pickup}\n**Session summary** · {summary}\n**Re-post controller when it scrolls away** · {}",
         onoff(gs.normalize),
         onoff(gs.announce)
     )));

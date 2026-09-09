@@ -291,8 +291,10 @@ struct PlayerState {
     prepared: Option<Prepared>,
     /// When the blend into `prepared` began, while it runs.
     fading: Option<Instant>,
-    /// Where the current track was at the last look, for the queue a 24/7 bot keeps.
+    /// Where the current track was at the last look, for the restart record.
     last_position_ms: u64,
+    /// Whether a restart record is on disk for this server, so an idle bot clears it once.
+    saved: bool,
     /// Since when nothing has been playing.
     idle_since: Option<Instant>,
     /// Since when the bot has been playing to nobody.
@@ -407,15 +409,27 @@ struct Prepared {
     epoch: u64,
 }
 
-/// The queue a 24/7 bot keeps across a restart.
+/// What the bot was doing in a server, written down while it plays so a restart (or a crash)
+/// brings it back: the channels, the controller message, the track and where it was, the queue
+/// behind it, and the modes.
 #[derive(Serialize, Deserialize)]
 struct SavedQueue {
+    #[serde(default)]
+    voice_channel: u64,
+    #[serde(default)]
+    text_channel: Option<u64>,
+    #[serde(default)]
+    controller: Option<(u64, u64)>,
     current: Option<SavedItem>,
     position_ms: u64,
+    #[serde(default)]
+    paused: bool,
     queue: Vec<SavedItem>,
     loop_mode: String,
     shuffle: bool,
     autoplay: bool,
+    #[serde(default)]
+    session_started_at: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -533,6 +547,7 @@ impl GuildPlayer {
                 prepared: None,
                 fading: None,
                 last_position_ms: 0,
+                saved: false,
                 idle_since: None,
                 alone_since: None,
                 controller: None,
@@ -634,9 +649,11 @@ impl GuildPlayer {
             let mut s = self.inner.lock().await;
             let session_since = s.session_started_at.take();
             let summary_on = s.settings.summary;
-            // A restart keeps a 24/7 server's queue for the rejoin; any other leave ends it.
-            let kept = (reason == LeaveReason::Shutdown && s.settings.always_on)
-                .then(|| Self::saved_state(&s));
+            // Going down mid-session keeps everything for the rejoin; any other leave ends it.
+            let kept = (reason == LeaveReason::Shutdown)
+                .then(|| Self::saved_state(&s))
+                .flatten();
+            s.saved = kept.is_some();
             if let Some(p) = s.prepared.take() {
                 let _ = p.handle.stop();
             }
@@ -737,21 +754,30 @@ impl GuildPlayer {
         }
     }
 
-    /// What the queue would need to come back as: the current track and where it was, what is
-    /// behind it, and the modes.
-    fn saved_state(s: &PlayerState) -> SavedQueue {
-        SavedQueue {
+    /// What a restart would need to bring the bot back as it was: only while it is in a voice
+    /// channel with something playing or waiting. An idle bot has nothing to come back to.
+    fn saved_state(s: &PlayerState) -> Option<SavedQueue> {
+        let voice = s.voice_channel?;
+        if s.current.is_none() && s.queue.is_empty() {
+            return None;
+        }
+        Some(SavedQueue {
+            voice_channel: voice.get(),
+            text_channel: s.text_channel.map(|c| c.get()),
+            controller: s.controller.map(|(c, m)| (c.get(), m.get())),
             current: s.current.as_ref().map(|c| SavedItem::of(&c.item)),
             position_ms: s.last_position_ms,
+            paused: s.current.as_ref().is_some_and(|c| c.paused),
             queue: s.queue.iter().map(SavedItem::of).collect(),
             loop_mode: s.loop_mode.label().to_string(),
             shuffle: s.shuffle,
             autoplay: s.autoplay,
-        }
+            session_started_at: s.session_started_at,
+        })
     }
 
-    /// Write the queue down for a restart, or forget it: a 24/7 bot going down keeps it, any
-    /// other leave is the end of it.
+    /// Write the restart record, or forget it: going down mid-session keeps it, any other leave
+    /// is the end of it.
     async fn keep_or_forget_queue(&self, identity: &Identity, kept: Option<SavedQueue>) {
         let Some(app_id) = identity.app_id_sync() else {
             return;
@@ -763,54 +789,46 @@ impl GuildPlayer {
             None => settings::clear_queue(db, &app_id, &guild_id).await,
         };
         if let Err(e) = result {
-            tracing::warn!(guild = %self.guild_id, error = %e, "keeping the queue for a restart");
+            tracing::warn!(guild = %self.guild_id, error = %e, "keeping the restart record");
         }
     }
 
-    /// Write the queue down while a 24/7 bot plays, so a crash loses at most a moment.
+    /// Write the restart record while the bot is busy, so a crash loses at most a moment; clear
+    /// it once when the bot goes idle.
     async fn persist_queue(&self) {
-        let state = {
-            let s = self.inner.lock().await;
-            if !s.settings.always_on || s.voice_channel.is_none() {
-                return;
-            }
-            Self::saved_state(&s)
+        let (state, had) = {
+            let mut s = self.inner.lock().await;
+            let state = Self::saved_state(&s);
+            let had = s.saved;
+            s.saved = state.is_some();
+            (state, had)
         };
+        if state.is_none() && !had {
+            return;
+        }
         let Ok(identity) = self.identity() else {
             return;
         };
-        let Some(app_id) = identity.app_id_sync() else {
-            return;
-        };
-        if let Ok(json) = serde_json::to_string(&state) {
-            let _ = settings::save_queue(
-                &identity.state.db,
-                &app_id.to_string(),
-                &self.guild_id.to_string(),
-                &json,
-            )
-            .await;
-        }
+        self.keep_or_forget_queue(&identity, state).await;
     }
 
-    /// Bring back the queue a 24/7 bot was playing before a restart: the tracks still in the
-    /// library, the modes, and the place in the track that was playing.
-    pub async fn restore_saved(self: &Arc<Self>) {
+    /// Bring the bot back as it was before a restart, from its record: into the channels it was
+    /// in, editing the controller message it had, with the queue (the tracks still in the
+    /// library), the modes, and the track that was playing from where it left off or from its
+    /// start, as the server has it set; paused if it was. `false` when it could not rejoin.
+    pub async fn restore(self: &Arc<Self>, json: &str) -> bool {
         let Ok(identity) = self.identity() else {
-            return;
+            return false;
         };
-        let Some(app_id) = identity.app_id_sync() else {
-            return;
+        let Ok(saved) = serde_json::from_str::<SavedQueue>(json) else {
+            return false;
         };
+        if saved.voice_channel == 0 {
+            return false;
+        }
+        let voice = ChannelId::new(saved.voice_channel);
+        let text = saved.text_channel.map(ChannelId::new).unwrap_or(voice);
         let db = &identity.state.db;
-        let Ok(Some(json)) =
-            settings::load_queue(db, &app_id.to_string(), &self.guild_id.to_string()).await
-        else {
-            return;
-        };
-        let Ok(saved) = serde_json::from_str::<SavedQueue>(&json) else {
-            return;
-        };
         let mut items = Vec::new();
         for it in saved.current.iter().chain(saved.queue.iter()) {
             if let Ok(Some(row)) = catalog::get_track_row(db, &it.track_id).await {
@@ -823,6 +841,7 @@ impl GuildPlayer {
         }
         {
             let mut s = self.inner.lock().await;
+            s.session_started_at = saved.session_started_at;
             s.loop_mode = match saved.loop_mode.as_str() {
                 "track" => LoopMode::Track,
                 "queue" => LoopMode::Queue,
@@ -831,18 +850,37 @@ impl GuildPlayer {
             s.shuffle = saved.shuffle;
             s.autoplay = saved.autoplay && s.settings.can_autoplay;
         }
+        if let Err(e) = self.join(voice, text).await {
+            tracing::warn!(guild = %self.guild_id, error = %e, "rejoining after a restart");
+            return false;
+        }
+        let pickup = {
+            let mut s = self.inner.lock().await;
+            // The goodbye the shutdown left becomes the player again.
+            s.controller = saved
+                .controller
+                .map(|(c, m)| (ChannelId::new(c), MessageId::new(m)));
+            s.saved = true;
+            s.settings.pickup
+        };
         if items.is_empty() {
-            return;
+            return true;
         }
         let count = items.len();
         if let Err(e) = self.enqueue(items, Position::Last).await {
             tracing::warn!(guild = %self.guild_id, error = %e, "restoring the queue");
-            return;
+            return true;
         }
-        if saved.current.is_some() && saved.position_ms > 5_000 {
-            let _ = self.seek(Duration::from_millis(saved.position_ms)).await;
+        if saved.current.is_some() {
+            if pickup == settings::Pickup::Position && saved.position_ms > 5_000 {
+                let _ = self.seek(Duration::from_millis(saved.position_ms)).await;
+            }
+            if saved.paused {
+                let _ = self.pause().await;
+            }
         }
-        tracing::info!(guild = %self.guild_id, tracks = count, "restored the queue after a restart");
+        tracing::info!(guild = %self.guild_id, tracks = count, "picked up where it left off");
+        true
     }
 
     /// The gateway says the bot is no longer in a voice channel (kicked, channel deleted).
@@ -2486,6 +2524,7 @@ mod tests {
             prepared: None,
             fading: None,
             last_position_ms: 0,
+            saved: false,
             loop_mode: LoopMode::Off,
             autoplay: false,
             shuffle: false,

@@ -420,6 +420,8 @@ pub struct GuildSettings {
     pub summary: bool,
     /// Seconds each track blends into the next; 0 is none.
     pub crossfade_secs: u8,
+    /// Where the bot picks up after a restart.
+    pub pickup: Pickup,
     /// This server's own versions of some of the bot's messages, over the bot's layouts.
     pub layout_overrides: LayoutOverrides,
 }
@@ -440,6 +442,34 @@ impl SkipMode {
         match self {
             SkipMode::Single => "single",
             SkipMode::Vote => "vote",
+        }
+    }
+}
+
+/// Where the bot picks up after a restart, when it was playing as it went down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Pickup {
+    /// Where it left off in the track.
+    #[default]
+    Position,
+    /// The start of the track that was playing.
+    Start,
+}
+
+impl Pickup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Pickup::Position => "position",
+            Pickup::Start => "start",
+        }
+    }
+
+    /// In words, for the settings panel.
+    pub fn label(self) -> &'static str {
+        match self {
+            Pickup::Position => "where it left off",
+            Pickup::Start => "the start of the track",
         }
     }
 }
@@ -481,6 +511,7 @@ impl GuildSettings {
             eq: eq::default_config(),
             summary: true,
             crossfade_secs: 0,
+            pickup: Pickup::Position,
             layout_overrides: LayoutOverrides::default(),
         }
     }
@@ -519,6 +550,7 @@ pub struct GuildSettingsPatch {
     pub summary: Option<bool>,
     /// Kept to twelve seconds at most.
     pub crossfade_secs: Option<u8>,
+    pub pickup: Option<Pickup>,
     /// Checked against the layout rules by the API before it gets here.
     pub layout_overrides: Option<LayoutOverrides>,
 }
@@ -575,6 +607,9 @@ impl GuildSettingsPatch {
         if let Some(v) = self.crossfade_secs {
             s.crossfade_secs = v.min(MAX_CROSSFADE_SECS);
         }
+        if let Some(v) = self.pickup {
+            s.pickup = v;
+        }
         if let Some(v) = self.layout_overrides {
             s.layout_overrides = v;
         }
@@ -602,6 +637,7 @@ struct GuildRow {
     eq: Option<String>,
     summary: i64,
     crossfade_secs: i64,
+    pickup: String,
     layout_overrides: Option<String>,
 }
 
@@ -636,6 +672,11 @@ impl From<GuildRow> for GuildSettings {
                 .unwrap_or_else(eq::default_config),
             summary: r.summary != 0,
             crossfade_secs: r.crossfade_secs.clamp(0, MAX_CROSSFADE_SECS as i64) as u8,
+            pickup: if r.pickup == "start" {
+                Pickup::Start
+            } else {
+                Pickup::Position
+            },
             layout_overrides: r
                 .layout_overrides
                 .as_deref()
@@ -652,7 +693,7 @@ impl From<GuildRow> for GuildSettings {
 const GUILD_COLS: &str = "app_id, guild_id, dj_role_ids, controller_channel_id, \
      controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce, \
      can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, eq, summary, \
-     crossfade_secs, layout_overrides";
+     crossfade_secs, pickup, layout_overrides";
 
 pub async fn load_guild(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<GuildSettings> {
     let row = sqlx::query_as::<_, GuildRow>(AssertSqlSafe(format!(
@@ -687,8 +728,8 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
         "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_ids, controller_channel_id, \
              controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, \
              announce, can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, \
-             eq, summary, crossfade_secs, layout_overrides, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             eq, summary, crossfade_secs, pickup, layout_overrides, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id, guild_id) DO UPDATE SET \
              dj_role_ids = excluded.dj_role_ids, \
              controller_channel_id = excluded.controller_channel_id, \
@@ -699,7 +740,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
              can_autoplay = excluded.can_autoplay, announce_after = excluded.announce_after, \
              skip_mode = excluded.skip_mode, vote_percent = excluded.vote_percent, \
              eq = excluded.eq, summary = excluded.summary, \
-             crossfade_secs = excluded.crossfade_secs, \
+             crossfade_secs = excluded.crossfade_secs, pickup = excluded.pickup, \
              layout_overrides = excluded.layout_overrides, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
@@ -721,6 +762,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(serde_json::to_string(&s.eq).ok())
     .bind(s.summary as i64)
     .bind(s.crossfade_secs as i64)
+    .bind(s.pickup.as_str())
     .bind(overrides)
     .bind(now_ms())
     .execute(db)
@@ -899,7 +941,17 @@ pub async fn plays_since(
     .await?)
 }
 
-/// The queue a 24/7 bot was playing when it went down, as JSON, for the rejoin.
+/// Every server this bot was busy in when it went down, with what it was doing, as JSON.
+pub async fn load_queues(db: &SqlitePool, app_id: &str) -> AppResult<Vec<(String, String)>> {
+    Ok(sqlx::query_as::<_, (String, String)>(
+        "SELECT guild_id, state FROM discord_saved_queue WHERE app_id = ?",
+    )
+    .bind(app_id)
+    .fetch_all(db)
+    .await?)
+}
+
+/// What the bot was doing in a server when it went down, as JSON, for the rejoin.
 pub async fn save_queue(
     db: &SqlitePool,
     app_id: &str,
