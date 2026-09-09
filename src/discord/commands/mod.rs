@@ -52,6 +52,7 @@ pub fn all() -> Vec<poise::Command<Data, Error>> {
         control::join(),
         control::leave(),
         control::radio(),
+        control::eq(),
         info::bots(),
         info::lyrics(),
         info::stats(),

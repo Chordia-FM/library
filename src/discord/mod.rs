@@ -31,6 +31,7 @@ pub mod avatar;
 pub mod client;
 pub mod commands;
 pub mod emoji;
+pub mod eq;
 pub mod hub;
 pub mod identity;
 pub mod interactions;

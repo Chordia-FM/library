@@ -3,9 +3,11 @@
 //! everything here is meant to be changed while the bot runs, from the dashboard or from Discord.
 
 use chordia_contracts::discord_layout::{BotLayouts, LayoutOverrides};
+use chordia_contracts::user::EqConfig;
 use serde::{Deserialize, Serialize};
 use sqlx::{AssertSqlSafe, SqlitePool};
 
+use crate::discord::eq;
 use crate::discord::ui::template;
 use crate::error::AppResult;
 
@@ -412,6 +414,8 @@ pub struct GuildSettings {
     pub skip_mode: SkipMode,
     /// The share of listeners (people in the voice channel, bots aside) a vote needs, 1 to 100.
     pub vote_percent: u8,
+    /// The server's equalizer: the web client's model, applied to what the bot plays.
+    pub eq: EqConfig,
     /// This server's own versions of some of the bot's messages, over the bot's layouts.
     pub layout_overrides: LayoutOverrides,
 }
@@ -470,6 +474,7 @@ impl GuildSettings {
             announce_after: 20,
             skip_mode: SkipMode::Single,
             vote_percent: 50,
+            eq: EqConfig::default(),
             layout_overrides: LayoutOverrides::default(),
         }
     }
@@ -503,6 +508,8 @@ pub struct GuildSettingsPatch {
     pub can_autoplay: Option<bool>,
     pub skip_mode: Option<SkipMode>,
     pub vote_percent: Option<u8>,
+    /// Kept to the ten bands and the range on the way in.
+    pub eq: Option<EqConfig>,
     /// Checked against the layout rules by the API before it gets here.
     pub layout_overrides: Option<LayoutOverrides>,
 }
@@ -550,6 +557,9 @@ impl GuildSettingsPatch {
         if let Some(v) = self.vote_percent {
             s.vote_percent = v.clamp(1, 100);
         }
+        if let Some(v) = self.eq {
+            s.eq = eq::tidy(&v);
+        }
         if let Some(v) = self.layout_overrides {
             s.layout_overrides = v;
         }
@@ -574,6 +584,7 @@ struct GuildRow {
     announce_after: i64,
     skip_mode: String,
     vote_percent: i64,
+    eq: Option<String>,
     layout_overrides: Option<String>,
 }
 
@@ -600,6 +611,12 @@ impl From<GuildRow> for GuildSettings {
                 SkipMode::Single
             },
             vote_percent: r.vote_percent.clamp(1, 100) as u8,
+            eq: r
+                .eq
+                .as_deref()
+                .and_then(|j| serde_json::from_str::<EqConfig>(j).ok())
+                .map(|c| eq::tidy(&c))
+                .unwrap_or_default(),
             layout_overrides: r
                 .layout_overrides
                 .as_deref()
@@ -615,7 +632,7 @@ impl From<GuildRow> for GuildSettings {
 
 const GUILD_COLS: &str = "app_id, guild_id, dj_role_ids, controller_channel_id, \
      controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, announce, \
-     can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, layout_overrides";
+     can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, eq, layout_overrides";
 
 pub async fn load_guild(db: &SqlitePool, app_id: &str, guild_id: &str) -> AppResult<GuildSettings> {
     let row = sqlx::query_as::<_, GuildRow>(AssertSqlSafe(format!(
@@ -650,8 +667,8 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
         "INSERT INTO discord_guild_settings (app_id, guild_id, dj_role_ids, controller_channel_id, \
              controller_message_id, volume, normalize, always_on, always_on_channel_id, autoplay, \
              announce, can_always_on, can_autoplay, announce_after, skip_mode, vote_percent, \
-             layout_overrides, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             eq, layout_overrides, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id, guild_id) DO UPDATE SET \
              dj_role_ids = excluded.dj_role_ids, \
              controller_channel_id = excluded.controller_channel_id, \
@@ -661,7 +678,8 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
              announce = excluded.announce, can_always_on = excluded.can_always_on, \
              can_autoplay = excluded.can_autoplay, announce_after = excluded.announce_after, \
              skip_mode = excluded.skip_mode, vote_percent = excluded.vote_percent, \
-             layout_overrides = excluded.layout_overrides, updated_at = excluded.updated_at",
+             eq = excluded.eq, layout_overrides = excluded.layout_overrides, \
+             updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
     .bind(&s.guild_id)
@@ -679,6 +697,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(s.announce_after as i64)
     .bind(s.skip_mode.as_str())
     .bind(s.vote_percent as i64)
+    .bind(eq::active(&s.eq).then(|| serde_json::to_string(&s.eq).ok()).flatten())
     .bind(overrides)
     .bind(now_ms())
     .execute(db)

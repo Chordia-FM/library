@@ -18,6 +18,7 @@ use serenity::all::{ComponentInteraction, ComponentInteractionDataKind, Context,
 
 use crate::discord::commands::guard;
 use crate::discord::commands::play::resolve;
+use crate::discord::eq;
 use crate::discord::identity::Identity;
 use crate::discord::player::{
     Cover, GuildPlayer, LeaveReason, PlayerError, PlayerSnapshot, Position, QueueItem,
@@ -46,7 +47,7 @@ pub async fn handle(
 
     // Acknowledge before anything that can take time.
     match cid.action {
-        Action::QueueOpen | Action::HistoryOpen | Action::Lyrics => {
+        Action::QueueOpen | Action::HistoryOpen | Action::Lyrics | Action::EqOpen => {
             send::component_defer_ephemeral(http, ic).await?
         }
         _ => send::component_ack(http, ic).await?,
@@ -149,6 +150,56 @@ pub async fn handle(
         Action::Refresh => {
             let snap = player.snapshot().await;
             send::interaction_edit(http, token, views::now_playing(&snap, false).ephemeral()).await
+        }
+        Action::EqOpen => send::interaction_edit(http, token, eq_panel(&player).await).await,
+        Action::EqStep(_) | Action::EqFlat | Action::EqToggle => {
+            if let Err(r) =
+                guard::controller_for(identity, &player, guild, user, ic.member.as_ref()).await
+            {
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
+            }
+            let band = player.eq_band().await;
+            player
+                .update_settings(|s| match cid.action {
+                    Action::EqStep(n) => {
+                        if let Some(b) = s.eq.bands.get_mut(band) {
+                            b.gain = (b.gain + f32::from(n)).clamp(-eq::MAX_DB, eq::MAX_DB);
+                        }
+                        s.eq.enabled = true;
+                    }
+                    Action::EqFlat => {
+                        s.eq = eq::preset_config(eq::preset("Flat").expect("flat"));
+                    }
+                    Action::EqToggle => s.eq.enabled = !s.eq.enabled,
+                    _ => {}
+                })
+                .await;
+            send::interaction_edit(http, token, eq_panel(&player).await).await
+        }
+        Action::Select(ref ctx_name) if ctx_name == "eq_preset" || ctx_name == "eq_band" => {
+            if let Err(r) =
+                guard::controller_for(identity, &player, guild, user, ic.member.as_ref()).await
+            {
+                return send::interaction_followup(http, token, r.view(&player.snapshot().await))
+                    .await;
+            }
+            let value = match &ic.data.kind {
+                ComponentInteractionDataKind::StringSelect { values } => {
+                    values.first().cloned().unwrap_or_default()
+                }
+                _ => return Ok(()),
+            };
+            if let Some(name) = value.strip_prefix("p:") {
+                if let Some(p) = eq::preset(name) {
+                    player
+                        .update_settings(|s| s.eq = eq::preset_config(p))
+                        .await;
+                }
+            } else if let Some(i) = value.strip_prefix("b:").and_then(|i| i.parse().ok()) {
+                player.set_eq_band(i).await;
+            }
+            send::interaction_edit(http, token, eq_panel(&player).await).await
         }
         Action::Cancel => send::interaction_edit(http, token, views::cancelled()).await,
         Action::Select(ref ctx_name) if ctx_name == "dj" => {
@@ -319,6 +370,19 @@ pub async fn handle(
         // Confirmations arrive with the destructive queue actions.
         Action::Confirm(_) => Ok(()),
     }
+}
+
+/// The equalizer panel for this guild as it stands, its curve drawn fresh.
+pub async fn eq_panel(player: &GuildPlayer) -> Message {
+    let snap = player.snapshot().await;
+    let band = player.eq_band().await;
+    let hex = format!("#{:06x}", snap.icons.accent());
+    let cfg = snap.eq.clone();
+    let picture = tokio::task::spawn_blocking(move || eq::picture(&cfg, &hex))
+        .await
+        .ok()
+        .and_then(|r| r.ok());
+    views::equalizer(&snap, band, picture)
 }
 
 /// The play log this guild's history pages, newest first.

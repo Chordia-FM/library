@@ -24,6 +24,7 @@ use chordia_contracts::discord::ResolvedTrack;
 use chordia_contracts::discord_layout::BotLayouts;
 use chordia_contracts::scrobble::{ClientType, ListeningEvent, PlaybackSource};
 use chordia_contracts::social::NowPlayingReport;
+use chordia_contracts::user::EqConfig;
 use uuid::Uuid;
 
 use crate::catalog::TrackRow;
@@ -33,7 +34,7 @@ use crate::discord::presence;
 use crate::discord::settings::{self, GuildSettings};
 use crate::discord::source::{self, TrackFacts};
 use crate::discord::ui::{self, views};
-use crate::discord::{autoplay, hub};
+use crate::discord::{autoplay, eq, hub};
 
 /// How many finished tracks `/back` and `/history` can reach.
 /// How often a long track re-tells the Hub who is hearing it (its live entry expires in twelve).
@@ -194,6 +195,8 @@ struct Playing {
     epoch: u64,
     /// The native (Symphonia) path seeks; the ffmpeg pipe does not.
     seekable: bool,
+    /// Where the ffmpeg pipe was started from, since its handle counts from zero.
+    offset_ms: u64,
     /// Wall-clock accounting for `ms_played`: time spent unpaused so far.
     played: Duration,
     resumed_at: Option<Instant>,
@@ -279,6 +282,8 @@ struct PlayerState {
     listeners: HashSet<UserId>,
     /// Who has voted to skip the current track.
     votes: HashSet<UserId>,
+    /// The band the equalizer panel's nudge buttons act on.
+    eq_band: usize,
     /// Since when nothing has been playing.
     idle_since: Option<Instant>,
     /// Since when the bot has been playing to nobody.
@@ -342,6 +347,8 @@ pub struct PlayerSnapshot {
     pub muted: bool,
     pub normalize: bool,
     pub listeners: usize,
+    /// The server's equalizer.
+    pub eq: EqConfig,
     /// How this guild's messages are laid out: the bot's layouts with the guild's own laid over.
     pub layouts: Arc<BotLayouts>,
 }
@@ -419,6 +426,7 @@ impl PlayerSnapshot {
             muted: false,
             normalize: true,
             listeners: 0,
+            eq: EqConfig::default(),
             layouts: Arc::new(settings.layouts),
         }
     }
@@ -432,6 +440,8 @@ pub struct GuildPlayer {
     /// One controller edit at a time, so a redraw already in flight cannot land over the
     /// goodbye the bot leaves behind.
     controller_edit: Mutex<()>,
+    /// The equalizer the audio reader follows; changed in place, heard at once.
+    eq: Arc<eq::Shared>,
 }
 
 impl GuildPlayer {
@@ -441,6 +451,7 @@ impl GuildPlayer {
         settings: GuildSettings,
         default_volume: u8,
     ) -> Arc<Self> {
+        let eq_config = settings.eq.clone();
         let player = Arc::new(Self {
             guild_id,
             identity: Arc::downgrade(identity),
@@ -458,6 +469,7 @@ impl GuildPlayer {
                 normalize: settings.normalize,
                 listeners: HashSet::new(),
                 votes: HashSet::new(),
+                eq_band: 0,
                 idle_since: None,
                 alone_since: None,
                 controller: None,
@@ -473,6 +485,7 @@ impl GuildPlayer {
             }),
             controller_wake: Notify::new(),
             controller_edit: Mutex::new(()),
+            eq: eq::Shared::new(eq_config),
         });
         player.spawn_controller_task();
         player
@@ -799,7 +812,10 @@ impl GuildPlayer {
             (cur.handle.clone(), cur.seekable)
         };
         if !seekable {
-            return Err(PlayerError::CannotSeek);
+            // The ffmpeg pipe cannot seek; start it again from there instead.
+            self.restart_at(to.as_millis() as u64).await?;
+            self.after_change().await;
+            return Ok(to);
         }
         let got = handle
             .seek_async(to)
@@ -810,8 +826,107 @@ impl GuildPlayer {
     }
 
     pub async fn position(&self) -> Option<Duration> {
-        let handle = self.inner.lock().await.current.as_ref()?.handle.clone();
-        handle.get_info().await.ok().map(|i| i.position)
+        let (handle, offset) = {
+            let s = self.inner.lock().await;
+            let cur = s.current.as_ref()?;
+            (cur.handle.clone(), cur.offset_ms)
+        };
+        handle
+            .get_info()
+            .await
+            .ok()
+            .map(|i| i.position + Duration::from_millis(offset))
+    }
+
+    /// Play the current track again from `ms`, keeping everything the play has accounted for
+    /// (its log row, who heard how much). The old handle's end is ignored by its epoch. Used to
+    /// seek on the ffmpeg pipe and to move onto it when the equalizer comes on mid-track.
+    async fn restart_at(&self, ms: u64) -> PlayerResult<()> {
+        let identity = self.identity()?;
+        let songbird = identity.songbird().ok_or(PlayerError::Offline)?;
+        let call = songbird.get(self.guild_id).ok_or(PlayerError::NotInVoice)?;
+        let (track, paused, old) = {
+            let s = self.inner.lock().await;
+            let cur = s.current.as_ref().ok_or(PlayerError::NothingPlaying)?;
+            (cur.item.track.clone(), cur.paused, cur.handle.clone())
+        };
+        let (input, facts) =
+            source::input_for(&identity.state, &track, Some(ms), Some(self.eq.clone()))
+                .await
+                .map_err(|e| PlayerError::Source(e.to_string()))?;
+        let seekable = !matches!(input, songbird::input::Input::Live(..));
+        let handle = call.lock().await.play_only_input(input);
+        if seekable && ms > 0 {
+            let _ = handle.seek_async(Duration::from_millis(ms)).await;
+        }
+        let self_arc = self
+            .identity
+            .upgrade()
+            .and_then(|i| i.player_arc(self.guild_id));
+        let mut s = self.inner.lock().await;
+        s.epoch += 1;
+        let volume = effective_volume(&s, &facts);
+        let _ = handle.set_volume(volume);
+        if paused {
+            let _ = handle.pause();
+        }
+        if let Some(p) = &self_arc {
+            for event in [TrackEvent::End, TrackEvent::Error] {
+                let _ = handle.add_event(
+                    Event::Track(event),
+                    TrackEnd {
+                        player: Arc::downgrade(p),
+                        epoch: s.epoch,
+                    },
+                );
+            }
+        }
+        let epoch = s.epoch;
+        if let Some(cur) = s.current.as_mut() {
+            cur.handle = handle;
+            cur.epoch = epoch;
+            cur.seekable = seekable;
+            cur.offset_ms = if seekable { 0 } else { ms };
+        }
+        drop(s);
+        let _ = old.stop();
+        Ok(())
+    }
+
+    /// The equalizer, live: the reader picks the change up between two buffers. A track on the
+    /// native path moves onto the filtered one from where it is when the equalizer comes on.
+    pub async fn apply_eq(&self) {
+        let (cfg, on_native, position) = {
+            let s = self.inner.lock().await;
+            (
+                s.settings.eq.clone(),
+                s.current.as_ref().is_some_and(|c| c.seekable),
+                s.current.as_ref().map(|c| c.handle.clone()),
+            )
+        };
+        self.eq.set(cfg.clone());
+        if on_native && eq::active(&cfg) {
+            let at = match position {
+                Some(h) => h
+                    .get_info()
+                    .await
+                    .map(|i| i.position.as_millis() as u64)
+                    .unwrap_or(0),
+                None => 0,
+            };
+            if let Err(e) = self.restart_at(at).await {
+                tracing::warn!(guild = %self.guild_id, error = %e, "moving the track onto the equalizer");
+            }
+        }
+    }
+
+    /// The band the panel's nudge buttons act on.
+    pub async fn eq_band(&self) -> usize {
+        self.inner.lock().await.eq_band
+    }
+
+    pub async fn set_eq_band(&self, band: usize) {
+        self.inner.lock().await.eq_band = band.min(eq::FREQS.len() - 1);
     }
 
     pub async fn set_volume(&self, pct: u8) -> PlayerResult<u8> {
@@ -1009,7 +1124,7 @@ impl GuildPlayer {
                 Some(i) => (i.index, i.display_name_sync()),
                 None => (0, "Chordia".to_string()),
             };
-            let handle = s.current.as_ref().map(|c| c.handle.clone());
+            let handle = s.current.as_ref().map(|c| (c.handle.clone(), c.offset_ms));
             let icons = identity.as_ref().map(|i| i.icons()).unwrap_or_default();
             let bot_avatar = identity
                 .as_ref()
@@ -1061,13 +1176,14 @@ impl GuildPlayer {
                 muted: s.muted_before.is_some(),
                 normalize: s.normalize,
                 listeners: s.listeners.len(),
+                eq: s.settings.eq.clone(),
                 layouts: Arc::new(layouts),
             };
             (handle, snap)
         };
-        if let (Some(h), Some(cur)) = (handle, snap.current.as_mut()) {
+        if let (Some((h, offset)), Some(cur)) = (handle, snap.current.as_mut()) {
             if let Ok(info) = h.get_info().await {
-                cur.position_ms = info.position.as_millis() as u64;
+                cur.position_ms = offset + info.position.as_millis() as u64;
             }
         }
         snap
@@ -1078,6 +1194,22 @@ impl GuildPlayer {
     }
 
     pub async fn update_settings(&self, f: impl FnOnce(&mut GuildSettings)) -> GuildSettings {
+        let before = self.inner.lock().await.settings.eq.clone();
+        let out = self.update_settings_inner(f).await;
+        if eq::label(&before) != eq::label(&out.eq)
+            || before.preamp != out.eq.preamp
+            || before
+                .bands
+                .iter()
+                .zip(out.eq.bands.iter())
+                .any(|(a, b)| a.gain != b.gain)
+        {
+            self.apply_eq().await;
+        }
+        out
+    }
+
+    async fn update_settings_inner(&self, f: impl FnOnce(&mut GuildSettings)) -> GuildSettings {
         let settings = {
             let mut s = self.inner.lock().await;
             f(&mut s.settings);
@@ -1297,9 +1429,10 @@ impl GuildPlayer {
         let identity = self.identity()?;
         let songbird = identity.songbird().ok_or(PlayerError::Offline)?;
         let call = songbird.get(self.guild_id).ok_or(PlayerError::NotInVoice)?;
-        let (input, mut facts) = source::input_for(&identity.state, &item.track, None)
-            .await
-            .map_err(|e| PlayerError::Source(e.to_string()))?;
+        let (input, mut facts) =
+            source::input_for(&identity.state, &item.track, None, Some(self.eq.clone()))
+                .await
+                .map_err(|e| PlayerError::Source(e.to_string()))?;
         let seekable = !matches!(input, songbird::input::Input::Live(..));
         let cover = Cover::load(&identity.state.db, &item.track).await;
         // The channel's bitrate can be changed while the bot sits in it; every track starts at the
@@ -1354,6 +1487,7 @@ impl GuildPlayer {
                 play_id: None,
                 epoch: s.epoch,
                 seekable,
+                offset_ms: 0,
                 played: Duration::ZERO,
                 resumed_at: Some(Instant::now()),
                 started_wall: settings::now_ms(),
@@ -1878,6 +2012,7 @@ mod tests {
             listeners: 0,
             shuffle: false,
             muted: false,
+            eq: EqConfig::default(),
             layouts: Arc::new(BotLayouts::default()),
         };
         assert_eq!(snap.queue_duration_ms(), 30_000);
@@ -1897,6 +2032,7 @@ mod tests {
             history: VecDeque::new(),
             current: None,
             votes: HashSet::new(),
+            eq_band: 0,
             loop_mode: LoopMode::Off,
             autoplay: false,
             shuffle: false,

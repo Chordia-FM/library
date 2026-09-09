@@ -13,8 +13,12 @@
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use std::sync::Arc;
+
 use songbird::input::{ChildContainer, Input, RawAdapter};
 use symphonia::core::io::ReadOnlySource;
+
+use crate::discord::eq;
 
 use crate::catalog::{self, TrackRow};
 use crate::error::{AppError, AppResult};
@@ -84,11 +88,14 @@ pub fn replaygain_multiplier(gain_db: Option<f64>, peak: Option<f64>) -> f32 {
 }
 
 /// Build the songbird input for a track, plus its facts. `seek_ms` matters only for the ffmpeg
-/// path, which cannot seek after the fact; the native path seeks through the track handle.
+/// path, which cannot seek after the fact; the native path seeks through the track handle. With
+/// an equalizer that changes anything, every file takes the ffmpeg path so the filters can sit
+/// on its PCM; they read the shared settings, so later changes are heard without a restart.
 pub async fn input_for(
     state: &AppState,
     row: &TrackRow,
     seek_ms: Option<u64>,
+    eq: Option<Arc<eq::Shared>>,
 ) -> AppResult<(Input, TrackFacts)> {
     let path = catalog::get_track_path(&state.db, &row.id)
         .await?
@@ -101,18 +108,24 @@ pub async fn input_for(
         )));
     }
     let facts = TrackFacts::from_row(row);
-    let native = NATIVE_CODECS.contains(&row.codec.as_str()) && !facts.spatial;
+    let filtered = eq.as_ref().is_some_and(|e| eq::active(&e.get()));
+    let native = NATIVE_CODECS.contains(&row.codec.as_str()) && !facts.spatial && !filtered;
     let input = if native {
         Input::from(songbird::input::File::new(path))
     } else {
-        ffmpeg_input(&state.config.transcode.ffmpeg_path, &path, seek_ms)?
+        ffmpeg_input(&state.config.transcode.ffmpeg_path, &path, seek_ms, eq)?
     };
     Ok((input, facts))
 }
 
 /// `ffmpeg` decoding to interleaved f32 PCM at 48 kHz stereo on stdout — exactly what songbird's
 /// mixer wants, so it does no resampling of its own.
-fn ffmpeg_input(ffmpeg: &str, path: &std::path::Path, seek_ms: Option<u64>) -> AppResult<Input> {
+fn ffmpeg_input(
+    ffmpeg: &str,
+    path: &std::path::Path,
+    seek_ms: Option<u64>,
+    eq: Option<Arc<eq::Shared>>,
+) -> AppResult<Input> {
     let mut cmd = Command::new(ffmpeg);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin"]);
     if let Some(ms) = seek_ms.filter(|ms| *ms > 0) {
@@ -129,8 +142,15 @@ fn ffmpeg_input(ffmpeg: &str, path: &std::path::Path, seek_ms: Option<u64>) -> A
     let child = cmd
         .spawn()
         .map_err(|e| AppError::Internal(anyhow::anyhow!("spawning {ffmpeg}: {e}")))?;
-    let source = ReadOnlySource::new(ChildContainer::new(vec![child]));
-    Ok(Input::from(RawAdapter::new(source, 48_000, 2)))
+    let pipe = ChildContainer::new(vec![child]);
+    Ok(match eq {
+        Some(shared) => Input::from(RawAdapter::new(
+            ReadOnlySource::new(eq::Reader::new(pipe, shared)),
+            48_000,
+            2,
+        )),
+        None => Input::from(RawAdapter::new(ReadOnlySource::new(pipe), 48_000, 2)),
+    })
 }
 
 #[cfg(test)]

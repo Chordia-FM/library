@@ -1,10 +1,11 @@
 //! Transport: `/skip`, `/forceskip`, `/vote`, `/back`, `/pause`, `/resume`, `/stop`, `/seek`,
-//! `/volume`, `/loop`, `/join`, `/leave`, `/radio`.
+//! `/volume`, `/loop`, `/join`, `/leave`, `/radio`, `/eq`.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use super::{guard, Context, Error};
+use crate::discord::eq;
 use crate::discord::player::{GuildPlayer, LeaveReason, LoopMode, PlayerError};
 use crate::discord::settings::SkipMode;
 use crate::discord::ui::{fmt, send, views};
@@ -378,6 +379,134 @@ pub async fn leave(ctx: Context<'_>) -> Result<(), Error> {
     };
     player.leave(LeaveReason::Command).await;
     send::respond(ctx, views::ok(&super::snap(ctx).await, "Left", "")).await
+}
+
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+pub enum EqPresetChoice {
+    #[name = "Flat"]
+    Flat,
+    #[name = "Bass Boost"]
+    BassBoost,
+    #[name = "Bass Reducer"]
+    BassReducer,
+    #[name = "Treble Boost"]
+    TrebleBoost,
+    #[name = "Treble Reducer"]
+    TrebleReducer,
+    #[name = "Vocal"]
+    Vocal,
+    #[name = "Rock"]
+    Rock,
+    #[name = "Pop"]
+    Pop,
+    #[name = "Jazz"]
+    Jazz,
+    #[name = "Classical"]
+    Classical,
+    #[name = "Electronic"]
+    Electronic,
+    #[name = "Hip-Hop"]
+    HipHop,
+    #[name = "Acoustic"]
+    Acoustic,
+    #[name = "Loudness"]
+    Loudness,
+}
+
+impl EqPresetChoice {
+    fn name(self) -> &'static str {
+        match self {
+            EqPresetChoice::Flat => "Flat",
+            EqPresetChoice::BassBoost => "Bass Boost",
+            EqPresetChoice::BassReducer => "Bass Reducer",
+            EqPresetChoice::TrebleBoost => "Treble Boost",
+            EqPresetChoice::TrebleReducer => "Treble Reducer",
+            EqPresetChoice::Vocal => "Vocal",
+            EqPresetChoice::Rock => "Rock",
+            EqPresetChoice::Pop => "Pop",
+            EqPresetChoice::Jazz => "Jazz",
+            EqPresetChoice::Classical => "Classical",
+            EqPresetChoice::Electronic => "Electronic",
+            EqPresetChoice::HipHop => "Hip-Hop",
+            EqPresetChoice::Acoustic => "Acoustic",
+            EqPresetChoice::Loudness => "Loudness",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, poise::ChoiceParameter)]
+pub enum EqBandChoice {
+    #[name = "31 Hz"]
+    B31,
+    #[name = "62 Hz"]
+    B62,
+    #[name = "125 Hz"]
+    B125,
+    #[name = "250 Hz"]
+    B250,
+    #[name = "500 Hz"]
+    B500,
+    #[name = "1 kHz"]
+    B1k,
+    #[name = "2 kHz"]
+    B2k,
+    #[name = "4 kHz"]
+    B4k,
+    #[name = "8 kHz"]
+    B8k,
+    #[name = "16 kHz"]
+    B16k,
+}
+
+/// The equalizer: see it, pick a preset, set a band, or turn it on or off
+#[poise::command(slash_command, guild_only)]
+pub async fn eq(
+    ctx: Context<'_>,
+    #[description = "A preset to apply"] preset: Option<EqPresetChoice>,
+    #[description = "A band to set"] band: Option<EqBandChoice>,
+    #[description = "The band's gain in dB, -15 to 15"]
+    #[min = -15]
+    #[max = 15]
+    gain: Option<i8>,
+    #[description = "On or off"] on: Option<bool>,
+) -> Result<(), Error> {
+    ctx.defer_ephemeral().await?;
+    let guild = super::guild_of(ctx)?;
+    let player = ctx.data().player(guild).await;
+    let changes = preset.is_some() || band.is_some() || on.is_some();
+    if changes {
+        if let Err(r) = guard::controller(ctx, &player).await {
+            return send::respond(ctx, r.view(&super::snap(ctx).await)).await;
+        }
+        if band.is_some() != gain.is_some() {
+            return send::respond(
+                ctx,
+                views::notice(
+                    &super::snap(ctx).await,
+                    "A band and its gain go together",
+                    "-# Name the band and the dB to set it to, like `band: 62 Hz` `gain: 4`.",
+                ),
+            )
+            .await;
+        }
+        player
+            .update_settings(|s| {
+                if let Some(p) = preset.and_then(|p| eq::preset(p.name())) {
+                    s.eq = eq::preset_config(p);
+                }
+                if let (Some(b), Some(g)) = (band, gain) {
+                    if let Some(slot) = s.eq.bands.get_mut(b as usize) {
+                        slot.gain = f32::from(g).clamp(-eq::MAX_DB, eq::MAX_DB);
+                    }
+                    s.eq.enabled = true;
+                }
+                if let Some(o) = on {
+                    s.eq.enabled = o;
+                }
+            })
+            .await;
+    }
+    send::respond(ctx, crate::discord::interactions::eq_panel(&player).await).await
 }
 
 /// Keep the music going with similar tracks when the queue runs out

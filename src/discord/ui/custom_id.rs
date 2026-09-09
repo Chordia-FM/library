@@ -54,6 +54,14 @@ pub enum Action {
     LyricsFirst,
     LyricsLast,
     AutoplayToggle,
+    /// Open the equalizer panel as a private message.
+    EqOpen,
+    /// Nudge the panel's chosen band by this many dB.
+    EqStep(i8),
+    /// Every band back to zero.
+    EqFlat,
+    /// The equalizer on or off.
+    EqToggle,
     /// A select menu; the arg names which picker it belongs to (`search`, `album`, `artist`, …).
     Select(String),
     /// Confirm a pending destructive action, by nonce.
@@ -95,6 +103,10 @@ impl Action {
             Action::LyricsFirst => "lyf".into(),
             Action::LyricsLast => "lyl".into(),
             Action::AutoplayToggle => "ap".into(),
+            Action::EqOpen => "eo".into(),
+            Action::EqStep(n) => format!("eqs:{n}"),
+            Action::EqFlat => "eqf".into(),
+            Action::EqToggle => "eqt".into(),
             Action::Select(ctx) => format!("sel:{ctx}"),
             Action::Confirm(n) => format!("cf:{n}"),
             Action::Cancel => "cx".into(),
@@ -132,6 +144,10 @@ impl Action {
             ("lyf", None) => Action::LyricsFirst,
             ("lyl", None) => Action::LyricsLast,
             ("ap", None) => Action::AutoplayToggle,
+            ("eo", None) => Action::EqOpen,
+            ("eqs", Some(n)) => Action::EqStep(n.parse().ok()?),
+            ("eqf", None) => Action::EqFlat,
+            ("eqt", None) => Action::EqToggle,
             ("sel", Some(c)) => Action::Select(c.to_string()),
             ("cf", Some(n)) => Action::Confirm(n.to_string()),
             ("cx", None) => Action::Cancel,
@@ -276,6 +292,11 @@ mod tests {
             Action::LyricsFirst,
             Action::LyricsLast,
             Action::AutoplayToggle,
+            Action::EqOpen,
+            Action::EqStep(-3),
+            Action::EqStep(1),
+            Action::EqFlat,
+            Action::EqToggle,
             Action::Select("search".into()),
             Action::Confirm("ab12".into()),
             Action::Cancel,

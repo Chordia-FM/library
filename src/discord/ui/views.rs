@@ -47,6 +47,7 @@ use super::v2::{
 };
 use crate::catalog::TrackRow;
 use crate::discord::emoji::{BarState, Cap, Icon, IconSet};
+use crate::discord::eq;
 use crate::discord::player::{
     Cover, CurrentSnapshot, Enqueued, LeaveReason, LoopMode, PlayerSnapshot, QueueItem, VoteTally,
 };
@@ -313,6 +314,7 @@ fn control(scene: &Scene, cur: &CurrentSnapshot, which: ControlButton) -> Compon
         ControlButton::Clear => (Action::Clear, Icon::Clear),
         ControlButton::History => (Action::HistoryOpen, Icon::History),
         ControlButton::Leave => (Action::Leave, Icon::Leave),
+        ControlButton::Equalizer => (Action::EqOpen, Icon::Equalizer),
     };
     btn(scene, action, icon)
 }
@@ -595,6 +597,7 @@ impl<'a> Scene<'a> {
             "player.shuffle" => onoff(snap.shuffle),
             "player.autoplay" => onoff(snap.autoplay),
             "player.muted" => onoff(snap.muted),
+            "player.eq" => eq::label(&snap.eq),
             "player.meta" => of_cur(&|c| meta_line(snap, c)),
             "player.line" => now_playing_line(snap),
             // the queue
@@ -1589,6 +1592,96 @@ pub fn settings(snap: &PlayerSnapshot, gs: &GuildSettings) -> Message {
     Message::new(vec![container(icons.accent(), body)]).ephemeral()
 }
 
+/// The equalizer panel: the curve as a picture, the bands as numbers, a preset to pick, a band
+/// to choose and nudge, and the switch. Every control edits the panel in place.
+pub fn equalizer(snap: &PlayerSnapshot, band: usize, picture: Option<Vec<u8>>) -> Message {
+    let icons = &snap.icons;
+    let cfg = &snap.eq;
+    let state = if cfg.enabled { "on" } else { "off" };
+    let mut body = header(
+        &icons.get(Icon::Equalizer),
+        "Equalizer",
+        Some(&format!("{} · {state}", eq::label(cfg))),
+    );
+    if picture.is_some() {
+        body.push(gallery(vec![Media::attachment("eq.png")]));
+    }
+    body.push(text(eq::table(cfg)));
+    body.push(separator(false, Spacing::Large));
+    let current = eq::preset_of(cfg).map(|p| p.name);
+    let mut presets: Vec<SelectOption> = eq::PRESETS
+        .iter()
+        .map(|p| {
+            let mut o = SelectOption::new(p.name.to_string(), format!("p:{}", p.name));
+            if current == Some(p.name) {
+                o = o.default(true);
+            }
+            o
+        })
+        .collect();
+    if current.is_none() {
+        presets.insert(0, SelectOption::new("Custom", "custom").default(true));
+    }
+    body.push(row(vec![Component::StringSelect {
+        custom_id: id(snap, Action::Select("eq_preset".into())),
+        placeholder: Some("Preset".into()),
+        options: presets,
+        min: 1,
+        max: 1,
+        disabled: false,
+    }]));
+    let band = band.min(eq::FREQS.len() - 1);
+    let bands: Vec<SelectOption> = cfg
+        .bands
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let hz = if b.freq >= 1000.0 {
+                format!("{} kHz", b.freq / 1000.0)
+            } else {
+                format!("{} Hz", b.freq)
+            };
+            let mut o =
+                SelectOption::new(hz, format!("b:{i}")).description(format!("{:+.1} dB", b.gain));
+            if i == band {
+                o = o.default(true);
+            }
+            o
+        })
+        .collect();
+    body.push(row(vec![Component::StringSelect {
+        custom_id: id(snap, Action::Select("eq_band".into())),
+        placeholder: Some("Band to nudge".into()),
+        options: bands,
+        min: 1,
+        max: 1,
+        disabled: false,
+    }]));
+    let step = |n: i8| {
+        button(
+            Button::new(ButtonStyle::Secondary, id(snap, Action::EqStep(n)))
+                .label(format!("{n:+} dB")),
+        )
+    };
+    body.push(row(vec![
+        step(-3),
+        step(-1),
+        step(1),
+        step(3),
+        button(Button::new(ButtonStyle::Secondary, id(snap, Action::EqFlat)).label("Flat")),
+    ]));
+    body.push(row(vec![button(
+        Button::new(ButtonStyle::Secondary, id(snap, Action::EqToggle))
+            .emoji(icons.get(Icon::Equalizer))
+            .label(if cfg.enabled { "Turn off" } else { "Turn on" }),
+    )]));
+    let msg = Message::new(vec![container(icons.accent(), body)]).ephemeral();
+    match picture {
+        Some(png) => msg.attach("eq.png", png),
+        None => msg,
+    }
+}
+
 /// One page of a track's lyrics, laid out by the `lyrics` layout; its page buttons turn the
 /// pages. The cover and the file facts are there when the track is the one playing.
 pub fn lyrics(snap: &PlayerSnapshot, track: &TrackRow, pages: &[String], page: usize) -> Message {
@@ -1660,6 +1753,7 @@ mod tests {
     use super::*;
     use crate::discord::player::CurrentSnapshot;
     use crate::discord::source::TrackFacts;
+    use chordia_contracts::user::EqConfig;
     use serenity::all::{ChannelId, GuildId};
     use std::sync::Arc;
 
@@ -1745,6 +1839,7 @@ mod tests {
             listeners: 3,
             shuffle: false,
             muted: false,
+            eq: EqConfig::default(),
             layouts: Arc::new(BotLayouts::default()),
         }
     }
@@ -2693,6 +2788,30 @@ mod tests {
             body.contains("16:00 in all · playing now · by <@42>"),
             "{body}"
         );
+    }
+
+    #[test]
+    fn the_equalizer_panel_names_its_state_and_validates() {
+        let mut s = snap(0, true, false);
+        let m = equalizer(&s, 2, None);
+        m.validate().unwrap();
+        let k = kids(&m);
+        assert!(k[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("Equalizer\n-# off · off"));
+        // Rows: the preset select, the band select (its third option chosen), the nudges, the switch.
+        assert_eq!(k[k.len() - 2]["components"].as_array().unwrap().len(), 5);
+        let band_select = &k[k.len() - 3]["components"][0];
+        assert_eq!(band_select["options"][2]["default"], true);
+        assert_eq!(band_select["options"][2]["label"], "125 Hz");
+        s.eq = eq::preset_config(eq::preset("Rock").unwrap());
+        let m = equalizer(&s, 0, Some(vec![0u8; 8]));
+        let k = kids(&m);
+        assert!(k[0]["content"].as_str().unwrap().contains("Rock · on"));
+        assert_eq!(k[2]["type"], 12);
+        assert_eq!(m.body()["attachments"][0]["filename"], "eq.png");
+        assert!(m.body().to_string().contains("+5  +4  +3"));
     }
 
     #[test]

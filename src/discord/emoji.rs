@@ -35,7 +35,7 @@ const SIZE: u32 = 128;
 const NAME_PREFIX: &str = "cd_";
 /// Bumped whenever an existing emoji name changes meaning (a redrawn segment, say). It is part of
 /// the applied stamp, so a set made by an older build is regenerated rather than reused by name.
-pub const SET_VERSION: u32 = 7;
+pub const SET_VERSION: u32 = 8;
 
 /// The colour of a stateful button's icon while it is off: white, so the accent colour reads as
 /// "on" without a word of label.
@@ -95,6 +95,8 @@ pub enum Icon {
     Vote,
     /// A Chordia playlist.
     Playlist,
+    /// The equalizer.
+    Equalizer,
     /// Progress-bar segments: left cap, middle, right cap, five states each (see [`BarState`]).
     BarL0,
     BarL1,
@@ -179,6 +181,7 @@ phosphor! {
     PageLast => "last", "caret-line-right", "⏭";
     Vote => "vote", "thumbs-up", "👍";
     Playlist => "playlist", "playlist", "📃";
+    Equalizer => "equalizer", "equalizer", "🎚";
 }
 
 /// Which end of the bar a segment is.
@@ -608,7 +611,7 @@ mod tests {
             );
             assert!(names.insert(name), "duplicate emoji name {name}");
         }
-        assert_eq!(names.len(), 57);
+        assert_eq!(names.len(), 58);
     }
 
     #[test]

@@ -247,6 +247,12 @@ pub fn variables() -> Vec<VariableInfo> {
         v("player.autoplay", "on or off", ANY, None),
         v("player.muted", "on or off", ANY, None),
         v(
+            "player.eq",
+            "The equalizer: off, a preset's name, or custom",
+            ANY,
+            None,
+        ),
+        v(
             "player.meta",
             "Who asked, the queue, the volume and the modes, in one line",
             PLAYING,

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chordia_contracts::discord_layout::{LayoutView, ViewLayout};
+use chordia_contracts::user::EqConfig;
 use serde::Serialize;
 use serenity::all::{ChannelId, GuildId, UserId};
 use sqlx::AssertSqlSafe;
@@ -326,6 +327,7 @@ pub async fn render(
         muted: false,
         normalize: true,
         listeners: 3,
+        eq: EqConfig::default(),
         layouts: Arc::new(layouts),
     };
     let message = match view {
