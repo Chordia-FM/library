@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 
 use base64::Engine;
 use chordia_contracts::discord_layout::{LayoutView, ViewLayout};
-use chordia_contracts::user::EqConfig;
 use serde::Serialize;
 use serenity::all::{ChannelId, GuildId, UserId};
 use sqlx::AssertSqlSafe;
@@ -297,6 +296,17 @@ pub async fn render(
     let mut facts = TrackFacts::from_row(current);
     facts.opus_kbps = Some(96);
     let queue: Vec<QueueItem> = sample.tracks[1..].iter().map(item).collect();
+    // The server's own equalizer when one is picked; else what a server starts with.
+    let guild_eq = match guild {
+        Some(g) => {
+            let app_id = identity.app_id_sync().unwrap_or(0).to_string();
+            settings::load_guild(&identity.state.db, &app_id, &g.get().to_string())
+                .await
+                .map(|s| s.eq)
+                .unwrap_or_else(|_| eq::default_config())
+        }
+        None => eq::default_config(),
+    };
     let snap = PlayerSnapshot {
         bot_index: identity.index,
         bot_name: identity.display_name_sync(),
@@ -328,12 +338,7 @@ pub async fn render(
         muted: false,
         normalize: true,
         listeners: 3,
-        // The equalizer panel previews with something to look at.
-        eq: if view == LayoutView::Equalizer {
-            eq::preset_config(eq::preset("Rock").expect("a preset"))
-        } else {
-            EqConfig::default()
-        },
+        eq: guild_eq,
         layouts: Arc::new(layouts),
     };
     let message = match view {

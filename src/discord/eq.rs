@@ -98,6 +98,11 @@ pub const PRESETS: &[Preset] = &[
     },
 ];
 
+/// What a server starts with: the bass boost, on.
+pub fn default_config() -> EqConfig {
+    preset_config(preset("Bass Boost").expect("a built-in preset"))
+}
+
 pub fn preset(name: &str) -> Option<&'static Preset> {
     PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(name))
 }
@@ -602,6 +607,15 @@ mod tests {
         custom.enabled = false;
         assert_eq!(label(&custom), "off");
         assert!(!active(&custom));
+    }
+
+    #[test]
+    fn a_server_starts_with_the_bass_boost_on() {
+        let d = default_config();
+        assert!(d.enabled);
+        assert_eq!(preset_of(&d).unwrap().name, "Bass Boost");
+        assert_eq!(d.preamp, -2.0);
+        assert_eq!(d.bands[0].gain, 6.0);
     }
 
     #[test]

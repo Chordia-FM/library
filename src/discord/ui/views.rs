@@ -2889,22 +2889,25 @@ mod tests {
     #[test]
     fn the_equalizer_panel_is_a_layout_of_menus_and_controls() {
         let mut s = snap(0, true, false);
-        // Without a picture the gallery is left out: header, divider, the two menus, the nudges,
-        // the switch.
+        // Without a picture the gallery is left out: the header with the switch beside it, the
+        // divider, the two headed menus, the nudges.
         let m = equalizer(&s, 2, None);
         m.validate().unwrap();
         let k = kids(&m);
-        assert!(k[0]["content"]
+        assert_eq!(k.len(), 7);
+        assert_eq!(k[0]["type"], 9);
+        assert!(k[0]["components"][0]["content"]
             .as_str()
             .unwrap()
-            .contains("Equalizer\n-# Flat · off"));
-        assert_eq!(k.len(), 6);
-        let band_select = &k[3]["components"][0];
+            .contains("Equalizer"));
+        assert_eq!(k[0]["accessory"]["custom_id"], "cd:1:1:777:eqt:@e0");
+        assert_eq!(k[2]["content"], "### Preset:");
+        let band_select = &k[5]["components"][0];
         assert_eq!(band_select["options"][2]["default"], true);
         assert_eq!(band_select["options"][2]["label"], "125 Hz");
         // Everything on the panel says where it sits, so a press redraws the panel.
         assert_eq!(band_select["custom_id"], "cd:1:1:777:sel:eq_band:@e0");
-        let nudges = k[4]["components"].as_array().unwrap();
+        let nudges = k[6]["components"].as_array().unwrap();
         assert_eq!(nudges.len(), 5);
         assert_eq!(nudges[0]["custom_id"], "cd:1:1:777:eqs:-3:@e0");
         assert_eq!(nudges[0]["label"], "-3 dB");
@@ -2917,16 +2920,16 @@ mod tests {
         }
         s.icons = Arc::new(set);
         let k = kids(&equalizer(&s, 0, None));
-        assert_eq!(k[5]["components"][0]["emoji"]["name"], "cd_equalizeroff");
-        assert!(k[5]["components"][0]["label"].is_null());
+        assert_eq!(k[0]["accessory"]["emoji"]["name"], "cd_equalizeroff");
+        assert!(k[0]["accessory"]["label"].is_null());
         s.eq = eq::preset_config(eq::preset("Rock").unwrap());
         let m = equalizer(&s, 0, Some(Arc::new(vec![0u8; 8])));
         let k = kids(&m);
-        assert!(k[0]["content"].as_str().unwrap().contains("Rock · on"));
-        assert_eq!(k[2]["type"], 12);
-        assert_eq!(k[2]["items"][0]["media"]["url"], "attachment://eq.png");
+        assert_eq!(k[0]["accessory"]["emoji"]["name"], "cd_equalizer");
+        assert_eq!(k.len(), 8);
+        assert_eq!(k[7]["type"], 12);
+        assert_eq!(k[7]["items"][0]["media"]["url"], "attachment://eq.png");
         assert_eq!(m.body()["attachments"][0]["filename"], "eq.png");
-        assert_eq!(k[6]["components"][0]["emoji"]["name"], "cd_equalizer");
         // A layout of one's own places each piece where it likes and reads every band through
         // the variables; the switch stands even while nothing plays, a Skip button waits.
         s.icons = Arc::new(IconSet::default());

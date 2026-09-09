@@ -474,7 +474,7 @@ impl GuildSettings {
             announce_after: 20,
             skip_mode: SkipMode::Single,
             vote_percent: 50,
-            eq: EqConfig::default(),
+            eq: eq::default_config(),
             layout_overrides: LayoutOverrides::default(),
         }
     }
@@ -616,7 +616,7 @@ impl From<GuildRow> for GuildSettings {
                 .as_deref()
                 .and_then(|j| serde_json::from_str::<EqConfig>(j).ok())
                 .map(|c| eq::tidy(&c))
-                .unwrap_or_default(),
+                .unwrap_or_else(eq::default_config),
             layout_overrides: r
                 .layout_overrides
                 .as_deref()
@@ -697,7 +697,7 @@ pub async fn save_guild(db: &SqlitePool, s: &GuildSettings) -> AppResult<()> {
     .bind(s.announce_after as i64)
     .bind(s.skip_mode.as_str())
     .bind(s.vote_percent as i64)
-    .bind(eq::active(&s.eq).then(|| serde_json::to_string(&s.eq).ok()).flatten())
+    .bind(serde_json::to_string(&s.eq).ok())
     .bind(overrides)
     .bind(now_ms())
     .execute(db)

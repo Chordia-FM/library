@@ -426,7 +426,7 @@ impl PlayerSnapshot {
             muted: false,
             normalize: true,
             listeners: 0,
-            eq: EqConfig::default(),
+            eq: eq::default_config(),
             layouts: Arc::new(settings.layouts),
         }
     }
