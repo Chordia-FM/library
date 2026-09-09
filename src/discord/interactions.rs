@@ -191,6 +191,7 @@ pub async fn handle(
                 &identity.state,
                 &value,
                 &[HitKind::Track, HitKind::Album, HitKind::Artist],
+                user,
             )
             .await?;
             if resolved.tracks.is_empty() {

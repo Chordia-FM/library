@@ -205,14 +205,16 @@ pub async fn hub_library_id(state: &AppState, local_library_id: &str) -> Option<
         .and_then(|s| s.parse().ok())
 }
 
-/// Playlists the bot may queue whose name matches, from the Hub: the library owner's own and
-/// anyone's public ones. Nothing without a Hub.
-pub async fn search_playlists(state: &AppState, query: &str) -> Vec<PlaylistHit> {
+/// Playlists the person asking may queue whose name matches, from the Hub: anyone's public
+/// ones, and their own when the Hub knows their Discord account and this server may act for
+/// them. Nothing without a Hub.
+pub async fn search_playlists(state: &AppState, query: &str, asker: u64) -> Vec<PlaylistHit> {
     let Some(key) = key(state).await else {
         return Vec::new();
     };
     let req = PlaylistSearchRequest {
         query: query.to_string(),
+        discord_id: Some(asker.to_string()),
         limit: 10,
     };
     match hub(state).search_playlists(&key, &req).await {
@@ -225,13 +227,18 @@ pub async fn search_playlists(state: &AppState, query: &str) -> Vec<PlaylistHit>
 }
 
 /// A playlist's tracks as this library's rows, in playlist order, with the Hub's word on it
-/// (its name, its owner, how many of its tracks this server does not hold).
+/// (its name, its owner, how many of its tracks this server does not hold). `asker` is the
+/// Discord account that wants it, for a playlist of their own.
 pub async fn playlist_tracks(
     state: &AppState,
     id: Uuid,
+    asker: u64,
 ) -> Option<(PlaylistTracksResponse, Vec<TrackRow>)> {
     let key = key(state).await?;
-    let req = PlaylistTracksRequest { playlist_id: id };
+    let req = PlaylistTracksRequest {
+        playlist_id: id,
+        discord_id: Some(asker.to_string()),
+    };
     let resp = match hub(state).playlist_tracks(&key, &req).await {
         Ok(r) => r,
         Err(e) => {
