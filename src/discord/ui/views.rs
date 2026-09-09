@@ -390,7 +390,8 @@ impl<'a> Scene<'a> {
     }
 
     /// Give the scene its entries and the page asked for; the page is clamped to what the
-    /// layout's list block holds, so `{page}` in a header agrees with the list under it.
+    /// layout's list block holds, so `{page}` in a header agrees with the list under it. A layout
+    /// with no page buttons has no way past the first page, so that is the one it shows.
     fn paged(&mut self, list: Vec<Entry>, page: usize, layout: &ViewLayout, paging: Paging) {
         let size = layout
             .blocks
@@ -402,9 +403,13 @@ impl<'a> Scene<'a> {
             .unwrap_or(10)
             .clamp(MIN_PAGE, MAX_PAGE) as usize;
         self.pages = list.len().div_ceil(size).max(1);
-        self.page = page.min(self.pages - 1);
+        let pager = layout
+            .flat()
+            .iter()
+            .any(|b| matches!(b, LayoutBlock::Pager));
+        self.page = if pager { page.min(self.pages - 1) } else { 0 };
         self.list = list;
-        self.paging = Some(paging);
+        self.paging = pager.then_some(paging);
     }
 
     /// A variable's value: `None` for one this scene does not know (left as written), an empty
@@ -777,6 +782,12 @@ fn render_blocks(scene: &Scene, blocks: &[LayoutBlock]) -> Rendered {
                 empty,
                 page_size,
             } => render_list(scene, item, empty, *page_size, &mut out.components),
+            LayoutBlock::Pager => {
+                if let Some(paging) = scene.paging.filter(|_| scene.pages > 1) {
+                    out.components
+                        .push(paging_row(scene.snap, paging, scene.page, scene.pages));
+                }
+            }
         }
     }
     out
@@ -795,7 +806,6 @@ fn render_list(scene: &Scene, item: &str, empty: &str, page_size: u8, out: &mut 
         return;
     }
     let size = page_size.clamp(MIN_PAGE, MAX_PAGE) as usize;
-    let pages = scene.pages;
     let page = scene.page;
     let start = page * size;
     let end = (start + size).min(total);
@@ -812,17 +822,11 @@ fn render_list(scene: &Scene, item: &str, empty: &str, page_size: u8, out: &mut 
         }
     }
     out.extend(chunks.into_iter().map(text));
-    if pages > 1 {
-        if let Some(paging) = scene.paging {
-            out.push(separator(false, Spacing::Large));
-            out.push(paging_row(scene.snap, paging, page, pages));
-        }
-    }
 }
 
-/// First / back / "2/5" / next / last. Every button carries a distinct custom id even at the
-/// edges (Discord refuses a message that repeats one), which is why first/last are their own
-/// actions.
+/// First / back / "2/5" / next / last, drawn wherever the layout's pager block sits. Every button
+/// carries a distinct custom id even at the edges (Discord refuses a message that repeats one),
+/// which is why first/last are their own actions.
 fn paging_row(snap: &PlayerSnapshot, paging: Paging, page: usize, pages: usize) -> Component {
     let icons = &snap.icons;
     let last = pages - 1;
@@ -845,12 +849,12 @@ fn paging_row(snap: &PlayerSnapshot, paging: Paging, page: usize, pages: usize) 
     row(vec![
         button(
             Button::new(ButtonStyle::Secondary, id(snap, first))
-                .emoji(icons.get(Icon::Prev))
+                .emoji(icons.get(Icon::PageFirst))
                 .disabled(page == 0),
         ),
         button(
             Button::new(ButtonStyle::Secondary, id(snap, prev))
-                .label("Back")
+                .emoji(icons.get(Icon::PageBack))
                 .disabled(page == 0),
         ),
         button(
@@ -860,12 +864,12 @@ fn paging_row(snap: &PlayerSnapshot, paging: Paging, page: usize, pages: usize) 
         ),
         button(
             Button::new(ButtonStyle::Secondary, id(snap, fwd))
-                .label("Next")
+                .emoji(icons.get(Icon::PageNext))
                 .disabled(page >= last),
         ),
         button(
             Button::new(ButtonStyle::Secondary, id(snap, end))
-                .emoji(icons.get(Icon::Next))
+                .emoji(icons.get(Icon::PageLast))
                 .disabled(page >= last),
         ),
     ])
@@ -1471,7 +1475,7 @@ pub fn lyrics(
                     ButtonStyle::Secondary,
                     id(snap, Action::LyricsPage(page.saturating_sub(1) as u32)),
                 )
-                .label("Back")
+                .emoji(icons.get(Icon::PageBack))
                 .disabled(page == 0),
             ),
             button(
@@ -1484,7 +1488,7 @@ pub fn lyrics(
                     ButtonStyle::Secondary,
                     id(snap, Action::LyricsPage((page + 1).min(last) as u32)),
                 )
-                .label("Next")
+                .emoji(icons.get(Icon::PageNext))
                 .disabled(page >= last),
             ),
         ]));
@@ -2305,6 +2309,42 @@ mod tests {
         let empty = queue_page(&snap(0, false, false), 0);
         let rows = kids(&empty);
         assert_eq!(rows.last().unwrap()["content"], "-# The queue is empty.");
+    }
+
+    #[test]
+    fn page_buttons_go_where_they_are_put_or_nowhere() {
+        let mut s = snap(25, true, false);
+        let list = LayoutBlock::List {
+            item: "{index}. {track.title}".into(),
+            empty: "-".into(),
+            page_size: 10,
+        };
+        s.layouts = Arc::new(BotLayouts {
+            queue: ViewLayout {
+                blocks: vec![LayoutBlock::Pager, list.clone(), LayoutBlock::Pager],
+            },
+            ..Default::default()
+        });
+        let m = queue_page(&s, 1);
+        m.validate().unwrap();
+        let top = m.body()["components"].as_array().unwrap().clone();
+        // No container: the rows are top-level, one before the entries and one after.
+        assert_eq!(top.len(), 3);
+        assert_eq!(top[0]["type"], 1);
+        assert_eq!(top[2]["type"], 1);
+        assert_eq!(top[0]["components"][2]["label"], "2/3");
+        assert_eq!(top[0]["components"][1]["emoji"]["name"], "◀");
+        assert!(top[1]["content"].as_str().unwrap().starts_with("11. "));
+        // Without page buttons the list stays on its first page, whatever page is asked for.
+        s.layouts = Arc::new(BotLayouts {
+            queue: ViewLayout { blocks: vec![list] },
+            ..Default::default()
+        });
+        let m = queue_page(&s, 2);
+        m.validate().unwrap();
+        let top = m.body()["components"].as_array().unwrap().clone();
+        assert_eq!(top.len(), 1);
+        assert!(top[0]["content"].as_str().unwrap().starts_with(" 1. "));
     }
 
     #[test]

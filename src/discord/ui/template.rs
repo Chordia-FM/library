@@ -16,8 +16,8 @@
 use serde::Serialize;
 
 use chordia_contracts::discord_layout::{
-    BotLayouts, ContainerAccent, LayoutBlock, LayoutOverrides, LayoutView, ViewLayout,
-    LAYOUT_VERSION,
+    BotLayouts, ContainerAccent, LayoutBlock, LayoutOverrides, LayoutView, SeparatorSpacing,
+    ViewLayout, LAYOUT_VERSION,
 };
 
 use crate::discord::emoji::{Icon, IconSet};
@@ -526,43 +526,83 @@ fn modernize_block(view: LayoutView, block: &mut LayoutBlock) {
                 modernize_block(view, b);
             }
         }
-        LayoutBlock::Gallery { .. } | LayoutBlock::Separator { .. } | LayoutBlock::Row { .. } => {}
+        LayoutBlock::Gallery { .. }
+        | LayoutBlock::Separator { .. }
+        | LayoutBlock::Row { .. }
+        | LayoutBlock::Pager => {}
     }
 }
 
-/// A layout from before [`LAYOUT_VERSION`]: its variables renamed, and the container every message
-/// used to be drawn in made explicit, so it looks exactly as it did.
-fn upgrade_view(view: LayoutView, layout: &mut ViewLayout) {
-    for b in &mut layout.blocks {
-        modernize_block(view, b);
+/// A layout saved by an older build, brought up to what this one writes so it looks exactly as
+/// it did. Each step is keyed to the version that introduced it: before 3, variables were renamed
+/// and the container every message used to be drawn in was made explicit; before 4, the page
+/// buttons came with the list and are now a block of their own, put after it.
+fn upgrade_view(view: LayoutView, layout: &mut ViewLayout, from: u32) {
+    if from < 3 {
+        for b in &mut layout.blocks {
+            modernize_block(view, b);
+        }
+        if !layout
+            .blocks
+            .iter()
+            .any(|b| matches!(b, LayoutBlock::Container { .. }))
+        {
+            let blocks = std::mem::take(&mut layout.blocks);
+            layout.blocks = vec![LayoutBlock::Container {
+                accent: ContainerAccent::Bot,
+                blocks,
+            }];
+        }
     }
-    if !layout
-        .blocks
-        .iter()
-        .any(|b| matches!(b, LayoutBlock::Container { .. }))
+    if from < 4
+        && view.is_list()
+        && !layout
+            .flat()
+            .iter()
+            .any(|b| matches!(b, LayoutBlock::Pager))
     {
-        let blocks = std::mem::take(&mut layout.blocks);
-        layout.blocks = vec![LayoutBlock::Container {
-            accent: ContainerAccent::Bot,
-            blocks,
-        }];
+        add_pager(&mut layout.blocks);
     }
+}
+
+/// The gap and the page buttons that used to follow the list, after it wherever it is.
+fn add_pager(blocks: &mut Vec<LayoutBlock>) -> bool {
+    if let Some(i) = blocks
+        .iter()
+        .position(|b| matches!(b, LayoutBlock::List { .. }))
+    {
+        blocks.insert(i + 1, LayoutBlock::Pager);
+        blocks.insert(
+            i + 1,
+            LayoutBlock::Separator {
+                divider: false,
+                spacing: SeparatorSpacing::Large,
+            },
+        );
+        return true;
+    }
+    blocks.iter_mut().any(|b| match b {
+        LayoutBlock::Container { blocks, .. } => add_pager(blocks),
+        _ => false,
+    })
 }
 
 /// Bring a bot's saved layouts up to date, once.
 pub fn upgrade(layouts: &mut BotLayouts) {
-    if layouts.version >= LAYOUT_VERSION {
+    let from = layouts.version;
+    if from >= LAYOUT_VERSION {
         return;
     }
     for view in LayoutView::ALL {
-        upgrade_view(view, layouts.view_mut(view));
+        upgrade_view(view, layouts.view_mut(view), from);
     }
     layouts.version = LAYOUT_VERSION;
 }
 
 /// Bring a server's saved versions up to date, once.
 pub fn upgrade_overrides(overrides: &mut LayoutOverrides) {
-    if overrides.version >= LAYOUT_VERSION {
+    let from = overrides.version;
+    if from >= LAYOUT_VERSION {
         return;
     }
     for (view, slot) in [
@@ -574,7 +614,7 @@ pub fn upgrade_overrides(overrides: &mut LayoutOverrides) {
         (LayoutView::History, &mut overrides.history),
     ] {
         if let Some(l) = slot {
-            upgrade_view(view, l);
+            upgrade_view(view, l, from);
         }
     }
     overrides.version = LAYOUT_VERSION;
@@ -690,6 +730,13 @@ mod tests {
             panic!()
         };
         assert_eq!(item, "{index}. {track.line} · {eta}");
+        // The page buttons that used to come with the list are a block after it now.
+        assert!(matches!(
+            blocks[1],
+            LayoutBlock::Separator { divider: false, .. }
+        ));
+        assert_eq!(blocks[2], LayoutBlock::Pager);
+        assert_eq!(blocks.len(), 3);
         // Untouched views got the (already boxed) defaults, and a second pass changes nothing.
         let again = l.clone();
         upgrade(&mut l);
@@ -723,6 +770,54 @@ mod tests {
             LayoutBlock::Container { blocks, .. }
                 if matches!(&blocks[0], LayoutBlock::Text { content } if content == "{player.volume}")
         ));
+    }
+
+    #[test]
+    fn a_version_three_list_keeps_its_shape_and_gains_page_buttons() {
+        let list = || LayoutBlock::List {
+            item: "{track.line}".into(),
+            empty: "-".into(),
+            page_size: 5,
+        };
+        let mut l = BotLayouts {
+            version: 3,
+            queue: ViewLayout {
+                blocks: vec![
+                    LayoutBlock::Text {
+                        content: "### {heading}".into(),
+                    },
+                    list(),
+                    LayoutBlock::Text {
+                        content: "-# end".into(),
+                    },
+                ],
+            },
+            ..Default::default()
+        };
+        upgrade(&mut l);
+        assert_eq!(l.version, LAYOUT_VERSION);
+        // Not boxed: a version-three save chose to have no container.
+        let kinds: Vec<&str> = l.queue.blocks.iter().map(|b| b.kind()).collect();
+        assert_eq!(kinds, ["text", "list", "separator", "pager", "text"]);
+        l.validate().unwrap();
+        // A server's version inside a container gets them inside it too.
+        let mut o = LayoutOverrides {
+            version: 3,
+            history: Some(ViewLayout {
+                blocks: vec![LayoutBlock::Container {
+                    accent: ContainerAccent::None,
+                    blocks: vec![list()],
+                }],
+            }),
+            ..Default::default()
+        };
+        upgrade_overrides(&mut o);
+        let LayoutBlock::Container { blocks, .. } = &o.history.as_ref().unwrap().blocks[0] else {
+            panic!()
+        };
+        let kinds: Vec<&str> = blocks.iter().map(|b| b.kind()).collect();
+        assert_eq!(kinds, ["list", "separator", "pager"]);
+        o.validate().unwrap();
     }
 
     #[test]
