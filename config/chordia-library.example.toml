@@ -95,9 +95,10 @@ dedupe_reuploads = true
 #   Gateway intents: GUILDS (channel names + voice bitrate, guild joins), GUILD_VOICE_STATES (join
 #   the channel; know who is listening), GUILD_MESSAGES (count messages under the now-playing
 #   message so it can re-post itself; message content is never requested).
-#   Scopes: bot, applications.commands.
-#   Permissions: View Channel, Send Messages, Read Message History, Embed Links, Attach Files,
-#   Connect, Speak, Set Voice Channel Status.
+#   Scopes: bot, applications.commands. No permissions: the invite asks for none, and the server
+#   grants what it likes through roles and channel overrides. It needs View Channel, Send Messages,
+#   Read Message History, Embed Links and Attach Files where the now-playing message goes, and
+#   Connect and Speak in voice; Set Voice Channel Status is optional.
 #
 # Invite it with the link shown in the library's Discord dashboard (Library → Settings → Discord),
 # which carries exactly that. Everything else about a bot (single-server mode, presence text, default

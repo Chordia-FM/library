@@ -592,29 +592,14 @@ impl Identity {
         self.cache().map(|c| c.guilds()).unwrap_or_default()
     }
 
-    /// What the invite must grant, and what each bit is for:
-    ///
-    /// - `VIEW_CHANNEL`, `SEND_MESSAGES`, `READ_MESSAGE_HISTORY` — post and later edit/delete the
-    ///   now-playing controller in the text channel `/play` was used in.
-    /// - `EMBED_LINKS`, `ATTACH_FILES` — the Components V2 messages and the now-playing card PNG.
-    /// - `CONNECT`, `SPEAK` — join the voice channel and play into it.
-    /// - `SET_VOICE_CHANNEL_STATUS` — put the playing track in the voice channel's status line.
-    ///   Optional in practice: without it the status call fails quietly and everything else works.
-    ///
-    /// The gateway intents are a separate list; see [`crate::discord::client::INTENTS`].
-    pub const INVITE_PERMISSIONS: u64 = (1 << 10) // VIEW_CHANNEL
-        | (1 << 11) // SEND_MESSAGES
-        | (1 << 14) // EMBED_LINKS
-        | (1 << 15) // ATTACH_FILES
-        | (1 << 16) // READ_MESSAGE_HISTORY
-        | (1 << 20) // CONNECT
-        | (1 << 21) // SPEAK
-        | (1 << 48); // SET_VOICE_CHANNEL_STATUS
-
+    /// The invite link: the `bot` and `applications.commands` scopes and no permissions at all.
+    /// What the bot may do in a server is the server's to grant, through its roles and channel
+    /// overrides, the way any member is trusted: it needs to see and post in the text channel the
+    /// controller lives in (with links and files), and to connect and speak in voice. Setting the
+    /// voice channel's status is optional; without it that one call fails quietly.
     pub fn invite_url(app_id: u64) -> String {
         format!(
-            "https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot%20applications.commands&permissions={}",
-            Self::INVITE_PERMISSIONS
+            "https://discord.com/oauth2/authorize?client_id={app_id}&scope=bot%20applications.commands&permissions=0"
         )
     }
 }
@@ -622,20 +607,12 @@ impl Identity {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serenity::all::Permissions;
 
     #[test]
-    fn invite_permission_bits_match_serenity() {
-        let want = Permissions::VIEW_CHANNEL
-            | Permissions::SEND_MESSAGES
-            | Permissions::EMBED_LINKS
-            | Permissions::ATTACH_FILES
-            | Permissions::READ_MESSAGE_HISTORY
-            | Permissions::CONNECT
-            | Permissions::SPEAK
-            | Permissions::SET_VOICE_CHANNEL_STATUS;
-        assert_eq!(Identity::INVITE_PERMISSIONS, want.bits());
-        assert!(Identity::invite_url(42)
-            .contains("client_id=42&scope=bot%20applications.commands&permissions="));
+    fn the_invite_asks_for_the_scopes_and_no_permissions() {
+        assert_eq!(
+            Identity::invite_url(42),
+            "https://discord.com/oauth2/authorize?client_id=42&scope=bot%20applications.commands&permissions=0"
+        );
     }
 }
