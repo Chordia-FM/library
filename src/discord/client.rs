@@ -37,8 +37,8 @@ use crate::discord::{interactions, presence};
 /// (privileged; nothing here cares what anyone else is doing). Interactions and
 /// `VOICE_SERVER_UPDATE` are not gated by any intent.
 ///
-/// The invite must also grant the permissions in [`Identity::INVITE_PERMISSIONS`] and the
-/// `bot` + `applications.commands` scopes; [`Identity::invite_url`] builds that link.
+/// The invite carries the `bot` + `applications.commands` scopes and no permissions; the server
+/// grants those through roles and channel overrides. [`Identity::invite_url`] builds that link.
 pub const INTENTS: GatewayIntents = GatewayIntents::GUILDS
     .union(GatewayIntents::GUILD_VOICE_STATES)
     .union(GatewayIntents::GUILD_MESSAGES);

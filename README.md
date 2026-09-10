@@ -53,7 +53,7 @@ TOML file (path via `CHORDIA_LIBRARY_CONFIG`, default `./chordia-library.toml`).
 The Discord bot is the `discord` cargo feature (on by default; the desktop app builds without it).
 It needs no privileged intents: `GUILDS`, `GUILD_VOICE_STATES` and `GUILD_MESSAGES` (without message
 content), the `bot` + `applications.commands` scopes, and the permissions in the dashboard's invite
-link — see `src/discord/client.rs` (`INTENTS`) and `identity.rs` (`INVITE_PERMISSIONS`). Its icons
+link — see `src/discord/client.rs` (`INTENTS`) and `identity.rs` (`invite_url`, which asks for no permissions). Its icons
 are [Phosphor](https://phosphoricons.com) (MIT, vendored in `assets/phosphor/`), tinted and uploaded
 as application emojis on first connection (`src/discord/emoji.rs`).
 It links libopus, built from source by `libopus_sys`, so a source build needs **cmake** and a C
