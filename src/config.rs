@@ -62,6 +62,10 @@ pub struct Config {
     /// separately under `[transcode] max_concurrent`.
     #[serde(default)]
     pub max_stream_kbps: Option<u32>,
+    /// Discord music bot(s) playing this library into voice channels. See [`DiscordConfig`]. Absent
+    /// or empty means no bot runs.
+    #[serde(default)]
+    pub discord: DiscordConfig,
 }
 
 /// Acoustic fingerprinting. A background pass computes each track's Chromaprint fingerprint and
@@ -187,6 +191,51 @@ impl Default for TranscodeConfig {
     }
 }
 
+/// Discord music bot. Every token here becomes an independent bot identity — its own slash commands,
+/// queue, voice channel and presence — playing tracks from this library. Give it one token to run one
+/// bot, or several so different voice channels on the same server can each have their own (the
+/// identities know about each other and point a busy channel at a free sibling).
+///
+/// A bot token is a credential, and this file is otherwise deliberately credential-free (see the
+/// module doc). It lives here anyway, for the same reason `[acoustid] api_key` does: it is a
+/// third-party secret the *library* owns and the Hub must never see. Tokens never leave this process;
+/// the management API reports each bot's status, not its token.
+///
+/// Everything else about a bot — presence template, single-server mode, default volume, allowed
+/// guilds — is a runtime setting stored in SQLite and edited from the library's Discord dashboard,
+/// so changing it never needs a restart.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct DiscordConfig {
+    /// A single bot token. Convenience for the one-bot case; equivalent to `tokens = ["…"]`.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Bot tokens, one per identity. Merged with `token`, deduplicated, blanks dropped.
+    #[serde(default)]
+    pub tokens: Vec<String>,
+    /// Development only: register slash commands to these guild ids instead of globally. Guild
+    /// commands appear instantly; global ones can take up to an hour to propagate.
+    #[serde(default)]
+    pub command_guilds: Vec<u64>,
+}
+
+impl DiscordConfig {
+    /// The distinct, non-empty tokens in configuration order (`token` first, then `tokens`).
+    pub fn tokens(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        for t in self.token.iter().chain(self.tokens.iter()) {
+            let t = t.trim();
+            if !t.is_empty() && !out.contains(&t) {
+                out.push(t);
+            }
+        }
+        out
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.tokens().is_empty()
+    }
+}
+
 /// Catalog metadata storage location - see [`Config::metadata_storage`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -243,6 +292,9 @@ impl Config {
             loudness: LoudnessConfig { enabled: false },
             scan: ScanConfig::default(),
             max_stream_kbps: None,
+            // A desktop client is not a Discord bot host, and the desktop build compiles this crate
+            // without the `discord` feature anyway.
+            discord: DiscordConfig::default(),
         }
     }
 
@@ -292,4 +344,31 @@ fn default_cache_max_bytes() -> u64 {
 }
 fn default_max_concurrent() -> usize {
     2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn discord_tokens_merge_dedupe_and_trim() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [discord]
+            token = " a "
+            tokens = ["b", "", "a", "c"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.discord.tokens(), vec!["a", "b", "c"]);
+        assert!(cfg.discord.enabled());
+    }
+
+    #[test]
+    fn discord_absent_means_off() {
+        let cfg: Config = toml::from_str("").unwrap();
+        assert!(cfg.discord.tokens().is_empty());
+        assert!(!cfg.discord.enabled());
+        assert!(!Config::embedded(PathBuf::from("x")).discord.enabled());
+    }
 }

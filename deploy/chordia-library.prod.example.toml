@@ -33,3 +33,8 @@ interval_minutes = 360
 # Off by default so the server never moves files in your library on its own. Turn on Dedupe per
 # library in the settings (needs the read-write music mount) if you want re-uploads collapsed.
 dedupe_reuploads = false
+
+# Discord music bot(s), one per token. Optional. Invite link + all other settings live in the
+# library's Discord dashboard. Full reference: ../config/chordia-library.example.toml
+# [discord]
+# tokens = ["MTIz...bot-one"]

@@ -189,6 +189,21 @@ async fn main() -> anyhow::Result<()> {
     // Re-upload dedupe (keep highest-quality copy; on unless [scan] dedupe_reuploads = false).
     dedupe::start_dedupe(state.clone());
 
+    // Discord music bot(s); no-op unless `[discord]` has a token.
+    #[cfg(feature = "discord")]
+    let discord = chordia_library::discord::start(state.clone());
+
+    // Stop on Ctrl-C / SIGTERM: the bots leave their voice channels first (a bot that vanishes
+    // mid-track looks broken; one that says goodbye looks like it meant to), then HTTP drains.
+    let shutdown = async move {
+        shutdown_signal().await;
+        tracing::info!("shutdown requested");
+        #[cfg(feature = "discord")]
+        if let Some(rt) = discord {
+            rt.shutdown().await;
+        }
+    };
+
     // Bind and serve.
     let app = http::router(state);
     let addr = SocketAddr::from(([0, 0, 0, 0], config.bind_port));
@@ -199,7 +214,14 @@ async fn main() -> anyhow::Result<()> {
             .await
             .context("loading TLS configuration")?;
         tracing::info!(port = config.bind_port, "chordia-library listening (HTTPS)");
+        let handle = axum_server::Handle::new();
+        let stopper = handle.clone();
+        tokio::spawn(async move {
+            shutdown.await;
+            stopper.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
+        });
         axum_server::bind_rustls(addr, tls_config)
+            .handle(handle)
             .serve(app.into_make_service())
             .await
             .context("TLS server error")?;
@@ -209,7 +231,32 @@ async fn main() -> anyhow::Result<()> {
             .await
             .with_context(|| format!("binding port {}", config.bind_port))?;
         tracing::info!(port = config.bind_port, "chordia-library listening (HTTP)");
-        axum::serve(listener, app).await.context("server error")?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await
+            .context("server error")?;
     }
     Ok(())
+}
+
+/// Resolves on Ctrl-C, or SIGTERM where that exists (Docker's `stop`, systemd's `stop`).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }

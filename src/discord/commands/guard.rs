@@ -1,0 +1,244 @@
+//! Who may do what.
+//!
+//! Two questions, asked before anything touches the player:
+//!
+//! - **Listener**: is the caller in a voice channel, and is this bot free to serve it? A bot already
+//!   playing to people in another channel of the same guild refuses and names a sibling that is
+//!   free. A bot alone in a channel, or idle, simply moves.
+//! - **Controller**: may the caller change what everyone hears (skip, stop, seek, volume, loop,
+//!   queue edits)? Yes if any holds: they own the bot (its owner list, or the library's owner
+//!   through their linked Discord account); they can manage the server; the guild has no DJ
+//!   roles; they hold one of the DJ roles; or they are the only listener. Otherwise the answer
+//!   names the DJ roles.
+//!
+//! Both are plain functions over ids and members so the slash commands and the button presses
+//! share them.
+
+use std::sync::Arc;
+
+use serenity::all::{ChannelId, GuildId, Member, Permissions, RoleId, UserId};
+
+use super::Context;
+use crate::discord::identity::Identity;
+use crate::discord::player::{GuildPlayer, PlayerSnapshot};
+use crate::discord::ui::{views, Message};
+
+#[derive(Debug)]
+pub enum Refusal {
+    NotInVoice,
+    Busy {
+        bot_name: String,
+        channel: ChannelId,
+        listeners: usize,
+        free: Vec<String>,
+    },
+    NeedDj {
+        roles: Vec<RoleId>,
+    },
+    /// Server settings: Manage Server, Administrator, or a configured bot owner.
+    NeedAdmin,
+    /// The library owner has not enabled this (24/7, autoplay) for the server.
+    NotAllowed(&'static str),
+    Offline,
+}
+
+impl Refusal {
+    /// The refusal as a reply, laid out by the server's notice / error layout.
+    pub fn view(&self, snap: &PlayerSnapshot) -> Message {
+        match self {
+            Refusal::NotInVoice => views::notice(
+                snap,
+                "Join a voice channel first",
+                "-# I play where you are. Hop into a voice channel and try again.",
+            ),
+            Refusal::Busy {
+                bot_name,
+                channel,
+                listeners,
+                free,
+            } => views::busy(snap, bot_name, *channel, *listeners, free),
+            Refusal::NeedDj { roles } => {
+                let who = if roles.is_empty() {
+                    "a DJ".to_string()
+                } else {
+                    roles
+                        .iter()
+                        .map(|r| format!("<@&{}>", r.get()))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                views::notice(
+                    snap,
+                    "That's a DJ control",
+                    &format!(
+                        "Only {who} (or someone who manages the server) can change what everyone hears while others are listening.\n-# Alone in the channel? Then it's all yours."
+                    ),
+                )
+            }
+            Refusal::NeedAdmin => views::notice(
+                snap,
+                "That's a server setting",
+                "-# Someone with **Manage Server** (or a bot owner) can change it.",
+            ),
+            Refusal::NotAllowed(what) => views::notice(
+                snap,
+                "Not enabled here",
+                &format!("-# The library owner hasn't enabled {what} for this server."),
+            ),
+            Refusal::Offline => views::error(
+                snap,
+                "Not connected",
+                "-# This bot is reconnecting to Discord. Try again in a moment.",
+            ),
+        }
+    }
+}
+
+/// The caller must be in a voice channel this bot can serve. Returns their channel and the player.
+pub async fn listener(ctx: Context<'_>) -> Result<(ChannelId, Arc<GuildPlayer>), Refusal> {
+    let identity = ctx.data();
+    let guild = ctx.guild_id().ok_or(Refusal::NotInVoice)?;
+    listener_for(identity, guild, ctx.author().id).await
+}
+
+pub async fn listener_for(
+    identity: &Arc<Identity>,
+    guild: GuildId,
+    user: UserId,
+) -> Result<(ChannelId, Arc<GuildPlayer>), Refusal> {
+    if identity.http().is_none() {
+        return Err(Refusal::Offline);
+    }
+    let vc = identity
+        .member_voice_channel(guild, user)
+        .ok_or(Refusal::NotInVoice)?;
+    let player = identity.player(guild).await;
+    if let Some(current) = player.voice_channel().await {
+        if current != vc && player.has_listeners().await {
+            let free = match crate::discord::runtime() {
+                Some(rt) => rt
+                    .free_siblings(guild, identity.index)
+                    .await
+                    .into_iter()
+                    .map(|i| i.display_name_sync())
+                    .collect(),
+                None => Vec::new(),
+            };
+            let snap = player.snapshot().await;
+            return Err(Refusal::Busy {
+                bot_name: identity.display_name_sync(),
+                channel: current,
+                listeners: snap.listeners,
+                free,
+            });
+        }
+    }
+    Ok((vc, player))
+}
+
+/// The caller must be allowed to change the bot's settings for this server.
+pub async fn admin(ctx: Context<'_>) -> Result<(), Refusal> {
+    let member = ctx.author_member().await;
+    admin_for(ctx.data(), ctx.author().id, member.as_deref())
+}
+
+pub fn admin_for(
+    identity: &Identity,
+    user: UserId,
+    member: Option<&Member>,
+) -> Result<(), Refusal> {
+    if identity.is_owner(user.get()) {
+        return Ok(());
+    }
+    let allowed = member.is_some_and(|m| {
+        m.permissions.is_some_and(|p| {
+            p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
+        })
+    });
+    if allowed {
+        Ok(())
+    } else {
+        Err(Refusal::NeedAdmin)
+    }
+}
+
+/// The caller must be allowed to change shared playback.
+pub async fn controller(ctx: Context<'_>, player: &GuildPlayer) -> Result<(), Refusal> {
+    let identity = ctx.data();
+    let guild = ctx.guild_id().ok_or(Refusal::NotInVoice)?;
+    let member = ctx.author_member().await;
+    controller_for(identity, player, guild, ctx.author().id, member.as_deref()).await
+}
+
+pub async fn controller_for(
+    identity: &Identity,
+    player: &GuildPlayer,
+    _guild: GuildId,
+    user: UserId,
+    member: Option<&Member>,
+) -> Result<(), Refusal> {
+    if identity.is_owner(user.get()) {
+        return Ok(());
+    }
+    if let Some(m) = member {
+        if m.permissions.is_some_and(|p| {
+            p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
+        }) {
+            return Ok(());
+        }
+    }
+    let roles: Vec<RoleId> = player
+        .settings()
+        .await
+        .dj_roles()
+        .into_iter()
+        .map(RoleId::new)
+        .collect();
+    if roles.is_empty() {
+        return Ok(());
+    }
+    if member.is_some_and(|m| m.roles.iter().any(|r| roles.contains(r))) {
+        return Ok(());
+    }
+    if player.is_alone_with(user).await {
+        return Ok(());
+    }
+    Err(Refusal::NeedDj { roles })
+}
+
+/// The caller must be a DJ: hold one of the server's DJ roles or, where none are set, manage the
+/// server. Owners and server managers always may. This is the force-skip permission, stricter
+/// than [`controller`]: with no DJ roles, being in the channel is not enough.
+pub async fn dj(ctx: Context<'_>, player: &GuildPlayer) -> Result<(), Refusal> {
+    let identity = ctx.data();
+    let user = ctx.author().id;
+    if identity.is_owner(user.get()) {
+        return Ok(());
+    }
+    let member = ctx.author_member().await;
+    let manages = member.as_deref().is_some_and(|m| {
+        m.permissions.is_some_and(|p| {
+            p.contains(Permissions::MANAGE_GUILD) || p.contains(Permissions::ADMINISTRATOR)
+        })
+    });
+    if manages {
+        return Ok(());
+    }
+    let roles: Vec<RoleId> = player
+        .settings()
+        .await
+        .dj_roles()
+        .into_iter()
+        .map(RoleId::new)
+        .collect();
+    if roles.is_empty() {
+        return Err(Refusal::NeedAdmin);
+    }
+    if member
+        .as_deref()
+        .is_some_and(|m| m.roles.iter().any(|r| roles.contains(r)))
+    {
+        return Ok(());
+    }
+    Err(Refusal::NeedDj { roles })
+}

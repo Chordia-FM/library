@@ -13,6 +13,34 @@ ignore = [
   # rustls-pemfile — unmaintained, no vulnerability (RUSTSEC-2025-0134); the code moved into
   # rustls-pki-types. Transitive via axum-server / rustls.
   "RUSTSEC-2025-0134",
+
+  # ---- Discord bot (feature `discord`): serenity 0.12 / poise 0.6 / songbird 0.6 tree ----
+  # derivative — unmaintained, no vulnerability (RUSTSEC-2024-0388). A proc macro used at compile
+  # time by poise and songbird; nothing of it ships in the binary.
+  "RUSTSEC-2024-0388",
+  # instant — unmaintained, no vulnerability (RUSTSEC-2024-0384). Transitive via davey → openmls →
+  # fluvio-wasm-timer → parking_lot 0.11; only its non-wasm `std::time::Instant` shim is compiled.
+  "RUSTSEC-2024-0384",
+  # proc-macro-error2 — unmaintained, no vulnerability (RUSTSEC-2026-0173). Compile-time only.
+  "RUSTSEC-2026-0173",
+  # libcrux-sha3 / libcrux-secrets — SHAKE incremental-squeeze output (RUSTSEC-2026-0207), a
+  # potential panic in AVX2 SHAKE-256 (RUSTSEC-2026-0208), and an aarch64 constant-time select
+  # (RUSTSEC-2026-0212). Transitive via davey (Discord's DAVE voice E2EE) → openmls_rust_crypto →
+  # hpke-rs, which pins the 0.0.x line; the fixed 0.0.10 is a different pre-1.0 major, so only an
+  # upstream hpke-rs/openmls bump can move it. The DAVE key exchange this reaches uses HPKE/ML-KEM
+  # over Discord's voice gateway only, and every Chordia build target is x86_64.
+  "RUSTSEC-2026-0207",
+  "RUSTSEC-2026-0208",
+  "RUSTSEC-2026-0212",
+  # rustls-webpki 0.102 — certificate name-constraint and CRL handling (RUSTSEC-2026-0049, -0098,
+  # -0099, -0104). Transitive via serenity 0.12's tokio-tungstenite 0.21 → rustls 0.22, which
+  # cannot take webpki 0.103. It verifies exactly one outbound connection, the bot's websocket to
+  # gateway.discord.gg against the bundled webpki roots, with no CRLs configured; the fixes arrive
+  # with serenity's next release, which moves to tungstenite 0.26 / rustls 0.23.
+  "RUSTSEC-2026-0049",
+  "RUSTSEC-2026-0098",
+  "RUSTSEC-2026-0099",
+  "RUSTSEC-2026-0104",
 ]
 
 [licenses]

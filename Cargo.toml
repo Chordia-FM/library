@@ -10,6 +10,8 @@ repository = "https://github.com/chordia-fm/library"
 [dependencies]
 # Local dev path dep; switch to the published crate once `contracts` ships.
 chordia-contracts = { path = "../contracts" }
+# The Discord bot's command descriptions in the locales the catalogs cover (embedded at build time).
+chordia-i18n = { path = "../i18n", optional = true }
 
 # Web / async
 axum = { version = "0.8", features = ["macros"] }
@@ -72,6 +74,40 @@ futures-core = "0.3"
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 rustls-pemfile = "2"
+
+# Discord music bot (feature `discord`, on by default). The desktop app embeds this crate with
+# `default-features = false`, so none of this — and libopus, the one C dependency in the tree — ever enters
+# that build. See src/discord/mod.rs for the crate choices.
+#
+# serenity's default feature set is trimmed to what poise + songbird need. `voice` is the
+# VoiceGatewayManager hook songbird registers into.
+serenity = { version = "0.12.5", default-features = false, features = [
+    "builder",
+    "cache",
+    "client",
+    "collector",
+    "framework",
+    "gateway",
+    "model",
+    "rustls_backend",
+    "utils",
+    "voice",
+], optional = true }
+poise = { version = "0.6.2", default-features = false, features = ["cache", "handle_panics"], optional = true }
+# Voice. DAVE (Discord's mandatory voice E2EE) is built in and pure Rust; Opus encoding goes through
+# `opus2` → `libopus_sys`, which links a system libopus via pkg-config or builds it from source with cmake.
+songbird = { version = "0.6.0", optional = true }
+# Now-playing cards: an SVG template rendered to PNG. `text` shapes titles with the bundled font,
+# `system-fonts` adds CJK/emoji fallback where the host has them, `raster-images` decodes the album art.
+resvg = { version = "0.48.1", default-features = false, features = [
+    "text",
+    "system-fonts",
+    "raster-images",
+], optional = true }
+
+[features]
+default = ["discord"]
+discord = ["dep:serenity", "dep:poise", "dep:songbird", "dep:resvg", "dep:chordia-i18n"]
 
 [dev-dependencies]
 # Generate self-signed certs in tests (no external openssl needed).

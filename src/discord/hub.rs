@@ -1,0 +1,373 @@
+//! What the bot asks the Hub for, and remembers: which listeners are Chordia users (for the
+//! controller's "counting for" line; the reporter resolves again when it sends), where a track's
+//! page is, and what an artist looks like. Every answer is cached in the [`Runtime`], negative
+//! answers too, so a busy channel costs the Hub a handful of requests an hour, not one per edit.
+//!
+//! Without a Hub (or before pairing) every lookup is `None` and the bot simply shows less.
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use chordia_contracts::discord::{
+    ArtistArt, ArtistArtRequest, BotLyricsRequest, ListenersNowPlaying, PlaylistHit,
+    PlaylistSearchRequest, PlaylistTracksRequest, PlaylistTracksResponse, ResolveListenersRequest,
+    ResolveTracksRequest, ResolvedListener, ResolvedTrack,
+};
+use chordia_contracts::social::NowPlayingReport;
+use uuid::Uuid;
+
+use crate::catalog::{self, TrackRow};
+use crate::discord::player::Cover;
+use crate::http::AppState;
+use crate::pairing::HubClient;
+
+/// How long a listener answer stands. Short: a share can be granted or an opt-out flipped.
+const LISTENER_TTL: Duration = Duration::from_secs(10 * 60);
+/// How long a track's or artist's page answer stands.
+const LINK_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a track's lyrics (or the lack of them) stand: paging through them costs one call.
+const LYRICS_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+type Cached<T> = Mutex<HashMap<String, (Instant, Option<T>)>>;
+
+#[derive(Default)]
+pub struct Caches {
+    listeners: Cached<ResolvedListener>,
+    tracks: Cached<ResolvedTrack>,
+    artists: Cached<ArtistArt>,
+    /// A track's lyrics as plain lines, by the library's track id.
+    lyrics: Cached<String>,
+    /// Fetched pictures by their Hub path, as `(mime, bytes)`.
+    images: Cached<(String, std::sync::Arc<Vec<u8>>)>,
+}
+
+/// Pictures are asked for at this width: plenty for a Discord thumbnail, small to fetch.
+const IMAGE_WIDTH: u32 = 512;
+/// Bigger than this is not attached to every toast.
+const IMAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+fn caches() -> Option<std::sync::Arc<super::Runtime>> {
+    super::runtime()
+}
+
+fn fresh<T: Clone>(cache: &Cached<T>, key: &str, ttl: Duration) -> Option<Option<T>> {
+    let map = cache.lock().unwrap_or_else(|e| e.into_inner());
+    map.get(key)
+        .filter(|(at, _)| at.elapsed() < ttl)
+        .map(|(_, v)| v.clone())
+}
+
+fn remember<T>(cache: &Cached<T>, key: String, value: Option<T>) {
+    cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (Instant::now(), value));
+}
+
+async fn key(state: &AppState) -> Option<String> {
+    state
+        .credentials
+        .read()
+        .await
+        .as_ref()
+        .map(|c| c.server_api_key.clone())
+}
+
+fn hub(state: &AppState) -> HubClient {
+    HubClient::new(state.config.backend_url.clone(), state.http.clone())
+}
+
+/// A Hub-relative URL (`/v1/images/…`) as something this library can fetch.
+pub fn absolute(state: &AppState, rel: &str) -> Option<String> {
+    let base = state.config.backend_url.as_deref()?.trim_end_matches('/');
+    Some(format!("{base}{rel}"))
+}
+
+/// A picture from the Hub, by its relative path, as bytes the bot can attach. Fetched rather than
+/// linked: Discord fetches links from its own servers, which cannot see a Hub on a private
+/// network or a developer's machine, and an attachment works wherever the library can reach the
+/// Hub.
+pub async fn image(state: &AppState, rel: &str) -> Option<(String, std::sync::Arc<Vec<u8>>)> {
+    let rt = caches()?;
+    if let Some(hit) = fresh(&rt.hub.images, rel, LINK_TTL) {
+        return hit;
+    }
+    let url = format!("{}?w={IMAGE_WIDTH}", absolute(state, rel)?);
+    let value = match state.http.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let mime = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("image/jpeg")
+                .split(';')
+                .next()
+                .unwrap_or("image/jpeg")
+                .to_string();
+            match resp.bytes().await {
+                Ok(b) if !b.is_empty() && b.len() <= IMAGE_MAX_BYTES => {
+                    Some((mime, std::sync::Arc::new(b.to_vec())))
+                }
+                _ => None,
+            }
+        }
+        Ok(resp) => {
+            tracing::debug!(status = %resp.status(), rel, "fetching a Hub image");
+            None
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, rel, "fetching a Hub image");
+            return None;
+        }
+    };
+    remember(&rt.hub.images, rel.to_string(), value.clone());
+    value
+}
+
+/// The Chordia users among these listeners, from the cache; the ones it does not know are asked
+/// for. Absent means: not a user this server may count for, or not known yet.
+pub async fn resolve_listeners(state: &AppState, ids: &[u64]) -> HashMap<u64, ResolvedListener> {
+    let Some(rt) = caches() else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    let mut ask: Vec<String> = Vec::new();
+    for id in ids {
+        match fresh(&rt.hub.listeners, &id.to_string(), LISTENER_TTL) {
+            Some(Some(l)) => {
+                out.insert(*id, l);
+            }
+            Some(None) => {}
+            None => ask.push(id.to_string()),
+        }
+    }
+    if ask.is_empty() {
+        return out;
+    }
+    let Some(key) = key(state).await else {
+        return out;
+    };
+    let req = ResolveListenersRequest {
+        discord_ids: ask.clone(),
+    };
+    match hub(state).resolve_listeners(&key, &req).await {
+        Ok(resp) => {
+            let mut found: HashMap<String, ResolvedListener> = resp
+                .listeners
+                .into_iter()
+                .map(|l| (l.discord_id.clone(), l))
+                .collect();
+            for id in ask {
+                let value = found.remove(&id);
+                if let (Some(l), Ok(n)) = (&value, id.parse::<u64>()) {
+                    out.insert(n, l.clone());
+                }
+                remember(&rt.hub.listeners, id, value);
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "resolving Discord listeners"),
+    }
+    out
+}
+
+/// What the cache already knows about these listeners, without asking. For a view.
+pub fn cached_listeners(ids: &[u64]) -> Vec<ResolvedListener> {
+    let Some(rt) = caches() else {
+        return Vec::new();
+    };
+    let mut out: Vec<ResolvedListener> = ids
+        .iter()
+        .filter_map(|id| fresh(&rt.hub.listeners, &id.to_string(), LISTENER_TTL).flatten())
+        .collect();
+    out.sort_by(|a, b| a.handle.cmp(&b.handle));
+    out
+}
+
+/// Tell the Hub what these listeners are hearing right now, or (with no report) that it stopped,
+/// so their profiles show it. Best effort: a Hub that is away simply shows nothing.
+pub async fn now_playing(state: &AppState, user_ids: Vec<Uuid>, report: Option<NowPlayingReport>) {
+    if user_ids.is_empty() {
+        return;
+    }
+    let Some(key) = key(state).await else { return };
+    let body = ListenersNowPlaying { user_ids, report };
+    if let Err(e) = hub(state).listeners_now_playing(&key, &body).await {
+        tracing::debug!(error = %e, "reporting listeners' now playing");
+    }
+}
+
+/// The Hub's id for one of the library's own libraries.
+pub async fn hub_library_id(state: &AppState, local_library_id: &str) -> Option<Uuid> {
+    sqlx::query_scalar::<_, Option<String>>("SELECT hub_library_id FROM libraries WHERE id = ?")
+        .bind(local_library_id)
+        .fetch_optional(&state.db)
+        .await
+        .ok()
+        .flatten()
+        .flatten()
+        .and_then(|s| s.parse().ok())
+}
+
+/// Playlists the person asking may queue whose name matches, from the Hub: anyone's public
+/// ones, and their own when the Hub knows their Discord account and this server may act for
+/// them. Nothing without a Hub.
+pub async fn search_playlists(state: &AppState, query: &str, asker: u64) -> Vec<PlaylistHit> {
+    let Some(key) = key(state).await else {
+        return Vec::new();
+    };
+    let req = PlaylistSearchRequest {
+        query: query.to_string(),
+        discord_id: Some(asker.to_string()),
+        limit: 25,
+    };
+    match hub(state).search_playlists(&key, &req).await {
+        Ok(resp) => resp.playlists,
+        Err(e) => {
+            tracing::debug!(error = %e, "searching playlists");
+            Vec::new()
+        }
+    }
+}
+
+/// A playlist's tracks as this library's rows, in playlist order, with the Hub's word on it
+/// (its name, its owner, how many of its tracks this server does not hold). `asker` is the
+/// Discord account that wants it, for a playlist of their own.
+pub async fn playlist_tracks(
+    state: &AppState,
+    id: Uuid,
+    asker: u64,
+) -> Option<(PlaylistTracksResponse, Vec<TrackRow>)> {
+    let key = key(state).await?;
+    let req = PlaylistTracksRequest {
+        playlist_id: id,
+        discord_id: Some(asker.to_string()),
+    };
+    let resp = match hub(state).playlist_tracks(&key, &req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(error = %e, "fetching a playlist");
+            return None;
+        }
+    };
+    let mut rows = Vec::with_capacity(resp.tracks.len());
+    for t in &resp.tracks {
+        if let Ok(Some(row)) = catalog::get_track_row(&state.db, &t.track_ref).await {
+            rows.push(row);
+        }
+    }
+    Some((resp, rows))
+}
+
+/// The track's lyrics from the Hub (its cache, else the provider), as plain lines; `None` when
+/// there are none or there is no Hub. Remembered either way for a while.
+pub async fn lyrics(state: &AppState, track: &TrackRow) -> Option<String> {
+    let rt = caches()?;
+    if let Some(hit) = fresh(&rt.hub.lyrics, &track.id, LYRICS_TTL) {
+        return hit;
+    }
+    let key = key(state).await?;
+    let library_id = hub_library_id(state, &track.library_id).await?;
+    let req = BotLyricsRequest {
+        library_id,
+        track_ref: track.id.clone(),
+    };
+    let value = match hub(state).bot_lyrics(&key, &req).await {
+        Ok(l) => {
+            let text = l
+                .lines
+                .iter()
+                .map(|line| line.text.trim())
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "asking the Hub for lyrics");
+            None
+        }
+    };
+    remember(&rt.hub.lyrics, track.id.clone(), value.clone());
+    value
+}
+
+/// Where a track's page is on the Hub, for a deep link.
+pub async fn resolve_track(state: &AppState, track: &TrackRow) -> Option<ResolvedTrack> {
+    let rt = caches()?;
+    if let Some(hit) = fresh(&rt.hub.tracks, &track.id, LINK_TTL) {
+        return hit;
+    }
+    let key = key(state).await?;
+    let library_id = hub_library_id(state, &track.library_id).await?;
+    let req = ResolveTracksRequest {
+        library_id,
+        track_refs: vec![track.id.clone()],
+    };
+    let value = match hub(state).resolve_tracks(&key, &req).await {
+        Ok(resp) => resp.tracks.into_iter().next(),
+        Err(e) => {
+            tracing::debug!(error = %e, "resolving a track's Hub page");
+            return None;
+        }
+    };
+    remember(&rt.hub.tracks, track.id.clone(), value.clone());
+    value
+}
+
+/// An artist's portrait and banner as uploads, whichever the Hub has.
+pub async fn artist_pictures(state: &AppState, art: &ArtistArt) -> (Option<Cover>, Option<Cover>) {
+    let mut out = (None, None);
+    if let Some(rel) = &art.image_url {
+        if let Some((mime, bytes)) = image(state, rel).await {
+            out.0 = Some(Cover::named(
+                &format!("artist-{}", art.artist_id),
+                &mime,
+                bytes,
+            ));
+        }
+    }
+    if let Some(rel) = &art.banner_url {
+        if let Some((mime, bytes)) = image(state, rel).await {
+            out.1 = Some(Cover::named(
+                &format!("banner-{}", art.artist_id),
+                &mime,
+                bytes,
+            ));
+        }
+    }
+    out
+}
+
+/// An artist's page and picture, by MusicBrainz id when the library has one, else by name.
+pub async fn artist_art(
+    state: &AppState,
+    name_normalized: &str,
+    mbid: Option<&str>,
+) -> Option<ArtistArt> {
+    let rt = caches()?;
+    let cache_key = mbid
+        .map(|m| format!("mbid:{m}"))
+        .unwrap_or_else(|| format!("name:{name_normalized}"));
+    if let Some(hit) = fresh(&rt.hub.artists, &cache_key, LINK_TTL) {
+        return hit;
+    }
+    let key = key(state).await?;
+    let req = ArtistArtRequest {
+        mbids: mbid.map(|m| vec![m.to_string()]).unwrap_or_default(),
+        names_normalized: vec![name_normalized.to_string()],
+    };
+    let value = match hub(state).artists_art(&key, &req).await {
+        Ok(resp) => {
+            let mut artists = resp.artists;
+            // Prefer the MusicBrainz match; a name can be shared, an mbid cannot.
+            artists.sort_by_key(|a| (mbid.is_some() && a.mbid.as_deref() != mbid) as u8);
+            artists.into_iter().next()
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "looking up artist art");
+            return None;
+        }
+    };
+    remember(&rt.hub.artists, cache_key, value.clone());
+    value
+}
