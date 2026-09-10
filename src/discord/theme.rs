@@ -43,7 +43,7 @@ pub fn status(s: &BotSettings) -> ThemeStatus {
     let hex = desired_hex(s);
     let emoji_applied = s.emoji_hex_applied.as_deref() == Some(emoji::applied_stamp(&hex).as_str());
     let avatar_applied = if s.avatar_managed {
-        s.avatar_hex_applied.as_deref() == Some(hex.as_str())
+        s.avatar_hex_applied.as_deref() == Some(avatar::applied_stamp(&hex).as_str())
     } else {
         s.avatar_custom_path.is_none() || s.avatar_custom_applied
     };
@@ -87,6 +87,10 @@ pub async fn tick(identity: &Arc<Identity>) {
     if s.theme_retry_at.is_some_and(|t| now_ms() < t) {
         return;
     }
+    // Written back only when something moved. This runs every five seconds per bot, and the row
+    // carries the layouts JSON; three bots rewriting it unchanged on every beat were three writers
+    // contending with the scanner for SQLite's one write lock, and losing for minutes at a time.
+    let before = serde_json::to_string(&s).unwrap_or_default();
     let hex = desired_hex(&s);
     let stamp = emoji::applied_stamp(&hex);
     let rest = Rest::new(identity.state.http.clone(), identity.token.clone());
@@ -115,7 +119,7 @@ pub async fn tick(identity: &Arc<Identity>) {
 
     // Avatar: the mark in the colour, or the owner's file once.
     let avatar_job: Option<(String, Vec<u8>, &'static str)> = if s.avatar_managed {
-        if s.avatar_hex_applied.as_deref() != Some(hex.as_str()) {
+        if s.avatar_hex_applied.as_deref() != Some(avatar::applied_stamp(&hex).as_str()) {
             match avatar::render_png(&hex) {
                 Ok(png) => Some(("image/png".to_string(), png, "mark")),
                 Err(e) => {
@@ -161,7 +165,7 @@ pub async fn tick(identity: &Arc<Identity>) {
                     identity.set_profile(p);
                 }
                 if kind == "mark" {
-                    s.avatar_hex_applied = Some(hex.clone());
+                    s.avatar_hex_applied = Some(avatar::applied_stamp(&hex));
                 } else {
                     s.avatar_custom_applied = true;
                 }
@@ -172,7 +176,9 @@ pub async fn tick(identity: &Arc<Identity>) {
             Err(e) => note_failure(identity.index, &mut s, "avatar", e),
         }
     }
-    persist(identity, s).await;
+    if serde_json::to_string(&s).unwrap_or_default() != before {
+        persist(identity, s).await;
+    }
 }
 
 /// Turn a failure into state the dashboard can show and the ticker can act on.
@@ -278,7 +284,7 @@ mod tests {
         assert!(st.pending && !st.emoji_applied && !st.avatar_applied);
 
         s.emoji_hex_applied = Some(emoji::applied_stamp(DEFAULT_HEX));
-        s.avatar_hex_applied = Some(DEFAULT_HEX.into());
+        s.avatar_hex_applied = Some(avatar::applied_stamp(DEFAULT_HEX));
         assert!(!status(&s).pending);
 
         s.emoji_hex = Some("#e67451".into());

@@ -58,9 +58,22 @@ pub fn render_png(hex: &str) -> anyhow::Result<Vec<u8>> {
 
 /// `PATCH /users/@me` with an image. `mime` is `image/png` for the mark, whatever the owner
 /// uploaded otherwise (PNG, JPEG, GIF, WebP).
-/// Upload the bot's avatar and say what Discord kept: the hash of the new image, from its own
-/// answer. A 200 whose user still has no avatar means Discord dropped the image, which is a
-/// failure here, not a success to record.
+/// Bumped when what an "applied" avatar means changes, so rows stamped by an older build apply
+/// again once: v2 added the application icon beside the user avatar.
+const APPLIED_VERSION: u32 = 2;
+
+/// The marker recorded once the mark in `hex` is on Discord, in both places.
+pub fn applied_stamp(hex: &str) -> String {
+    format!("{hex}@v{APPLIED_VERSION}")
+}
+
+/// Put the image on Discord in both places it shows a bot's face, and say what Discord kept.
+///
+/// The bot **user** avatar is what members see in a server. The **application** icon is the tile
+/// in the developer portal, the authorize page an invite opens, and the App Directory; Discord
+/// keeps it as a separate image behind a separate route, so setting one leaves the other blank.
+/// Returns the user avatar's hash from Discord's own answer. A 200 that still carries no image
+/// means Discord dropped it, which is a failure here, not a success to record.
 pub async fn upload(rest: &Rest, mime: &str, bytes: &[u8]) -> Result<String, RestError> {
     let image = format!(
         "data:{mime};base64,{}",
@@ -69,13 +82,28 @@ pub async fn upload(rest: &Rest, mime: &str, bytes: &[u8]) -> Result<String, Res
     let user = rest
         .patch::<serde_json::Value>("/users/@me", &json!({ "avatar": image }))
         .await?;
-    user.get("avatar")
+    let hash = user
+        .get("avatar")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
         .ok_or(RestError::Status {
             status: 200,
             message: "Discord answered without an avatar".to_string(),
-        })
+        })?;
+    let app = rest
+        .patch::<serde_json::Value>("/applications/@me", &json!({ "icon": image }))
+        .await?;
+    if app
+        .get("icon")
+        .and_then(serde_json::Value::as_str)
+        .is_none()
+    {
+        return Err(RestError::Status {
+            status: 200,
+            message: "Discord answered without an application icon".to_string(),
+        });
+    }
+    Ok(hash)
 }
 
 /// Where Discord serves a user's avatar, from the hash its API hands back.
@@ -87,6 +115,12 @@ pub fn cdn_url(user_id: u64, hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_applied_stamp_carries_the_version() {
+        assert_eq!(applied_stamp("#fe6262"), "#fe6262@v2");
+        assert_ne!(applied_stamp("#fe6262"), "#fe6262");
+    }
 
     #[test]
     fn the_cdn_url_follows_discords_shape() {
