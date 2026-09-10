@@ -56,14 +56,19 @@ impl AppState {
         let transcode_cache_dir = config.transcode_cache_dir();
         std::fs::create_dir_all(&transcode_cache_dir)?;
         // Scans, workers, and HTTP readers share this database: WAL lets readers proceed during
-        // writes, the busy timeout rides out short writer contention instead of erroring, and
-        // NORMAL sync is the standard durable-enough pairing with WAL.
+        // writes, the busy timeout rides out writer contention instead of erroring, and NORMAL
+        // sync is the standard durable-enough pairing with WAL.
+        //
+        // Fifteen seconds, not five. SQLite's busy handler polls rather than queues, so a steady
+        // stream of short transactions (a rescan indexes one file per transaction) can keep a
+        // waiting writer from ever catching the lock; at five seconds the Discord settings writes
+        // timed out for a minute and a half after a deploy. Longer waits lose that race less.
         let opts = SqliteConnectOptions::new()
             .filename(config.data_dir.join("library.sqlite"))
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(std::time::Duration::from_secs(15));
         let db = SqlitePool::connect_with(opts).await?;
         sqlx::migrate!("./migrations").run(&db).await?;
 
