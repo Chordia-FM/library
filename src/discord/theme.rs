@@ -152,8 +152,14 @@ pub async fn tick(identity: &Arc<Identity>) {
     };
     if let Some((mime, bytes, kind)) = avatar_job {
         match avatar::upload(&rest, &mime, &bytes).await {
-            Ok(()) => {
+            Ok(hash) => {
                 tracing::info!(bot = identity.index, kind, "avatar updated");
+                // The dashboard reads the profile, which the gateway only refreshes on its next
+                // Ready; without this the card kept its letter until a reconnect.
+                if let Some(mut p) = identity.profile() {
+                    p.avatar_url = Some(avatar::cdn_url(p.user_id.get(), &hash));
+                    identity.set_profile(p);
+                }
                 if kind == "mark" {
                     s.avatar_hex_applied = Some(hex.clone());
                 } else {

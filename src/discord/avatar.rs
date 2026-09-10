@@ -58,19 +58,44 @@ pub fn render_png(hex: &str) -> anyhow::Result<Vec<u8>> {
 
 /// `PATCH /users/@me` with an image. `mime` is `image/png` for the mark, whatever the owner
 /// uploaded otherwise (PNG, JPEG, GIF, WebP).
-pub async fn upload(rest: &Rest, mime: &str, bytes: &[u8]) -> Result<(), RestError> {
+/// Upload the bot's avatar and say what Discord kept: the hash of the new image, from its own
+/// answer. A 200 whose user still has no avatar means Discord dropped the image, which is a
+/// failure here, not a success to record.
+pub async fn upload(rest: &Rest, mime: &str, bytes: &[u8]) -> Result<String, RestError> {
     let image = format!(
         "data:{mime};base64,{}",
         base64::engine::general_purpose::STANDARD.encode(bytes)
     );
-    rest.patch::<serde_json::Value>("/users/@me", &json!({ "avatar": image }))
-        .await
-        .map(|_| ())
+    let user = rest
+        .patch::<serde_json::Value>("/users/@me", &json!({ "avatar": image }))
+        .await?;
+    user.get("avatar")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .ok_or(RestError::Status {
+            status: 200,
+            message: "Discord answered without an avatar".to_string(),
+        })
+}
+
+/// Where Discord serves a user's avatar, from the hash its API hands back.
+pub fn cdn_url(user_id: u64, hash: &str) -> String {
+    let ext = if hash.starts_with("a_") { "gif" } else { "png" };
+    format!("https://cdn.discordapp.com/avatars/{user_id}/{hash}.{ext}?size=256")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cdn_url_follows_discords_shape() {
+        assert_eq!(
+            cdn_url(7, "abc"),
+            "https://cdn.discordapp.com/avatars/7/abc.png?size=256"
+        );
+        assert!(cdn_url(7, "a_abc").ends_with("a_abc.gif?size=256"));
+    }
 
     #[test]
     fn mark_matches_the_web_geometry() {
