@@ -137,7 +137,7 @@ async fn check_folder_exclusions(
 ///
 /// The distinction cannot be drawn from the bytes: a download and a playthrough are the same Range
 /// GET, and refusing `Original` outright would break the lossless streaming a stream-only share is
-/// explicitly meant to allow. So the request says which it is (`?download=1`), our clients set it
+/// explicitly meant to allow. So the request says which it is (`?download=true`), our clients set it
 /// (and hide the action for such a share), and the server refuses it here. That makes the tier an
 /// honest boundary between friends rather than a label with nothing behind it; it is not, and is
 /// not claimed to be, a defence against someone rewriting their own client.
@@ -330,6 +330,33 @@ mod tests {
             exp: 0,
             kid: String::new(),
         }
+    }
+
+    /// The flag only gates anything if the query it arrives in still parses.
+    ///
+    /// `StreamQuery.download` is a `bool` and axum's `Query` deserializes with `serde_urlencoded`,
+    /// whose bool accepts `true`/`false` and nothing else. So `?download=1` does not read as
+    /// "false" — it fails the WHOLE query and answers 400, which is every download broken rather
+    /// than a tier enforced. Pinned here because the spelling lives in the clients, where nothing
+    /// else would catch it.
+    #[test]
+    fn the_download_flag_survives_the_query_string() {
+        use axum::extract::Query;
+
+        let parse = |q: &str| {
+            let uri: axum::http::Uri = format!("http://library/v1/stream/t?{q}").parse().unwrap();
+            Query::<StreamQuery>::try_from_uri(&uri).map(|q| q.0)
+        };
+
+        // What `LibraryClient.downloadUrl` sends.
+        let q = parse("profile=original&download=true").expect("a download request parses");
+        assert!(q.download);
+        // What a playthrough sends: absent, not `download=false`.
+        let q = parse("profile=original").expect("a playthrough request parses");
+        assert!(!q.download);
+        // And the spelling that used to be documented, so the reason is recorded rather than
+        // rediscovered.
+        assert!(parse("profile=original&download=1").is_err());
     }
 
     #[test]
