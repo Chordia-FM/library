@@ -151,6 +151,30 @@ async fn authorize(
     check_folder_exclusions(db, &local_library_id, &claims.sub.to_string(), path).await
 }
 
+/// The same decision as [`authorize`], answered as a boolean rather than a rejection.
+///
+/// `/v1/tracks/match` needs it: that endpoint answers "do you have this recording", and the honest
+/// answer for a caller who could not stream the file is "no" — not a 403 that confirms possession,
+/// and not the full record it used to hand out with no token at all.
+///
+/// Unknown track ids and `Forbidden` collapse to `false`; anything else (a database failure) is
+/// still an error, because a match endpoint that reports "no copy" when it actually could not look
+/// is the one answer worse than a slow one.
+pub(super) async fn readable_by(
+    db: &sqlx::SqlitePool,
+    claims: &CapabilityClaims,
+    track_id: &str,
+) -> AppResult<bool> {
+    let Some(meta) = catalog::get_track_meta(db, track_id).await? else {
+        return Ok(false);
+    };
+    match authorize(db, claims, track_id, &meta.path).await {
+        Ok(()) => Ok(true),
+        Err(AppError::Forbidden) => Ok(false),
+        Err(other) => Err(other),
+    }
+}
+
 pub fn router() -> Router<AppState> {
     Router::new().route("/stream/{track_id}", get(stream))
 }

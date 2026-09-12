@@ -105,23 +105,64 @@ impl AppState {
     }
 }
 
+/// Origins the desktop app's webview sends, mirroring the Hub's own allowlist.
+///
+/// Tauri serves the bundled app from these and nothing on the network can claim one — they are the
+/// webview's own scheme, not an address. All three because the value differs by platform and by
+/// config: WebView2 uses `tauri.localhost` over http, or https with `useHttpsScheme`, and
+/// WebKitGTK/WKWebView use the `tauri:` scheme.
+const DESKTOP_ORIGINS: [&str; 3] = [
+    "https://tauri.localhost",
+    "http://tauri.localhost",
+    "tauri://localhost",
+];
+
+/// The CORS policy, which is not the same question in the two modes this server runs in.
+///
+/// A standalone library is reached cross-origin by whatever frontend its owner uses, on a hostname
+/// this process does not know, so the origin stays open — every route behind it requires a bearer
+/// credential, which no cross-origin page can obtain.
+///
+/// An embedded library is different in kind: it is on loopback, inside the desktop app, and the only
+/// legitimate caller is that app's own webview. Leaving it open there means any page the user visits
+/// can address `127.0.0.1` and read whatever answers, so the allowlist is the webview itself (plus
+/// the Vite dev origin in a debug build, which is the same app under `tauri dev`).
+fn cors(state: &AppState) -> CorsLayer {
+    // `CorsLayer::permissive()` sends `Allow-Headers: *`, which the Fetch spec does not treat as
+    // covering `Authorization`, so mirror the requested headers instead (which does cover it), and
+    // expose all headers for Range streaming.
+    let base = CorsLayer::new()
+        .allow_methods(Any)
+        .allow_headers(AllowHeaders::mirror_request())
+        .expose_headers(Any);
+    if state.local_session.is_none() {
+        return base.allow_origin(Any);
+    }
+    let origins: Vec<axum::http::HeaderValue> = DESKTOP_ORIGINS
+        .iter()
+        .copied()
+        .chain(if cfg!(debug_assertions) {
+            Some("http://localhost:3001")
+        } else {
+            None
+        })
+        .map(|origin| {
+            origin
+                .parse()
+                .unwrap_or_else(|_| panic!("{origin} is not a valid CORS origin"))
+        })
+        .collect();
+    base.allow_origin(origins)
+}
+
 pub fn router(state: AppState) -> Router {
+    let cors = cors(&state);
     Router::new()
         .route("/health", get(health))
         // One-time browser setup link (printed to terminal on first run).
         .route("/setup/{token}", get(crate::api::setup::setup_redirect))
         .nest("/v1", crate::api::v1::router())
-        // Browser clients call the catalog/match endpoints cross-origin with an `Authorization`
-        // header. `CorsLayer::permissive()` sends `Allow-Headers: *`, which the Fetch spec does not
-        // treat as covering `Authorization`, so we mirror the requested headers instead (which does
-        // cover it), while keeping origin/methods open and exposing all headers for Range streaming.
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(AllowHeaders::mirror_request())
-                .expose_headers(Any),
-        )
+        .layer(cors)
         // Baseline response headers, mirroring what the Hub sets on itself. This server hands out
         // audio and JSON, never an app document, so a full CSP isn't meaningful here — but a
         // response that a browser could be talked into sniffing as HTML, or framing, still is.

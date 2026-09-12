@@ -319,6 +319,32 @@ impl FromRequestParts<AppState> for CapToken {
     }
 }
 
+/// A credential an embedded library requires and a standalone one does not.
+///
+/// One endpoint genuinely has to answer without a credential on a real server: `/v1/ping` is what
+/// the pairing wizard probes to learn a self-signed library's certificate fingerprint and whether it
+/// is already paired, and at that moment no credential exists to present.
+///
+/// None of that is true in the desktop app. There is no wizard, nothing external is meant to find
+/// the loopback port, and the body — paired status and folder count — is precisely the fingerprint a
+/// web page would scan the ephemeral range for before asking what music is on the disk. So in
+/// embedded mode the probe wants the session token like everything else.
+pub struct EmbeddedSession;
+
+impl FromRequestParts<AppState> for EmbeddedSession {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if state.local_session.is_some() {
+            CapToken::from_request_parts(parts, state).await?;
+        }
+        Ok(Self)
+    }
+}
+
 /// Convenience: assert the token authorizes a specific action and return its claims.
 ///
 /// A local session is exempt, and the exemption is the point rather than a loophole: capability
