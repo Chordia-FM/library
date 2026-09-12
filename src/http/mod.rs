@@ -81,6 +81,8 @@ impl AppState {
         let credentials = PairingCredentials::load(&config.data_dir);
 
         let transcoder = Arc::new(Transcoder::new(&config.transcode, transcode_cache_dir));
+        // Partial transcodes from a previous process are dead weight the LRU cannot serve.
+        transcoder.sweep_tmp().await;
 
         // Compute the TLS leaf fingerprint once if in-process TLS is configured; empty otherwise.
         let tls_fingerprint = match config.tls_paths() {
