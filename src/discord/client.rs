@@ -223,8 +223,44 @@ async fn on_ready(
         guilds = ready.guilds.len(),
         "Discord bot online"
     );
+    seed_allow_list(identity, ready).await;
     presence::update(identity).await;
     rejoin_always_on(identity).await;
+}
+
+/// The one-time allow-list seed. `allowed_guilds` now denies when it is unset, which would
+/// silence every bot that upgrades into that rule, so the first boot adopts the servers the bot
+/// is already a member of and records that it did (migration 0035). Every server joined after
+/// that is denied until the owner allows it in the dashboard. Runs before the 24/7 rejoin so a
+/// restart on the upgrade boot still comes back to its channels.
+async fn seed_allow_list(identity: &Arc<Identity>, ready: &Ready) {
+    use crate::discord::settings::{seed_allowed_guilds, GuildSeed};
+
+    let mut s = identity.settings();
+    if s.app_id.is_empty() {
+        return;
+    }
+    let joined: Vec<u64> = ready.guilds.iter().map(|g| g.id.get()).collect();
+    match seed_allowed_guilds(&s, &joined) {
+        GuildSeed::Done => return,
+        GuildSeed::Stamp => tracing::info!(
+            bot = identity.index,
+            "Discord allow list is already set; leaving it as it is"
+        ),
+        GuildSeed::Seed(list) => {
+            tracing::warn!(
+                bot = identity.index,
+                guilds = %list.join(", "),
+                "seeding the Discord allow list once from the servers this bot is already in; \
+                 every server joined from now on serves nothing until it is allowed in the \
+                 dashboard"
+            );
+            s.allowed_guilds = Some(list);
+        }
+    }
+    s.guilds_seeded_at = Some(crate::discord::settings::now_ms());
+    identity.set_settings(s);
+    identity.save_settings().await;
 }
 
 /// After a restart, every server the bot was busy in gets it back as it was (its restart
