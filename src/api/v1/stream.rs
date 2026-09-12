@@ -8,6 +8,7 @@ use axum::http::HeaderMap;
 use axum::routing::get;
 use axum::Router;
 use chordia_contracts::auth::{CapabilityAction, CapabilityClaims, ResourceRef};
+use chordia_contracts::library::PermissionLevel;
 use chordia_contracts::streaming::{QualityProfile, StreamQuery};
 
 use crate::auth::{require_action, CapToken};
@@ -128,6 +129,25 @@ async fn check_folder_exclusions(
     Ok(())
 }
 
+/// Refuse a download-shaped request made with a stream-only capability.
+///
+/// `permission_level` is the one thing that separates the two share tiers the product offers, and
+/// until now it was minted, signed and read by nobody — a "Stream only" share served the same
+/// bit-perfect bytes to a client that was keeping them.
+///
+/// The distinction cannot be drawn from the bytes: a download and a playthrough are the same Range
+/// GET, and refusing `Original` outright would break the lossless streaming a stream-only share is
+/// explicitly meant to allow. So the request says which it is (`?download=1`), our clients set it
+/// (and hide the action for such a share), and the server refuses it here. That makes the tier an
+/// honest boundary between friends rather than a label with nothing behind it; it is not, and is
+/// not claimed to be, a defence against someone rewriting their own client.
+fn check_download_permission(claims: &CapabilityClaims, download: bool) -> AppResult<()> {
+    if download && claims.permission_level == PermissionLevel::Read {
+        return Err(AppError::Forbidden);
+    }
+    Ok(())
+}
+
 /// Everything a Hub-signed capability token has to satisfy before a byte is served.
 ///
 /// ONE function rather than three calls in the handler, deliberately: this is the whole of the
@@ -202,6 +222,7 @@ async fn stream(
     // relaxed here — there is simply no statement to check. See `auth::LocalSession`.
     if !token.local {
         authorize(&state.db, &token.claims, &track_id, &meta.path).await?;
+        check_download_permission(&token.claims, q.download)?;
     }
 
     let source = std::path::Path::new(&meta.path);
@@ -309,6 +330,20 @@ mod tests {
             exp: 0,
             kid: String::new(),
         }
+    }
+
+    #[test]
+    fn a_stream_only_token_may_stream_but_not_download() {
+        let hub = Uuid::now_v7();
+        let mut c = claims(hub, FRIEND, ResourceRef::Library { library_id: hub });
+
+        // Stream-only means exactly that: playing the original bytes stays allowed...
+        assert!(check_download_permission(&c, false).is_ok());
+        // ...and keeping a copy does not.
+        assert!(check_download_permission(&c, true).is_err());
+
+        c.permission_level = PermissionLevel::Download;
+        assert!(check_download_permission(&c, true).is_ok());
     }
 
     #[tokio::test]
