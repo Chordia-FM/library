@@ -253,6 +253,9 @@ async fn autocomplete_artist(ctx: Context<'_>, partial: &str) -> Vec<Autocomplet
 /// Autocomplete for `/playlist`: the Hub's playlists the asker may queue, by name, their own
 /// first; with nothing typed, their own and the newest public ones.
 async fn autocomplete_playlist(ctx: Context<'_>, partial: &str) -> Vec<AutocompleteChoice> {
+    if !super::serves(ctx) {
+        return Vec::new();
+    }
     hub::search_playlists(&ctx.data().state, partial, ctx.author().id.get())
         .await
         .into_iter()
@@ -277,6 +280,10 @@ async fn autocomplete_kinds(
     partial: &str,
     kinds: &[HitKind],
 ) -> Vec<AutocompleteChoice> {
+    // A suggestion list is a catalog read; commands are checked, so these are too.
+    if !super::serves(ctx) {
+        return Vec::new();
+    }
     let identity = ctx.data();
     let db = &identity.state.db;
     // Nothing typed yet: the asker's own recent requests, what this server plays most, and what

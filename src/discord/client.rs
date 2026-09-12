@@ -106,6 +106,8 @@ async fn run_once(identity: &Arc<Identity>) -> anyhow::Result<Exit> {
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: commands::localized(commands::all()),
+            // Before any command body: the server has to be one the library owner allowed.
+            command_check: Some(|ctx| Box::pin(commands::allowed_guild(ctx))),
             event_handler: |ctx, event, fw, data| Box::pin(on_event(ctx, event, fw, data)),
             on_error: |e| Box::pin(commands::on_error(e)),
             ..Default::default()
@@ -241,6 +243,10 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
         let Some(guild) = guild_id.parse::<u64>().ok().map(GuildId::new) else {
             continue;
         };
+        // A server dropped from the allow list keeps its queue, but nothing is restored into it.
+        if !identity.settings().allows_guild(guild.get()) {
+            continue;
+        }
         let player = identity.player(guild).await;
         if player.restore(&json).await {
             restored.insert(guild);
@@ -266,7 +272,7 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
             continue;
         };
         let guild = GuildId::new(guild);
-        if restored.contains(&guild) {
+        if restored.contains(&guild) || !identity.settings().allows_guild(guild.get()) {
             continue;
         }
         let voice = serenity::all::ChannelId::new(voice);
@@ -383,13 +389,31 @@ async fn on_event(
         FullEvent::GuildCreate { guild, .. }
             if !identity.settings().allows_guild(guild.id.get()) =>
         {
-            tracing::info!(
-                bot = identity.index,
-                guild = guild.id.get(),
-                "leaving a guild that is not on the allow list"
-            );
-            if let Err(e) = guild.id.leave(&ctx.http).await {
-                tracing::warn!(error = %e, "leaving guild");
+            // An allow list the owner has filled in is a decision, so a server that is not on it
+            // is left. An empty list is the shipped default (which serves nobody): leaving on it
+            // would take the server straight back out of the dashboard the owner allows it from,
+            // so the bot stays put and simply answers nothing — every command and button press
+            // is refused by `commands::allowed_guild` and `interactions::handle`.
+            let listed = identity
+                .settings()
+                .allowed_guilds
+                .is_some_and(|l| !l.is_empty());
+            if listed {
+                tracing::info!(
+                    bot = identity.index,
+                    guild = guild.id.get(),
+                    "leaving a guild that is not on the allow list"
+                );
+                if let Err(e) = guild.id.leave(&ctx.http).await {
+                    tracing::warn!(error = %e, "leaving guild");
+                }
+            } else {
+                tracing::info!(
+                    bot = identity.index,
+                    guild = guild.id.get(),
+                    guild_name = %guild.name,
+                    "in a server that is not on the allow list; serving nothing there until it is allowed in the dashboard"
+                );
             }
         }
         _ => {}

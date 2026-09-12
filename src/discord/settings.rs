@@ -75,7 +75,8 @@ pub struct BotSettings {
     pub status_rotate_secs: u32,
     pub default_volume: u8,
     pub idle_timeout_secs: u32,
-    /// `None` = any guild the bot is invited to.
+    /// The servers this bot serves. `None` (or empty) = none of them: an invite alone never
+    /// reaches the owner's library, the owner allows a server in the dashboard.
     pub allowed_guilds: Option<Vec<String>>,
     pub owner_discord_ids: Vec<String>,
     pub vc_status: bool,
@@ -136,14 +137,16 @@ impl BotSettings {
         self.owner_discord_ids.contains(&id)
     }
 
+    /// May the bot serve this server? Only if the owner put it on the list. The list starts empty
+    /// and an empty list denies: anyone who reads a bot's application id off its profile can
+    /// invite it, and until 2026-09 that was enough to play the owner's library in their own
+    /// server. The bot still joins — that is how the server shows up in the dashboard for the
+    /// owner to allow — it just answers nothing there.
     pub fn allows_guild(&self, guild_id: u64) -> bool {
-        match &self.allowed_guilds {
-            None => true,
-            Some(list) => {
-                let id = guild_id.to_string();
-                list.contains(&id)
-            }
-        }
+        let id = guild_id.to_string();
+        self.allowed_guilds
+            .as_ref()
+            .is_some_and(|list| list.contains(&id))
     }
 }
 
@@ -1085,7 +1088,10 @@ mod tests {
     #[test]
     fn guild_allow_list() {
         let mut s = BotSettings::defaults("1");
-        assert!(s.allows_guild(5));
+        // The default denies: an invite the owner never allowed serves nobody.
+        assert!(!s.allows_guild(5));
+        s.allowed_guilds = Some(Vec::new());
+        assert!(!s.allows_guild(5));
         s.allowed_guilds = Some(vec!["5".into()]);
         assert!(s.allows_guild(5));
         assert!(!s.allows_guild(6));
