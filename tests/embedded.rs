@@ -149,6 +149,65 @@ async fn management_answers_to_the_session_and_nothing_else() {
 }
 
 #[tokio::test]
+async fn the_matcher_answers_the_session_and_nothing_else() {
+    // `/v1/tracks/match` took no credential at all, which on a loopback server with `Allow-Origin:
+    // *` meant any page the user visited could ask what music is on their disk. It is the only
+    // endpoint the desktop app uses to answer "do I already own this", so it has to keep working
+    // *with* the session and stop working without it.
+    let (server, _dir) = library().await;
+    let track = wait_for_a_track(&server).await;
+    let hash: String = sqlx::query_scalar("SELECT content_hash FROM tracks WHERE id = ?")
+        .bind(&track)
+        .fetch_one(&server.state.db)
+        .await
+        .expect("hash");
+    let url = format!("{}/v1/tracks/match?content_hash={hash}", server.endpoint());
+    let http = reqwest::Client::new();
+
+    let body: serde_json::Value = http
+        .get(&url)
+        .bearer_auth(&server.token)
+        .send()
+        .await
+        .expect("request")
+        .json()
+        .await
+        .expect("json");
+    assert_eq!(body["track"]["id"].as_str(), Some(track.as_str()));
+
+    assert_eq!(
+        http.get(&url).send().await.expect("request").status(),
+        401,
+        "the matcher is open to unauthenticated callers"
+    );
+}
+
+#[tokio::test]
+async fn the_readiness_probe_is_not_a_port_oracle() {
+    // `/v1/ping` reports paired status and folder count, which is how a page scanning the ephemeral
+    // range recognises this server. A real server must answer it unauthenticated (the pairing wizard
+    // probes it before any credential exists); an embedded one has no wizard and must not.
+    let (server, _dir) = library().await;
+    let url = format!("{}/v1/ping", server.endpoint());
+    let http = reqwest::Client::new();
+
+    assert!(http
+        .get(&url)
+        .bearer_auth(&server.token)
+        .send()
+        .await
+        .expect("request")
+        .status()
+        .is_success());
+
+    assert_eq!(
+        http.get(&url).send().await.expect("request").status(),
+        401,
+        "ping identifies the embedded library to any caller"
+    );
+}
+
+#[tokio::test]
 async fn a_second_run_gets_a_different_token() {
     // The token lives and dies with the process. A stable one would be a credential worth stealing
     // from a memory dump or a log line months later; this one is worthless the moment the app exits.

@@ -4,6 +4,7 @@
 //! frontend `/library/setup` page.  The frontend then calls `POST /v1/pairing/claim` with:
 //!   - `Authorization: Bearer {hub_access_token}` (the logged-in user's Hub JWT)
 //!   - `X-Setup-Token: {token}`                   (from the URL the user visited)
+//!   - `X-Pair-Origin: {origin}`                  (the address the browser reached this library at)
 //!
 //! The library forwards the Hub JWT to `POST /v1/libraries/pair`, receives a `server_id` and
 //! `server_api_key`, saves them to `data/pairing.json`, and returns a `management_token` the
@@ -61,10 +62,19 @@ async fn claim(
         .ok_or(AppError::Unauthorized)?
         .to_string();
 
+    // The address the browser reached this library at. The Hub bound the pairing ticket to it at
+    // mint time and refuses a redemption that names a different one, so it has to travel with the
+    // ticket — an honest library forwards what it was given; a library the ticket was never meant
+    // for cannot produce a value that matches.
+    let claimed_origin = headers
+        .get("X-Pair-Origin")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+
     // Forward to Hub to allocate server_id + server_api_key.
     let hub = HubClient::new(state.config.backend_url.clone(), state.http.clone());
     let pair = hub
-        .pair(&user_token)
+        .pair(&user_token, claimed_origin.as_deref())
         .await
         .map_err(|e| AppError::BadGateway(e.to_string()))?;
 

@@ -78,10 +78,62 @@ fn hub(state: &AppState) -> HubClient {
     HubClient::new(state.config.backend_url.clone(), state.http.clone())
 }
 
-/// A Hub-relative URL (`/v1/images/…`) as something this library can fetch.
-pub fn absolute(state: &AppState, rel: &str) -> Option<String> {
-    let base = state.config.backend_url.as_deref()?.trim_end_matches('/');
-    Some(format!("{base}{rel}"))
+/// Is this one of the Hub's image paths, `/v1/images/<sha256>` and nothing else? The value comes
+/// out of the Hub's own answer, so it is checked rather than trusted: `"@10.0.0.5/admin"` pasted
+/// onto the base would have pointed the fetch at a host on the owner's network, with the Hub as
+/// userinfo, and the bytes would have gone out as a Discord attachment.
+fn is_image_path(rel: &str) -> bool {
+    rel.strip_prefix("/v1/images/")
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// A Hub image path (`/v1/images/<sha256>`) as something this library can fetch: joined onto the
+/// configured `backend_url` and confirmed to still be on the Hub's own origin. Anything else is
+/// `None`.
+pub fn absolute(state: &AppState, rel: &str) -> Option<reqwest::Url> {
+    if !is_image_path(rel) {
+        tracing::warn!(
+            rel,
+            "refusing a Hub image path that is not /v1/images/<sha256>"
+        );
+        return None;
+    }
+    let base = reqwest::Url::parse(state.config.backend_url.as_deref()?).ok()?;
+    let url = base.join(rel).ok()?;
+    (url.origin() == base.origin()).then_some(url)
+}
+
+/// The Hub client for pictures: redirects refused, because a 302 on a path the Hub chose would
+/// otherwise take the fetch — and the bytes, which end up in a Discord attachment — to a host the
+/// owner never configured.
+fn image_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .unwrap_or_default()
+    })
+}
+
+/// The body, up to [`IMAGE_MAX_BYTES`]. Read in chunks so an oversized (or endless) response is
+/// dropped as it arrives rather than buffered whole and measured afterwards.
+async fn read_capped(mut resp: reqwest::Response) -> Option<Vec<u8>> {
+    if resp
+        .content_length()
+        .is_some_and(|n| n > IMAGE_MAX_BYTES as u64)
+    {
+        return None;
+    }
+    let mut out: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if out.len() + chunk.len() > IMAGE_MAX_BYTES {
+            return None;
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Some(out)
 }
 
 /// A picture from the Hub, by its relative path, as bytes the bot can attach. Fetched rather than
@@ -93,8 +145,9 @@ pub async fn image(state: &AppState, rel: &str) -> Option<(String, std::sync::Ar
     if let Some(hit) = fresh(&rt.hub.images, rel, LINK_TTL) {
         return hit;
     }
-    let url = format!("{}?w={IMAGE_WIDTH}", absolute(state, rel)?);
-    let value = match state.http.get(&url).send().await {
+    let mut url = absolute(state, rel)?;
+    url.set_query(Some(&format!("w={IMAGE_WIDTH}")));
+    let value = match image_client().get(url).send().await {
         Ok(resp) if resp.status().is_success() => {
             let mime = resp
                 .headers()
@@ -105,10 +158,8 @@ pub async fn image(state: &AppState, rel: &str) -> Option<(String, std::sync::Ar
                 .next()
                 .unwrap_or("image/jpeg")
                 .to_string();
-            match resp.bytes().await {
-                Ok(b) if !b.is_empty() && b.len() <= IMAGE_MAX_BYTES => {
-                    Some((mime, std::sync::Arc::new(b.to_vec())))
-                }
+            match read_capped(resp).await {
+                Some(b) if !b.is_empty() => Some((mime, std::sync::Arc::new(b))),
                 _ => None,
             }
         }
@@ -370,4 +421,34 @@ pub async fn artist_art(
     };
     remember(&rt.hub.artists, cache_key, value.clone());
     value
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Hub's answer decides the path, so only its image route is fetchable. The hostile values
+    /// are the ones that used to survive string concatenation onto `backend_url`.
+    #[test]
+    fn only_the_hubs_image_route_is_fetchable() {
+        let hash = "a".repeat(64);
+        assert!(is_image_path(&format!("/v1/images/{hash}")));
+        assert!(!is_image_path("@10.0.0.5/admin"));
+        assert!(!is_image_path("//10.0.0.5/admin"));
+        assert!(!is_image_path("http://10.0.0.5/admin"));
+        assert!(!is_image_path("/v1/images/../../admin"));
+        assert!(!is_image_path(&format!("/v1/images/{hash}/../admin")));
+        assert!(!is_image_path("/v1/images/"));
+        assert!(!is_image_path("/v1/images/zz"));
+    }
+
+    /// A path that passes the check joins onto the Hub and stays on its origin.
+    #[test]
+    fn a_valid_path_joins_onto_the_hub() {
+        let base = reqwest::Url::parse("https://hub.example/").unwrap();
+        let rel = format!("/v1/images/{}", "b".repeat(64));
+        let url = base.join(&rel).unwrap();
+        assert_eq!(url.origin(), base.origin());
+        assert_eq!(url.as_str(), format!("https://hub.example{rel}"));
+    }
 }

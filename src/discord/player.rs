@@ -1590,13 +1590,17 @@ impl GuildPlayer {
         };
         let (report, ids, previous) = {
             let s = self.inner.lock().await;
-            let report = s.current.as_ref().map(|c| {
+            // Only a track the Hub knows can be reported: it takes the display text from its own
+            // row and refuses a report with no `track_id`, so a track it has never seen simply
+            // shows nothing rather than posting a body it will reject.
+            let report = s.current.as_ref().and_then(|c| {
+                let track_id = c.links.as_ref().map(|l| l.track_id)?;
                 let channel = s
                     .voice_channel
                     .and_then(|vc| identity.channel_name(self.guild_id, vc))
                     .unwrap_or_default();
-                NowPlayingReport {
-                    track_id: c.links.as_ref().map(|l| l.track_id),
+                Some(NowPlayingReport {
+                    track_id: Some(track_id),
                     title: c.item.track.title.clone(),
                     artist: c.item.track.artist.clone(),
                     album: c.item.track.album.clone(),
@@ -1607,7 +1611,7 @@ impl GuildPlayer {
                         self.guild_id.get()
                     )),
                     device_label: Some(format!("Discord · #{channel}")),
-                }
+                })
             });
             let ids: Vec<u64> = s.listeners.iter().map(|u| u.get()).collect();
             (report, ids, s.now_playing_for.clone())

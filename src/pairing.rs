@@ -96,14 +96,21 @@ impl HubClient {
 
     /// Call `POST /v1/libraries/pair` forwarding the user's access token.
     /// Returns the Hub-assigned server credentials.
-    pub async fn pair(&self, user_access_token: &str) -> anyhow::Result<HubPairResponse> {
+    ///
+    /// `claimed_origin` is the address the browser reached *this* library at, forwarded verbatim
+    /// from the setup request. The Hub binds a pairing ticket to the origin it was minted for and
+    /// refuses a mismatch, so a ticket lifted out of one handshake cannot register another server.
+    pub async fn pair(
+        &self,
+        user_access_token: &str,
+        claimed_origin: Option<&str>,
+    ) -> anyhow::Result<HubPairResponse> {
         let url = format!("{}/v1/libraries/pair", self.base()?);
-        let resp = self
-            .http
-            .post(&url)
-            .bearer_auth(user_access_token)
-            .send()
-            .await?;
+        let mut req = self.http.post(&url).bearer_auth(user_access_token);
+        if let Some(origin) = claimed_origin {
+            req = req.header("X-Pair-Origin", origin);
+        }
+        let resp = req.send().await?;
         if !resp.status().is_success() {
             let status = resp.status();
             let body = resp.text().await.unwrap_or_default();

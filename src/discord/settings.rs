@@ -75,7 +75,8 @@ pub struct BotSettings {
     pub status_rotate_secs: u32,
     pub default_volume: u8,
     pub idle_timeout_secs: u32,
-    /// `None` = any guild the bot is invited to.
+    /// The servers this bot serves. `None` (or empty) = none of them: an invite alone never
+    /// reaches the owner's library, the owner allows a server in the dashboard.
     pub allowed_guilds: Option<Vec<String>>,
     pub owner_discord_ids: Vec<String>,
     pub vc_status: bool,
@@ -101,6 +102,12 @@ pub struct BotSettings {
     pub theme_backoff: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub commands_hash: Option<String>,
+    /// When the one-time allow-list seed ran (epoch millis), from migration 0035. `None` means it
+    /// has not run yet: the next boot fills `allowed_guilds` from the servers the bot is already
+    /// in, so upgrading into the deny-by-default rule does not silence a live bot. Set means the
+    /// list is the owner's, empty included.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guilds_seeded_at: Option<i64>,
 }
 
 impl BotSettings {
@@ -128,6 +135,7 @@ impl BotSettings {
             theme_warning: None,
             theme_backoff: 0,
             commands_hash: None,
+            guilds_seeded_at: None,
         }
     }
 
@@ -136,15 +144,43 @@ impl BotSettings {
         self.owner_discord_ids.contains(&id)
     }
 
+    /// May the bot serve this server? Only if the owner put it on the list. The list starts empty
+    /// and an empty list denies: anyone who reads a bot's application id off its profile can
+    /// invite it, and until 2026-09 that was enough to play the owner's library in their own
+    /// server. The bot still joins — that is how the server shows up in the dashboard for the
+    /// owner to allow — it just answers nothing there.
     pub fn allows_guild(&self, guild_id: u64) -> bool {
-        match &self.allowed_guilds {
-            None => true,
-            Some(list) => {
-                let id = guild_id.to_string();
-                list.contains(&id)
-            }
-        }
+        let id = guild_id.to_string();
+        self.allowed_guilds
+            .as_ref()
+            .is_some_and(|list| list.contains(&id))
     }
+}
+
+/// What the one-time allow-list seed should do for a bot that just came online.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuildSeed {
+    /// The seed already ran; deny-by-default stands, whatever the list says now.
+    Done,
+    /// First boot under the deny-by-default rule with no list of the owner's: adopt the servers
+    /// the bot is already in (empty on a fresh install) and stamp the seed.
+    Seed(Vec<String>),
+    /// First boot, but the owner already has a list: leave it alone and only stamp the seed, so
+    /// emptying that list later is respected instead of refilled.
+    Stamp,
+}
+
+/// The seed-once rule (M-34). Reading an unset allow list as "deny everything" would silence every
+/// bot that upgrades into the rule, so the first boot after the upgrade adopts the servers the bot
+/// is already a member of; `guilds_seeded_at` records that it happened and nothing seeds twice.
+pub fn seed_allowed_guilds(s: &BotSettings, joined: &[u64]) -> GuildSeed {
+    if s.guilds_seeded_at.is_some() {
+        return GuildSeed::Done;
+    }
+    if s.allowed_guilds.is_some() {
+        return GuildSeed::Stamp;
+    }
+    GuildSeed::Seed(joined.iter().map(u64::to_string).collect())
 }
 
 /// A partial update from the dashboard: every field optional, absent means unchanged.
@@ -272,6 +308,7 @@ struct BotRow {
     theme_warning: Option<String>,
     theme_backoff: i64,
     commands_hash: Option<String>,
+    guilds_seeded_at: Option<i64>,
 }
 
 pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
@@ -280,7 +317,8 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
                 status_rotate_secs, default_volume, \
                 idle_timeout_secs, allowed_guilds, owner_discord_ids, vc_status, layouts, emoji_hex, \
                 emoji_hex_applied, avatar_managed, avatar_hex_applied, avatar_custom_path, \
-                avatar_custom_applied, theme_retry_at, theme_warning, theme_backoff, commands_hash \
+                avatar_custom_applied, theme_retry_at, theme_warning, theme_backoff, \
+                commands_hash, guilds_seeded_at \
          FROM discord_bot_settings WHERE app_id = ?",
     )
     .bind(app_id)
@@ -319,6 +357,7 @@ pub async fn load_bot(db: &SqlitePool, app_id: &str) -> AppResult<BotSettings> {
             theme_warning: r.theme_warning,
             theme_backoff: r.theme_backoff.max(0) as u32,
             commands_hash: r.commands_hash,
+            guilds_seeded_at: r.guilds_seeded_at,
         },
     })
 }
@@ -339,8 +378,8 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
              layouts, \
              emoji_hex, emoji_hex_applied, avatar_managed, avatar_hex_applied, \
              avatar_custom_path, avatar_custom_applied, theme_retry_at, theme_warning, \
-             theme_backoff, commands_hash, updated_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+             theme_backoff, commands_hash, guilds_seeded_at, updated_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT(app_id) DO UPDATE SET \
              display_name = excluded.display_name, mode = excluded.mode, \
              single_statuses = excluded.single_statuses, \
@@ -358,7 +397,8 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
              avatar_custom_applied = excluded.avatar_custom_applied, \
              theme_retry_at = excluded.theme_retry_at, theme_warning = excluded.theme_warning, \
              theme_backoff = excluded.theme_backoff, \
-             commands_hash = excluded.commands_hash, updated_at = excluded.updated_at",
+             commands_hash = excluded.commands_hash, \
+             guilds_seeded_at = excluded.guilds_seeded_at, updated_at = excluded.updated_at",
     )
     .bind(&s.app_id)
     .bind(&s.display_name)
@@ -382,6 +422,7 @@ pub async fn save_bot(db: &SqlitePool, s: &BotSettings) -> AppResult<()> {
     .bind(&s.theme_warning)
     .bind(s.theme_backoff as i64)
     .bind(&s.commands_hash)
+    .bind(s.guilds_seeded_at)
     .bind(now_ms())
     .execute(db)
     .await?;
@@ -1085,9 +1126,47 @@ mod tests {
     #[test]
     fn guild_allow_list() {
         let mut s = BotSettings::defaults("1");
-        assert!(s.allows_guild(5));
+        // The default denies: an invite the owner never allowed serves nobody.
+        assert!(!s.allows_guild(5));
+        s.allowed_guilds = Some(Vec::new());
+        assert!(!s.allows_guild(5));
         s.allowed_guilds = Some(vec!["5".into()]);
         assert!(s.allows_guild(5));
         assert!(!s.allows_guild(6));
+    }
+
+    #[test]
+    fn allow_list_seeds_once() {
+        // A bot that upgraded into the deny-by-default rule adopts the servers it is already in,
+        // so it keeps answering where it already was.
+        let mut s = BotSettings::defaults("1");
+        let seed = seed_allowed_guilds(&s, &[7, 8]);
+        assert_eq!(seed, GuildSeed::Seed(vec!["7".into(), "8".into()]));
+        let GuildSeed::Seed(list) = seed else {
+            unreachable!()
+        };
+        s.allowed_guilds = Some(list);
+        s.guilds_seeded_at = Some(now_ms());
+        assert!(s.allows_guild(7) && s.allows_guild(8) && !s.allows_guild(9));
+
+        // Seeded is seeded: a server joined afterwards is denied, and a list the owner empties
+        // stays empty instead of being refilled from the guilds the bot sits in.
+        assert_eq!(seed_allowed_guilds(&s, &[7, 8, 9]), GuildSeed::Done);
+        s.allowed_guilds = None;
+        assert_eq!(seed_allowed_guilds(&s, &[7, 8, 9]), GuildSeed::Done);
+        assert!(!s.allows_guild(7));
+
+        // A fresh install with no guilds gets an empty list, not a wildcard.
+        let fresh = BotSettings::defaults("2");
+        assert_eq!(
+            seed_allowed_guilds(&fresh, &[]),
+            GuildSeed::Seed(Vec::new())
+        );
+
+        // An unstamped bot whose owner already chose a list keeps that choice; only the stamp is
+        // written, so the choice survives being emptied later.
+        let mut chosen = BotSettings::defaults("3");
+        chosen.allowed_guilds = Some(vec!["4".into()]);
+        assert_eq!(seed_allowed_guilds(&chosen, &[7, 8]), GuildSeed::Stamp);
     }
 }

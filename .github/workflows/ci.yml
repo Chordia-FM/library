@@ -14,18 +14,23 @@ env:
 # the default GITHUB_TOKEN can clone them; every job that builds checks them out next to library/
 # (all under the runner workspace) so the `path = "../contracts"` / `"../i18n"` deps resolve.
 
+# Least privilege for the default GITHUB_TOKEN. Jobs that need to write something declare it
+# themselves, so a compromised third-party action in an ordinary job cannot push, tag or release.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
@@ -34,10 +39,12 @@ jobs:
       # cmake builds libopus for the Discord bot (`opus2` → `libopus_sys`).
       - name: Install lld + cmake
         run: sudo apt-get update && sudo apt-get install -y lld cmake
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned by commit SHA, so the toolchain the `@stable` ref used to imply is named here.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-12
         with:
+          toolchain: stable
           components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: library
           # Deliberately no `cache-on-failure`: `cargo fmt --check` runs first and compiles nothing,
@@ -64,18 +71,18 @@ jobs:
     # a third-party action can carry a binary of its own. 2vCPU still applies.
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: library/Cargo.toml
 
@@ -88,24 +95,24 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
-      - uses: docker/login-action@v4
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: meta
-        uses: docker/metadata-action@v6
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
         with:
           images: ghcr.io/chordia-fm/library
           # From tag v1.2.3 → :1.2.3, :1.2, and :latest.
@@ -113,7 +120,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
-      - uses: useblacksmith/build-push-action@v2
+      - uses: useblacksmith/build-push-action@9b0579bbec7a6cad2f171596c57e7ac1e7658850 # v2.3.0
         with:
           # Workspace root holds library/ + contracts/ + i18n/; the Dockerfile copies the siblings.
           context: .
@@ -131,14 +138,14 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
@@ -151,10 +158,11 @@ jobs:
       # static binary carries it too.
       - name: Install lld + musl toolchain + cmake
         run: sudo apt-get update && sudo apt-get install -y lld musl-tools cmake
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch, resolved 2026-09-12
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: library
           # No `cache-on-failure` here either, for the reason given on the test job above.
@@ -169,7 +177,7 @@ jobs:
       - name: Stage binary
         run: install -Dm755 library/target/x86_64-unknown-linux-musl/release/chordia-library chordia-library-linux-x86_64
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           files: chordia-library-linux-x86_64
           generate_release_notes: true
