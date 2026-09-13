@@ -26,14 +26,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
+      - name: Pick sibling refs (this branch where the sibling has it, else main)
+        id: siblings
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          pick() {
+            if [ -n "$HEAD_REF" ] && git ls-remote --exit-code --heads "https://github.com/chordia-fm/$1.git" "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+              echo "$HEAD_REF"
+            else
+              echo main
+            fi
+          }
+          for s in contracts i18n; do echo "$s=$(pick "$s")" >> "$GITHUB_OUTPUT"; done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
+          ref: ${{ steps.siblings.outputs.contracts }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
+          ref: ${{ steps.siblings.outputs.i18n }}
       # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
       # rebuild spends its time on here — the compile is incremental, the link never is.
       # cmake builds libopus for the Discord bot (`opus2` → `libopus_sys`).
@@ -74,14 +90,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
+      - name: Pick sibling refs (this branch where the sibling has it, else main)
+        id: siblings
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          pick() {
+            if [ -n "$HEAD_REF" ] && git ls-remote --exit-code --heads "https://github.com/chordia-fm/$1.git" "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+              echo "$HEAD_REF"
+            else
+              echo main
+            fi
+          }
+          for s in contracts i18n; do echo "$s=$(pick "$s")" >> "$GITHUB_OUTPUT"; done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
+          ref: ${{ steps.siblings.outputs.contracts }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
+          ref: ${{ steps.siblings.outputs.i18n }}
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
         with:
           manifest-path: library/Cargo.toml
@@ -98,14 +130,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
+      - name: Pick sibling refs (this branch where the sibling has it, else main)
+        id: siblings
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          pick() {
+            if [ -n "$HEAD_REF" ] && git ls-remote --exit-code --heads "https://github.com/chordia-fm/$1.git" "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+              echo "$HEAD_REF"
+            else
+              echo main
+            fi
+          }
+          for s in contracts i18n; do echo "$s=$(pick "$s")" >> "$GITHUB_OUTPUT"; done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
+          ref: ${{ steps.siblings.outputs.contracts }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
+          ref: ${{ steps.siblings.outputs.i18n }}
       - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
@@ -141,14 +189,30 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           path: library
+      - name: Pick sibling refs (this branch where the sibling has it, else main)
+        id: siblings
+        shell: bash
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          pick() {
+            if [ -n "$HEAD_REF" ] && git ls-remote --exit-code --heads "https://github.com/chordia-fm/$1.git" "refs/heads/$HEAD_REF" >/dev/null 2>&1; then
+              echo "$HEAD_REF"
+            else
+              echo main
+            fi
+          }
+          for s in contracts i18n; do echo "$s=$(pick "$s")" >> "$GITHUB_OUTPUT"; done
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/contracts
           path: contracts
+          ref: ${{ steps.siblings.outputs.contracts }}
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: chordia-fm/i18n
           path: i18n
+          ref: ${{ steps.siblings.outputs.i18n }}
       # lld, which `.cargo/config.toml` selects for the Linux target. Linking is most of what a
       # rebuild spends its time on here — the compile is incremental, the link never is.
       # musl-tools rides along in the same step: it supplies musl-gcc for the bundled libsqlite3 in
