@@ -68,6 +68,33 @@ fn target_for(profile: QualityProfile) -> Option<Target> {
     }
 }
 
+/// Deletes a partial `.tmp` transcode output unless the transcode got far enough to own it.
+///
+/// The cancellation path is the reason this is a guard rather than a `remove_file` call: when the
+/// client disconnects mid-transcode the handler's future is dropped, so no line after the `.await`
+/// ever runs and the partial file would be left behind. `enforce_budget` counts `.tmp` files but
+/// only evicts stale ones, so an uncollected partial is real disk the cache cannot reclaim.
+struct TmpGuard(Option<PathBuf>);
+
+impl TmpGuard {
+    /// The file is now the cache's (renamed) or already gone; stop owning it.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TmpGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            // Synchronous on purpose: this runs from a dropped future, where spawning a task races
+            // runtime shutdown. It is one unlink of a file this process created. Best-effort -
+            // Windows refuses while the killed child's handle is still open, and the startup sweep
+            // plus the budget accounting below catch whatever survives.
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 /// Result of resolving a transcoded stream: the cache file, the codec string for `Content-Type`,
 /// and a profile-qualified ETag (so a client doesn't reuse a cached `Original` body for `high`).
 pub struct Transcoded {
@@ -176,7 +203,15 @@ impl Transcoder {
                 .cache_dir
                 .join(format!("{file_name}.{}.{nonce}.tmp", std::process::id()));
 
+            // Delete the partial output whatever happens next — including the case nothing else
+            // covers, a client disconnect, where this whole future is simply dropped.
+            let mut tmp_guard = TmpGuard(Some(tmp.clone()));
+
             let mut cmd = tokio::process::Command::new(&self.ffmpeg);
+            // Without this the child outlives the request: a disconnect drops the future, which
+            // releases the semaphore permit and the single-flight lock but leaves ffmpeg running,
+            // so N aborted requests put N transcodes on the machine past `max_concurrent`.
+            cmd.kill_on_drop(true);
             cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
                 .arg(source)
                 // Drop any video/cover stream; map only audio; re-encode to the tier.
@@ -208,6 +243,7 @@ impl Transcoder {
 
             if !status.success() {
                 let _ = tokio::fs::remove_file(&tmp).await;
+                tmp_guard.disarm();
                 break 'flight Err(AppError::BadGateway(format!(
                     "transcode to {} failed (ffmpeg exit {:?})",
                     t.slug,
@@ -215,7 +251,10 @@ impl Transcoder {
                 )));
             }
 
-            if let Err(e) = tokio::fs::rename(&tmp, &out).await {
+            let published = tokio::fs::rename(&tmp, &out).await;
+            tmp_guard.disarm();
+            if let Err(e) = published {
+                let _ = tokio::fs::remove_file(&tmp).await;
                 break 'flight Err(AppError::Internal(anyhow::anyhow!(
                     "publishing transcode: {e}"
                 )));
@@ -247,6 +286,27 @@ impl Transcoder {
         result
     }
 
+    /// Remove partial transcodes left by a previous process (a crash, or a kill that beat
+    /// [`TmpGuard`]). Called once at startup, when nothing this process wrote can be in flight.
+    pub async fn sweep_tmp(&self) {
+        let Ok(mut rd) = tokio::fs::read_dir(&self.cache_dir).await else {
+            return;
+        };
+        let mut removed = 0usize;
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            let path = ent.path();
+            if path.extension().is_none_or(|e| e != "tmp") {
+                continue;
+            }
+            if tokio::fs::remove_file(&path).await.is_ok() {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            info!(removed, "swept orphaned transcode temp files");
+        }
+    }
+
     /// Evict least-recently-served cache files until the total is under `max_bytes`.
     async fn enforce_budget(&self) {
         type Entry = (PathBuf, u64, Option<Instant>, Option<std::time::SystemTime>);
@@ -261,11 +321,9 @@ impl Transcoder {
             .lock()
             .map(|m| m.clone())
             .unwrap_or_default();
+        let now = std::time::SystemTime::now();
         while let Ok(Some(ent)) = rd.next_entry().await {
             let path = ent.path();
-            if path.extension().is_some_and(|e| e == "tmp") {
-                continue;
-            }
             let Ok(meta) = ent.metadata().await else {
                 continue;
             };
@@ -273,6 +331,21 @@ impl Transcoder {
                 continue;
             }
             let len = meta.len();
+            // A partial transcode is real disk, so it counts toward the budget even though it is
+            // not servable - skipping it is how aborted requests used to hide their bytes from the
+            // cap entirely. It is only *evictable* once it is too old to be an in-flight transcode
+            // (a crash orphan); deleting a live one would break the rename that publishes it.
+            if path.extension().is_some_and(|e| e == "tmp") {
+                total += len;
+                if is_stale_tmp(&meta, now) {
+                    if let Err(e) = tokio::fs::remove_file(&path).await {
+                        warn!(?path, error = %e, "stale transcode temp file removal failed");
+                    } else {
+                        total = total.saturating_sub(len);
+                    }
+                }
+                continue;
+            }
             total += len;
             // Rank by last-served time; files not served this run (`None`) fall back to mtime.
             let rank = access.get(&path).copied();
@@ -305,6 +378,17 @@ impl Transcoder {
             }
         }
     }
+}
+
+/// How long a `.tmp` may sit before it is assumed to be an orphan rather than an in-flight
+/// transcode. Generous: transcoding a long album at `high` is minutes, never hours.
+const TMP_STALE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+
+fn is_stale_tmp(meta: &std::fs::Metadata, now: std::time::SystemTime) -> bool {
+    meta.modified()
+        .ok()
+        .and_then(|m| now.duration_since(m).ok())
+        .is_some_and(|age| age > TMP_STALE)
 }
 
 #[cfg(test)]
@@ -341,6 +425,38 @@ mod tests {
             .await
             .unwrap();
         assert!(res.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn tmp_guard_removes_partial_output_unless_disarmed() {
+        let dir = temp_dir("guard");
+        let partial = dir.join("partial.m4a.tmp");
+        std::fs::write(&partial, b"half a transcode").unwrap();
+        drop(TmpGuard(Some(partial.clone())));
+        // A dropped request (client disconnect) must not leave its partial file behind.
+        assert!(!partial.exists());
+
+        let published = dir.join("published.m4a.tmp");
+        std::fs::write(&published, b"renamed away").unwrap();
+        let mut guard = TmpGuard(Some(published.clone()));
+        guard.disarm();
+        drop(guard);
+        assert!(published.exists(), "a disarmed guard owns nothing");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn sweep_tmp_clears_orphans_and_keeps_cache_entries() {
+        let dir = temp_dir("sweep");
+        let orphan = dir.join("abc.high.m4a.999.0.tmp");
+        let cached = dir.join("abc.high.m4a");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        std::fs::write(&cached, b"cached").unwrap();
+        let tc = Transcoder::new(&TranscodeConfig::default(), dir.clone());
+        tc.sweep_tmp().await;
+        assert!(!orphan.exists());
+        assert!(cached.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

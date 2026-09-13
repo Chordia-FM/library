@@ -105,6 +105,14 @@ dedupe_reuploads = true
 # volume, allowed servers, DJ role, the icon colour…) is set at runtime from that dashboard or from
 # Discord, never here.
 #
+# Two things guard who can reach your music through the bot, and the first one is in the portal:
+#   1. Turn "Public Bot" OFF (Application → Bot). While it is on, anyone who reads the application
+#      id off the bot's profile can invite it to a server of their own.
+#   2. Allowed servers, in the dashboard, starts EMPTY and empty means none: a freshly invited bot
+#      answers nothing anywhere until you add the server there. It joins and shows up in the
+#      dashboard so you can allow it with one click; a server you remove from a non-empty list is
+#      left.
+#
 # On first connection the bot dresses itself: its icon set (Phosphor glyphs and the progress-bar
 # segments, tinted in the Chordia pink) goes up as application emojis, so buttons and headers look
 # the same on every server without using anyone's emoji slots, and its avatar becomes the Chordia

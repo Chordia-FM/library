@@ -106,6 +106,8 @@ async fn run_once(identity: &Arc<Identity>) -> anyhow::Result<Exit> {
     let framework = poise::Framework::builder()
         .options(poise::FrameworkOptions {
             commands: commands::localized(commands::all()),
+            // Before any command body: the server has to be one the library owner allowed.
+            command_check: Some(|ctx| Box::pin(commands::allowed_guild(ctx))),
             event_handler: |ctx, event, fw, data| Box::pin(on_event(ctx, event, fw, data)),
             on_error: |e| Box::pin(commands::on_error(e)),
             ..Default::default()
@@ -221,8 +223,44 @@ async fn on_ready(
         guilds = ready.guilds.len(),
         "Discord bot online"
     );
+    seed_allow_list(identity, ready).await;
     presence::update(identity).await;
     rejoin_always_on(identity).await;
+}
+
+/// The one-time allow-list seed. `allowed_guilds` now denies when it is unset, which would
+/// silence every bot that upgrades into that rule, so the first boot adopts the servers the bot
+/// is already a member of and records that it did (migration 0035). Every server joined after
+/// that is denied until the owner allows it in the dashboard. Runs before the 24/7 rejoin so a
+/// restart on the upgrade boot still comes back to its channels.
+async fn seed_allow_list(identity: &Arc<Identity>, ready: &Ready) {
+    use crate::discord::settings::{seed_allowed_guilds, GuildSeed};
+
+    let mut s = identity.settings();
+    if s.app_id.is_empty() {
+        return;
+    }
+    let joined: Vec<u64> = ready.guilds.iter().map(|g| g.id.get()).collect();
+    match seed_allowed_guilds(&s, &joined) {
+        GuildSeed::Done => return,
+        GuildSeed::Stamp => tracing::info!(
+            bot = identity.index,
+            "Discord allow list is already set; leaving it as it is"
+        ),
+        GuildSeed::Seed(list) => {
+            tracing::warn!(
+                bot = identity.index,
+                guilds = %list.join(", "),
+                "seeding the Discord allow list once from the servers this bot is already in; \
+                 every server joined from now on serves nothing until it is allowed in the \
+                 dashboard"
+            );
+            s.allowed_guilds = Some(list);
+        }
+    }
+    s.guilds_seeded_at = Some(crate::discord::settings::now_ms());
+    identity.set_settings(s);
+    identity.save_settings().await;
 }
 
 /// After a restart, every server the bot was busy in gets it back as it was (its restart
@@ -241,6 +279,10 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
         let Some(guild) = guild_id.parse::<u64>().ok().map(GuildId::new) else {
             continue;
         };
+        // A server dropped from the allow list keeps its queue, but nothing is restored into it.
+        if !identity.settings().allows_guild(guild.get()) {
+            continue;
+        }
         let player = identity.player(guild).await;
         if player.restore(&json).await {
             restored.insert(guild);
@@ -266,7 +308,7 @@ async fn rejoin_always_on(identity: &Arc<Identity>) {
             continue;
         };
         let guild = GuildId::new(guild);
-        if restored.contains(&guild) {
+        if restored.contains(&guild) || !identity.settings().allows_guild(guild.get()) {
             continue;
         }
         let voice = serenity::all::ChannelId::new(voice);
@@ -383,13 +425,31 @@ async fn on_event(
         FullEvent::GuildCreate { guild, .. }
             if !identity.settings().allows_guild(guild.id.get()) =>
         {
-            tracing::info!(
-                bot = identity.index,
-                guild = guild.id.get(),
-                "leaving a guild that is not on the allow list"
-            );
-            if let Err(e) = guild.id.leave(&ctx.http).await {
-                tracing::warn!(error = %e, "leaving guild");
+            // An allow list the owner has filled in is a decision, so a server that is not on it
+            // is left. An empty list is the shipped default (which serves nobody): leaving on it
+            // would take the server straight back out of the dashboard the owner allows it from,
+            // so the bot stays put and simply answers nothing — every command and button press
+            // is refused by `commands::allowed_guild` and `interactions::handle`.
+            let listed = identity
+                .settings()
+                .allowed_guilds
+                .is_some_and(|l| !l.is_empty());
+            if listed {
+                tracing::info!(
+                    bot = identity.index,
+                    guild = guild.id.get(),
+                    "leaving a guild that is not on the allow list"
+                );
+                if let Err(e) = guild.id.leave(&ctx.http).await {
+                    tracing::warn!(error = %e, "leaving guild");
+                }
+            } else {
+                tracing::info!(
+                    bot = identity.index,
+                    guild = guild.id.get(),
+                    guild_name = %guild.name,
+                    "in a server that is not on the allow list; serving nothing there until it is allowed in the dashboard"
+                );
             }
         }
         _ => {}

@@ -42,6 +42,16 @@ pub async fn handle(
     if cid.bot != identity.index || ic.guild_id != Some(guild) {
         return send::component_ack(http, ic).await;
     }
+    // The same allow list the commands are checked against: in a server the library owner never
+    // allowed, a press is acknowledged (so the client stops spinning) and nothing else happens.
+    if !identity.settings().allows_guild(guild.get()) {
+        tracing::debug!(
+            bot = identity.index,
+            guild = guild.get(),
+            "ignoring a component press from a server that is not on the allow list"
+        );
+        return send::component_ack(http, ic).await;
+    }
     let user = ic.user.id;
     let token = ic.token.as_str();
 

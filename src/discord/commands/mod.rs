@@ -129,6 +129,47 @@ pub async fn snap(ctx: Context<'_>) -> PlayerSnapshot {
     }
 }
 
+/// Does this bot serve the server the interaction came from? The allow list ships empty and an
+/// empty list denies, so a bot someone invited off its public application id answers nothing
+/// until the library owner allows that server in the dashboard. Everything the bot would say
+/// goes through this: commands ([`allowed_guild`]), button presses
+/// (`interactions::handle`) and the autocomplete lists, which are a catalog oracle of their own.
+pub fn serves(ctx: Context<'_>) -> bool {
+    ctx.guild_id()
+        .is_some_and(|g| ctx.data().settings().allows_guild(g.get()))
+}
+
+/// Poise's check on every command. A refusal names the server id and where to allow it, so the
+/// owner's own server is one paste away from working.
+pub async fn allowed_guild(ctx: Context<'_>) -> Result<bool, Error> {
+    let Some(guild) = ctx.guild_id() else {
+        // Every command is `guild_only`; poise refuses a DM before this.
+        return Ok(true);
+    };
+    if serves(ctx) {
+        return Ok(true);
+    }
+    let identity = ctx.data();
+    tracing::info!(
+        bot = identity.index,
+        guild = guild.get(),
+        command = %ctx.command().qualified_name,
+        "refusing a command from a server that is not on the allow list"
+    );
+    ctx.defer_ephemeral().await?;
+    let snap = PlayerSnapshot::bare(identity).await;
+    let msg = views::notice(
+        &snap,
+        "This server isn't allowed",
+        &format!(
+            "The library owner hasn't allowed this server, so I don't play here.\n-# They can add server ID `{}` under **Allowed servers** in the bot's settings.",
+            guild.get()
+        ),
+    );
+    send::respond(ctx, msg).await?;
+    Ok(false)
+}
+
 /// The guild a command ran in. Every command is `guild_only`, so this only fails for a DM that
 /// slipped through.
 pub fn guild_of(ctx: Context<'_>) -> anyhow::Result<GuildId> {
